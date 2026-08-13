@@ -40,7 +40,7 @@ See §1.3.
 
 ### D5. No FSM library dependency
 
-**Considered and rejected, the object-bound school.** These bind the machine to a live model instance and assume in-process lifetime, which is wrong here because every hook fire is a fresh process:
+**Considered and rejected, the object-bound school.** These bind the machine to a live model instance and assume in-process lifetime. That is wrong here, because every hook fire is a fresh process: measured against Claude Code `2.1.229`, the dispatcher runs as a fresh `node` process per `SubagentStop`. The candidates:
 - **Automat**: its stated premise is an object whose behavior varies with state, and it avoids reified input objects. This design requires reified inputs.
 - **finite-state-machine**: decorator-based, subclass and set a state instance variable.
 - **friendly_states**: states as classes, transitions as annotated methods.
@@ -55,13 +55,13 @@ See §1.3.
 
 ### D6. Authoring surface
 
-TS script that compiles, plus a hand-writable JSON IR fed to the compiler directly. Never in dispute.
+**Chosen:** a TS script that compiles. Never in dispute.
 
-**Amended by the dependency sweep. The second half was contradicted, and is now replaced.** D24 and §1.2 state that the IR is a compile target, "not something the user writes." D6 as written offered a hand-writable JSON IR as a second authoring surface. Both could not be true; the clause predated D24 and was carried forward unexamined.
+**Rejected:** a hand-writable JSON IR fed to the compiler directly, as a second authoring surface. It cannot coexist with D24 and §1.2, which make the IR a compile target, "not something the user writes."
 
-**Resolved:** the IR proper is **internal**. It is not a public contract, gets no compatibility promise, and needs no separate validator. Validation stays in the builder, at the offending line, which is what D24 bought.
+**Position:** the IR proper is **internal**. It is not a public contract, gets no compatibility promise, and needs no separate validator. Validation stays in the builder, at the offending line, which is what D24 bought.
 
-**Replaced by:** a declarative **YAML front-end**, in the Keras sense, a second *front-end* that compiles to the same IR, sitting beside the builder rather than beneath it. Both surfaces produce the IR; neither is the IR. It carries its own diagnostics when built. **Deferred, not v1**, and recorded here so it is designed for rather than retrofitted: the IR must stay expressible as plain data with no builder-only constructs, which it already is.
+**The hand-authoring use case is served instead by** a declarative **YAML front-end**, in the Keras sense, a second *front-end* that compiles to the same IR, sitting beside the builder rather than beneath it. Both surfaces produce the IR; neither is the IR. It carries its own diagnostics when built. **Deferred, not v1.** The constraint it places on everything before it: the IR must stay expressible as plain data with no builder-only constructs, which it already is.
 
 ### D7. Output artifact: a plugin
 
@@ -77,7 +77,7 @@ TS script that compiles, plus a hand-writable JSON IR fed to the compiler direct
 
 **Chosen:** thin dispatcher plus `workflow.compiled.json`. Graph changes produce readable JSON diffs; runtime bugs are a version bump.
 
-**Graph hash placement, corrected after reading the plugin references.** On Claude Code it goes in the manifest's free-form `metadata` object, not as a custom top-level field, so `claude plugin validate --strict` stays clean in CI. On Agent Plugins targets the manifest schema is closed, so it goes under `extensions["<our-namespace>"]` (D21). Same hash, two homes.
+**Graph hash placement.** On Claude Code it goes in the manifest's free-form `metadata` object, not as a custom top-level field, so `claude plugin validate --strict` stays clean in CI. On Agent Plugins targets the manifest schema is closed, so it goes under `extensions["<our-namespace>"]` (D21). Same hash, two homes.
 
 ### D9. Zero idle footprint is a hard requirement
 
@@ -97,16 +97,16 @@ Now generalized as a contract every backend must satisfy (§4.3).
 
 ### D11. State: transient, trace persistent
 
-Ephemeral state file, never user-managed. Amendment: an append-only trace survives the run, because "why did this loop review three times?" must be answerable. Keyed by `session_id`; GC'd on `SessionStart`; stored in `$CLAUDE_PLUGIN_DATA`.
+**Chosen:** an ephemeral state file, never user-managed, stored in `$CLAUDE_PLUGIN_DATA`, plus an append-only trace that survives the run, because "why did this loop review three times?" must be answerable.
 
-**Broken by the dependency sweep, and it is the D25 pattern again.** "Keyed by `session_id`, GC'd on `SessionStart`" was written when state was ephemeral *within one run in one session*. D17 then made approval gates **segmented across sessions**, and §3.9 promises a parked run "survives the user closing their laptop." Under D11 as written it does not, in two separate ways:
+**Rejected:** keying that state on `session_id` and garbage-collecting it on `SessionStart`. That works only while a run lives entirely *within one session*, and D17 makes approval gates **segmented across sessions**, with §3.9 promising a parked run "survives the user closing their laptop." Session-keyed state cannot deliver that, in two separate ways:
 
 1. A fresh session's `/approve-plan` computes a new `session_id` and cannot find the parked state.
 2. `SessionStart` GC cannot tell a run parked at a gate from an orphan, so the next session start collects the thing the gate exists to preserve.
 
-L4's mitigation already refers to "run id", a concept the state design does not have. That is the seam: **state keys on a run id**; `session_id` becomes a non-authoritative hint recorded in the trace; and GC collects only state whose status is `running` and whose session is provably gone. State whose status is `awaiting`, with the gate it is parked at named in a separate `gate` field (§3.4), is never collected by session GC and expires on an explicit TTL or user command instead. L3's "SessionStart GC is mandatory" inherits the same narrowing.
+L4's mitigation refers to "run id", and that is the concept the state design needs: **state keys on a run id**; `session_id` becomes a non-authoritative hint recorded in the trace; and GC collects only state whose status is `running` and whose session is provably gone. State whose status is `awaiting`, with the gate it is parked at named in a separate `gate` field (§3.4), is never collected by session GC and expires on an explicit TTL or user command instead. L3's "SessionStart GC is mandatory" inherits the same narrowing.
 
-Not yet decided in detail, and it does not block the IR, the evaluator, or the builder. It binds when the Claude Code emitter writes state.
+The remaining details are open, and they do not block the IR, the evaluator, or the builder. They bind when the Claude Code emitter writes state.
 
 ### D12. Dispatch mechanism
 
@@ -122,7 +122,7 @@ The limit is configurable via `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH`, so a deep 
 
 **Chosen:** flat runner. Depth stays constant at two whatever the graph does, and on the current default of three layers below main that leaves one layer of headroom for a step to spawn a helper of its own.
 
-Two is not unconditionally safe, and the ledger should not claim it is. The default was **one** on v2.1.217 and v2.1.218, where a flat runner does not work either unless `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH` is raised (L1, and [`VERIFICATION.md`](./VERIFICATION.md) records the same). That is one of the three observed defaults, and it is the only one that breaks this design, which is the argument for the flat runner rather than against it: a nested stack is capped on every observed default, and capped silently once the graph is long enough, whereas depth 2 fails on one release pair only, fails immediately, and is restored by an environment variable a preflight check can set.
+Depth 2 is not unconditionally safe. The default was **one** on v2.1.217 and v2.1.218, where a flat runner does not work either unless `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH` is raised (L1, and [`VERIFICATION.md`](./VERIFICATION.md) records the same). That is one of the three observed defaults, and it is the only one that breaks this design, which is the argument for the flat runner rather than against it: a nested stack is capped on every observed default, and capped silently once the graph is long enough, whereas depth 2 fails on one release pair only, fails immediately, and is restored by an environment variable a preflight check can set.
 
 ### D14. Skill-scoped hooks via frontmatter, rejected
 
@@ -164,9 +164,9 @@ See §3.9 for the mechanism.
 
 `claude -p` runs headless; the `Setup` event fires with `--init-only`, or `--init`/`--maintenance` in `-p` mode. The transition table needs no model at all.
 
-**Corrected by execution against 2.1.229.** Two claims here were wrong, both discovered by running them:
+**Measured against 2.1.229**, two constraints on the testing tooling:
 
-- `--debug` produced **no output at all** on stderr or stdout under `-p`. It also takes an *optional filter argument*, so a trailing positional prompt is silently consumed as the filter and the run dies with "Input must be provided either through stdin or as a prompt argument." Pass the prompt on stdin. The dispatcher's own event log, not `--debug`, is the evidence channel for headless tests.
+- `--debug` produces **no output at all** on stderr or stdout under `-p`. It also takes an *optional filter argument*, so a trailing positional prompt is silently consumed as the filter and the run dies with "Input must be provided either through stdin or as a prompt argument." Pass the prompt on stdin. The dispatcher's own event log, not `--debug`, is the evidence channel for headless tests.
 - `claude plugin validate --strict` covers **the manifest and `hooks/hooks.json` only.** Measured: an agent with `name: bad:name` (which Claude Code refuses to load) plus an unrecognized frontmatter key passed; a skill with no `name` at all passed; a skill whose `name` did not match its directory passed. An invalid hook event key was caught. It also fails on a *missing* `author`, an advisory warning promoted to an error, so the emitter must populate it.
 
   Consequence: §3.6's build-time validation cannot be delegated to the platform tool. Skill checking is `skills-ref validate`; **agent frontmatter has no platform validator and the compiler must implement its own.**
@@ -183,7 +183,7 @@ Only ergonomics need a human session.
 
 ### D19. Late discovery: native and third-party implementations exist
 
-**What happened:** after the architecture was settled, a search for *implementations* rather than *writing* surfaced Claude Code's native Workflow runtime, plus several third-party projects covering substantially this idea.
+**Found, by searching for *implementations* rather than for *writing about* the pattern, which is all D1 looked for:** Claude Code's native Workflow runtime, plus several third-party projects covering substantially this idea.
 
 - **xirothedev/claude-workflow-plugin**: workflows as TypeScript modules, with a runtime building an orchestration plan of agents, schemas, and execution stages. The same authoring model, already built.
 - **mbruhler/claude-orchestration**: state persisted so a run dying at step 14 of 15 resumes by loading state, skipping 1–13, and injecting variables; plus routing on natural-language conditions. The same state design and the same NL escape hatch, both validated.
@@ -249,11 +249,13 @@ Only ergonomics need a human session.
 
 **Why it existed:** in the D12c architecture a plugin-level `PostToolUse` hook was already registered, so harvesting touched paths cost nothing. It was proposed on that basis alone.
 
-**Why it should have died with D12c:** the final design registers two matcher-scoped hooks and no `PostToolUse`. Per-step scoping needs agent frontmatter, which plugin subagents ignore (L16), and a plugin-level registration matches on tool name only, firing on every file write in every session, a worse D9 violation than the `Stop` hook rejected in D12c. A `git status --porcelain` diff inside the dispatcher was briefly proposed to preserve it; that was patching a feature instead of re-examining it.
+**Why it should have died with D12c:** the final design registers two matcher-scoped hooks and no `PostToolUse`. Per-step scoping needs agent frontmatter, which plugin subagents ignore (L16), and a plugin-level registration matches on tool name only, firing on every file write in every session, a worse D9 violation than the `Stop` hook rejected in D12c.
+
+**Sub-path rejected, a `git status --porcelain` diff inside the dispatcher.** It preserves the manifest without the hook, and it patches a feature instead of re-examining whether the feature is wanted at all.
 
 **Why it was never needed:** every path a guard reads is known when the graph compiles, and the compiler writes it into the step wrapper that will produce it (§3.5), so output paths are assigned rather than discovered. The manifest only added value for undeclared writes, and an undeclared write is one the next step was not told to consume.
 
-**Lesson recorded:** this survived three revisions after the architecture justifying it was superseded. When a decision is reversed, its dependents need re-deriving, not carrying forward.
+**Lesson recorded:** when a decision is reversed, its dependents need re-deriving rather than carrying forward. A feature outlives the architecture that justified it otherwise, and stays plausible because nothing in it looks wrong on its own.
 
 ## §5.1 The reversal chain
 
@@ -278,15 +280,3 @@ D12d  FINAL: steps as subagents, transitions on SubagentStop.
 ```
 
 **What made the difference each time:** a platform fact assumed rather than checked. D12a assumed hooks were global. D12b assumed frontmatter editing was acceptable. D12c assumed a no-op spawn was invisible enough. D19 assumed no implementations existed because none had been *written about*.
-
-## Dependency sweep, 12 August 2026
-
-Every decision D1 through D25 was re-read against what justified it, on the theory that a reversed decision leaves dependents standing. Results:
-
-- **D11, broken.** Session-keyed state plus `SessionStart` GC contradicts D17's cross-session gates. Re-derivation recorded in D11; binds at emitter time.
-- **D6, contradicted, now resolved.** A hand-writable JSON IR could not coexist with D24 and §1.2. The IR is internal; a deferred YAML front-end replaces the hand-authoring use case. Recorded in D6.
-- **D18, factually wrong on two claims**, corrected there against measured behaviour.
-- **D5, re-derived, holds.** Its "every hook fire is a fresh process" premise was D12a-era; execution confirms a fresh `node` process per `SubagentStop`, so the rejection of object-bound FSM libraries survives on its original reasoning.
-- **D15, wording fossil, no action.** Its rule ("loose hooks where the platform can filter") reads as violated by §3.2's single dispatcher, but is satisfied in substance: two matcher-scoped registrations, no no-op spawns. The rule was about registration granularity, not file count.
-- **D1, D12a through D12c, dead and marked as such.** No live dependents beyond those above.
-- All others re-derive cleanly on their stated reasons.

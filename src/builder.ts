@@ -687,7 +687,7 @@ export interface LintableGraph {
  * exported because the builder is not the only way to produce an IR: the IR is
  * plain data, a second front-end can hand us one directly, and that graph deserves
  * the same three checks. Several of them, an unconditional cycle in particular,
- * describe shapes the builder now refuses to author at all, so this is the only
+ * describe shapes the builder refuses to author at all, so this is the only
  * place they can still be caught, and the only place they can be tested.
  *
  * @returns One line per problem, empty when the graph is sound.
@@ -792,13 +792,12 @@ function isUnconditional(guard: Guard): boolean {
  * command, so a loop through one is not a machine spinning. It is a machine
  * waiting.
  *
- * **A `limit` never rescues an unconditional edge, and an earlier version of this
- * function believed it did.** `limit` is consulted on exactly one path: the
- * evaluator increments it when a guard *fails* and `otherwise` is a retry. A guard
- * that cannot fail never reaches that path, so `{ guard: always, otherwise: retry,
- * limit: 3 }` is bounded by nothing at all. It just advances forever. Treating
- * the limit as a ceiling let that graph compile clean, which was the exact bug
- * this check exists to catch, wearing the costume of the fix.
+ * **A `limit` never rescues an unconditional edge.** `limit` is consulted on
+ * exactly one path: the evaluator increments it when a guard *fails* and
+ * `otherwise` is a retry. A guard that cannot fail never reaches that path, so
+ * `{ guard: always, otherwise: retry, limit: 3 }` is bounded by nothing at all.
+ * It just advances forever. Treating the limit as a ceiling would let that graph
+ * compile clean, which is the exact shape this check exists to catch.
  *
  * So an ungated unconditional edge is unbounded, full stop. There is no `limit`
  * term here because there is no shape in which one would be sound.

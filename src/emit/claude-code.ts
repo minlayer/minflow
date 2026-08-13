@@ -14,9 +14,9 @@
  *
  * - **The dispatcher is `.cjs`, never `.js`.** Node resolves CommonJS-vs-ESM
  *   from the nearest ancestor `package.json`, and a compiled plugin usually
- *   lands inside the user's repo. The spike's `dispatch.js` inherited
- *   `"type": "module"` from two levels up and died with `require is not defined`
- *   on every hook fire.
+ *   lands inside the user's repo. A `dispatch.js` that inherits
+ *   `"type": "module"` from an ancestor package, however many levels up, dies
+ *   with `require is not defined` on every hook fire.
  * - **`hooks.json` needs the top-level `hooks` wrapper.** Event names are keys
  *   inside it. Without the wrapper the registration does not load at all.
  * - **The manifest must carry `author`.** `claude plugin validate --strict`
@@ -33,8 +33,8 @@
  *   substring. Anchoring is right for both; assuming one rule covers both is not.
  * - **A command must exist for the entrypoint hook to be reachable at all.**
  *   `UserPromptExpansion` fires when a *command* expands, so a matcher naming
- *   commands nothing defines never runs. This emitter shipped exactly that bug:
- *   a correct-looking plugin, with an entrypoint that could not be invoked.
+ *   commands nothing defines never runs. The result is a correct-looking plugin
+ *   with an entrypoint that cannot be invoked.
  * - **Commands are namespaced by the manifest name**: `/my-workflow:run`, never
  *   `/run`, and the payload reports `command_name` in that same form without the
  *   slash. Both the matcher and the dispatcher's own routing table have to carry
@@ -567,9 +567,9 @@ function hookCommand(): { hooks: JsonValue[] } {
  * data-directory id form, whose name carries an `-inline` suffix for a
  * `--plugin-dir` load. The same string is what the hook payload reports as
  * `command_name` (without the leading slash), so it is what the matcher must
- * carry and what the dispatcher must compare against. An earlier version of this
- * emitter used the bare name in both places and emitted no commands at all, which
- * produced a plugin that installed, read correctly, and did nothing whatsoever.
+ * carry and what the dispatcher must compare against. Using the bare name in
+ * either place, or emitting no commands at all, produces a plugin that installs,
+ * reads correctly, and does nothing whatsoever.
  */
 function qualified(pluginName: string, command: string): string {
   return `${pluginName}:${command}`;
@@ -612,10 +612,10 @@ function commandFor(description: string, body: string): string {
  *
  * A hook cannot instruct the conversation here. Rendering a `block` decision on
  * `UserPromptExpansion` cancels the expansion and prints the reason, so the model
- * never sees the command at all: measured, after this emitter first assumed the
- * blocked-and-redirected behaviour that `SubagentStop` really does have. The
- * dispatcher therefore seeds state silently and lets the expansion through, and
- * this text is what spawns the runner.
+ * never sees the command at all. That is the opposite of `SubagentStop`, where a
+ * block does hand the runner its next instruction, and the two events must not be
+ * assumed to behave alike. The dispatcher therefore seeds state silently and lets
+ * the expansion through, and this text is what spawns the runner.
  *
  * Which step runs first is deliberately not stated here, because a command file
  * is written at compile time and cannot know where a resumed run is parked. The
@@ -2152,9 +2152,9 @@ function startRun(event, sessionId) {
   // Marked as not yet started, then no decision is rendered. Blocking here would
   // be wrong: on this event a block CANCELS the command's expansion and prints
   // the reason, rather than handing the conversation an instruction the way a
-  // blocked SubagentStop hands one to the runner. Measured, after assuming
-  // otherwise. Letting the expansion through is what puts the command's own body
-  // in front of the model, and that body is what spawns the runner.
+  // blocked SubagentStop hands one to the runner. Letting the expansion through
+  // is what puts the command's own body in front of the model, and that body is
+  // what spawns the runner.
   saveState(withScratch(state, { node: state.node, steps: state.steps, answers: {},
     asking: null, payload: null, start: true }));
   linkSession(sessionId, runId);
@@ -2344,10 +2344,26 @@ function act(graph, state, transition) {
     return;
   }
 
-  // error. Saved rather than deleted, so the state that could not be routed is
-  // still there to look at, and no decision, so the run stops here instead of
-  // looping.
-  saveState(transition.state);
+  // error. The state is recorded into the trace and then deleted, and no
+  // decision is rendered, so the run stops here.
+  //
+  // An errored run must not be left on disk. At status "running" it is still a
+  // live run, so the next time any runner stops it is loaded, re-evaluated
+  // against the same failed guard, and reports the same error again, once per
+  // stop. It also leaks: no garbage collector would ever come for it, and a
+  // later gate command in the same session could still find it. State is
+  // ephemeral and the trace is what survives a run (D11), so the final state
+  // belongs in the trace.
+  appendTrace(state.runId, {
+    at: new Date().toISOString(),
+    decision: "stopped",
+    run: state.runId,
+    node: state.node,
+    code: transition.code,
+    message: transition.message,
+    state: transition.state,
+  });
+  deleteState(state.runId);
   report("run " + state.runId + " stopped: [" + transition.code + "] " + transition.message);
 }
 

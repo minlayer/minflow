@@ -603,8 +603,9 @@ describe("evaluate preconditions", () => {
     const at = evaluate(graph, makeState({ steps: 3 }), {}, { stepCeiling: 3 });
     if (at.kind !== "error") throw new Error("expected error");
     expect(at.code).toBe("step-ceiling-exceeded");
-    // Was `toContain("3")`, which the step count alone satisfied and which the
-    // default ceiling of 1000 would not have contradicted.
+    // The whole phrase, never a bare `toContain("3")`: the step count alone
+    // satisfies a bare "3", and the default ceiling of 1000 does not
+    // contradict it either, so the override would go unproven.
     expect(at.message).toContain("ceiling of 3");
   });
 });
@@ -1301,10 +1302,10 @@ describe("firing an edge", () => {
   });
 
   it("rule 7a: records nothing when the node asks for no payload at all", () => {
-    // Renamed from "when no payload observation resolved ok", which this fixture
-    // never exercised: the node declares no schema and its guard reads no lane,
-    // so nothing is requested and the not-ok branch is never reached. The three
-    // tests below cover what the old title claimed.
+    // The node declares no schema and its guard reads no lane, so no payload is
+    // ever requested and the not-ok branch is never reached: this pins the
+    // nothing-asked-for case alone. A payload that was asked for and did not
+    // come back ok is the subject of the tests below.
     const graph = makeIr([{ id: "e1", from: "a", event: "pass", guard: ALWAYS, goto: "b" }]);
     const transition = evaluate(graph, makeState(), {});
     expect(transition.state.outputs).toEqual({});
@@ -1312,9 +1313,10 @@ describe("firing an edge", () => {
 
   it("rule 7a: a schema node whose payload failed to parse is an error, not an empty output", () => {
     // The asymmetry this closes: rule 5 insists a failed observation is an error
-    // rather than a false guard, but a schema-implied payload used to be dropped
-    // on the floor, so a step that violated its own output contract departed
-    // silently and the damage surfaced in whichever later step interpolated it.
+    // rather than a false guard, and a schema-implied payload is no exception.
+    // Dropping one on the floor would let a step that violated its own output
+    // contract depart silently, and the damage would surface in whichever later
+    // step interpolated it.
     const graph = withNodeSchema(
       makeIr([{ id: "e1", from: "a", event: "pass", guard: ALWAYS, goto: "b" }]),
       "a",
@@ -1542,10 +1544,10 @@ describe("otherwise", () => {
     expect(exhausted.state.steps).toBe(3);
   });
 
-  // The exhaustion message is the only place the ordinal is ever seen, and
-  // nothing pinned it: a constant "th" suffix, or a dropped 11-13 special case,
-  // still errors with the right code and still names the edge, so the run would
-  // report "a 21th time" and every test would stay green.
+  // The exhaustion message is the only place the ordinal is ever seen. A
+  // constant "th" suffix, or a dropped 11-13 special case, still errors with
+  // the right code and still names the edge, so without these rows the run
+  // reports "a 21th time" and every other test stays green.
   const ordinals: Array<[number, string]> = [
     [0, "1st"],
     [1, "2nd"],
@@ -1738,11 +1740,11 @@ describe("purity", () => {
   });
 
   it("carries a parked run's gate through an error transition", () => {
-    // An error copies the state verbatim, gate included. No fixture ever set a
-    // gate before reaching an error path, so dropping the gate here changed
-    // nothing that any test could see, and it would strand a parked run: the
-    // host persists this state, and a run that has forgotten which gate it
-    // waits on cannot be resumed by the command meant to resume it.
+    // An error copies the state verbatim, gate included. A fixture that parks
+    // no run before reaching an error path cannot see the gate go missing, and
+    // a dropped gate strands a parked run: the host persists this state, and a
+    // run that has forgotten which gate it waits on cannot be resumed by the
+    // command meant to resume it.
     const parked = makeState({ status: "awaiting", gate: "approve-plan", graphHash: "stale" });
     const transition = evaluate(graph, parked, {});
     if (transition.kind !== "error") throw new Error("expected error");

@@ -471,9 +471,8 @@ describe("the artifact", () => {
     //
     // The three commands/ files are load-bearing rather than decoration. The
     // UserPromptExpansion event fires when a *command* expands, so a matcher
-    // naming commands that nothing defines can never run, which is what this
-    // emitter used to produce: a plugin that installed, validated, read
-    // correctly, and did nothing at all.
+    // naming commands that nothing defines can never run, and the plugin it
+    // belongs to installs, validates, reads correctly, and does nothing at all.
     expect(Object.keys(emit(exampleIr())).sort()).toEqual(
       [
         ".claude-plugin/plugin.json",
@@ -656,7 +655,7 @@ describe("the manifest", () => {
     // Truncation is lossy and pluginNameFor does not de-duplicate, so two workflows
     // whose names agree for 63 characters compile to the same plugin. That is the
     // documented cost of the cap; what is not acceptable is the collision landing
-    // on a trailing hyphen, which is what both of these would end in unfixed.
+    // on a trailing hyphen, which is where both of these end without the re-trim.
     const shared = "a".repeat(63);
     const one = pluginNameFor(exampleIr(), { name: `${shared} one` });
     const two = pluginNameFor(exampleIr(), { name: `${shared} two` });
@@ -845,9 +844,8 @@ describe("the commands", () => {
   }
 
   it("defines exactly the commands its matcher accepts, and no others", () => {
-    // The invariant that was violated when this emitter shipped a matcher over
-    // commands it never wrote: the hook fires on a command EXPANDING, so a
-    // matcher naming a command nothing defines is unreachable, and the whole
+    // The invariant, and why it is one: the hook fires on a command EXPANDING,
+    // so a matcher over a command nothing defines is unreachable, and the whole
     // plugin is inert while looking perfectly well-formed. Checked in both
     // directions on purpose: an orphaned matcher alternative is a dead
     // entrypoint, and an orphaned command file is a command that does nothing.
@@ -1118,6 +1116,13 @@ interface Harness {
   onlyRun(): RunState;
   /** Writes a file into the project directory the guards resolve against. */
   write(relative: string, contents: string): void;
+  /**
+   * Every trace entry written for every run, in order.
+   *
+   * The trace outlives the run state on purpose, so it is the only evidence a
+   * finished or failed run leaves behind.
+   */
+  trace(): Record<string, JsonValue>[];
   /** Rewrites the compiled graph, as an editor recompiling mid-run would. */
   editGraph(change: (graph: Record<string, JsonValue>) => void): void;
   /**
@@ -1213,6 +1218,20 @@ async function withPlugin(ir: WorkflowIr, body: (harness: Harness) => void): Pro
         // Seeding only. A decision here would cancel the command.
         expect(started.decision).toBeNull();
         return harness.fire(stopped("Standing by.", session));
+      },
+      trace() {
+        const dir = path.join(dataDir, "trace");
+        if (!sync.existsSync(dir)) return [];
+        return sync
+          .readdirSync(dir)
+          .sort()
+          .flatMap((name: string) =>
+            sync
+              .readFileSync(path.join(dir, name), "utf8")
+              .split("\n")
+              .filter((line: string) => line.trim() !== "")
+              .map((line: string) => JSON.parse(line) as Record<string, JsonValue>),
+          );
       },
       runs() {
         const dir = path.join(dataDir, "runs");
@@ -1384,7 +1403,17 @@ describe("a run, driven through the emitted dispatcher", () => {
       expect(missing.stderr).toContain("observation-failed");
       expect(missing.stderr).toContain("out/scan.json");
 
+      // The run is over, not merely paused. An errored run kept at status
+      // "running" is still a live run: the next stop reloads it, re-evaluates
+      // the same failed guard and reports the same error again. There is no
+      // resume-from-error path, so leaving it on disk only leaks a run nothing
+      // will ever collect.
+      expect(plugin.runs()).toHaveLength(0);
+      expect(plugin.fire(stopped("I scanned again.")).stderr).not.toContain("observation-failed");
+
+      // The lane itself reads correctly when the step honours its contract.
       plugin.write("out/scan.json", JSON.stringify({ clean: true }));
+      plugin.begin();
       const fired = plugin.fire(stopped("I scanned."));
       expect(fired.reason).toContain("file-lane:step-act");
       expect(plugin.onlyRun().outputs).toEqual({ scan: { clean: true } });
@@ -1617,7 +1646,12 @@ describe("a run, driven through the emitted dispatcher", () => {
       // "done" is absent here, and reading that as `done: false` would route the
       // run down a branch it was never meant to take.
       expect(unparseable.stderr).toContain("observation-failed");
-      expect(plugin.onlyRun().node).toBe("draft");
+      // Ended, with the final state preserved in the trace rather than on disk:
+      // state is ephemeral and the trace is what survives a run (D11).
+      expect(plugin.runs()).toHaveLength(0);
+      expect(plugin.trace()).toContainEqual(
+        expect.objectContaining({ decision: "stopped", code: "observation-failed" }),
+      );
     });
   });
 });
@@ -1718,7 +1752,7 @@ describe("the step wrappers", () => {
     );
     expect(stepFrontmatter({ skill: "s", tools: ["*"] }).tools).toBe('["*"]');
     expect(stepFrontmatter({ skill: "s", tools: ["Read, Write"] }).tools).toBe('["Read, Write"]');
-    // The comma-joined plain form the spike measured survives for plain entries.
+    // Measured on 2.1.229: the comma-joined plain form survives for plain entries.
     expect(stepFrontmatter({ skill: "s", tools: ["Read", "Write"] }).tools).toBe("Read, Write");
   });
 

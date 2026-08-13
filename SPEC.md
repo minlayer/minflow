@@ -208,7 +208,7 @@ Two rules the docs are emphatic about. The manifest goes in `.claude-plugin/`, a
 
 **The graph hash goes in `metadata`.** The manifest has a free-form `metadata` object that Claude Code does not read, which is exactly the right home. A custom top-level field would also load, since unrecognized fields are ignored, but `claude plugin validate` reports them as warnings and `--strict` turns them into errors, so `metadata` is the correct choice and `--strict` stays usable in CI (D8).
 
-**The dispatcher must declare its own module type.** Node resolves CommonJS-vs-ESM from the nearest ancestor `package.json`, and a compiled plugin often sits inside the user's repo. Measured during verification: a dispatcher emitted as `dispatch.js` inherited `"type": "module"` from a `package.json` two levels up and died with `ReferenceError: require is not defined` on every hook fire. Emit the dispatcher as `.cjs` (or ship an explicit `package.json`); never as a bare `.js` that borrows its semantics from whatever encloses it.
+**The dispatcher must declare its own module type.** Node resolves CommonJS-vs-ESM from the nearest ancestor `package.json`, and a compiled plugin often sits inside the user's repo. Measured during verification: a dispatcher emitted as `dispatch.js` inherits `"type": "module"` from a `package.json` two levels up and dies with `ReferenceError: require is not defined` on every hook fire. Emit the dispatcher as `.cjs` (or ship an explicit `package.json`); never as a bare `.js` that borrows its semantics from whatever encloses it.
 
 **`author` is required in practice.** `claude plugin validate --strict` promotes "no author information" from advisory warning to error (D18), so the emitter must populate it.
 
@@ -250,7 +250,7 @@ The top-level `hooks` wrapper is **required**. Confirmed twice during verificati
 - For this event the matcher behaves as a **full match**, not the unanchored search recorded for `SubagentStop`. A matcher of `run-my-workflow` does not fire for `my-workflow:run-my-workflow` even though it is a substring. Anchoring is therefore harmless and correct, but the plugin prefix is mandatory either way.
 - The payload also carries `command_args`, `command_source: "plugin"`, and `expansion_type: "slash_command"`, which is how the dispatcher distinguishes a run from a gate resume and picks up arguments.
 
-**A `block` decision means something different on this event, and the difference is total.** On `SubagentStop` a block redirects the runner: the reason becomes the runner's next instruction, which is the actuation channel §3.3 rests on. On `UserPromptExpansion` a block **cancels the expansion**. The reason is printed and the command never reaches the model at all, so a dispatcher that blocks here seeds a run and then strands it, with nothing spawned and nothing to spawn it. Measured on 2.1.229, after an implementation assumed the two events behaved alike.
+**A `block` decision means something different on this event, and the difference is total.** On `SubagentStop` a block redirects the runner: the reason becomes the runner's next instruction, which is the actuation channel §3.3 rests on. On `UserPromptExpansion` a block **cancels the expansion**. The reason is printed and the command never reaches the model at all, so a dispatcher that blocks here seeds a run and then strands it, with nothing spawned and nothing to spawn it. Measured on 2.1.229. Neither event's behaviour can be inferred from the other's.
 
 The entrypoint therefore works the other way round. The dispatcher seeds state and renders **no decision**, letting the expansion through, and the **command's own body** is what instructs the conversation to spawn the runner. The body cannot name the first step, because a command file is written at compile time and a resumed run may be parked anywhere, so it tells the runner to stand by. The runner stops, and that `SubagentStop` is redirected into the real step by the mechanism the spike verified. One static command therefore serves both a fresh run and a run resumed at any node.
 
@@ -273,12 +273,13 @@ Thereafter the cycle repeats:
 8. **Verdict needed** → `{"decision":"block", …}` asking the runner for one word from the verdict set. Nothing is evaluated on that pass; the answer arrives on the next stop. A command hook cannot ask a model anything, and hooks matching one event run in parallel rather than in sequence, so a verdict can only be obtained by asking and being called again.
 9. **Human gate** → exit 0, no block. Runner stops. State persists with status `awaiting` and the gate's name recorded beside it.
 10. **Terminal node** → exit 0, no block. Runner stops. Dispatcher deletes state.
+11. **Unroutable run** → exit 0, no block, and the state is written into the trace and then deleted. An errored run left on disk is still a live run: the next stop reloads it, re-evaluates the same failed guard, and errors again, so a single failure is reported twice. There is no resume-from-error path, so the trace is where a failed run's evidence belongs.
 
 A run of a two-step graph therefore traces as `start`, `SubagentStop`, `begin`, `SubagentStop`, `advance`, `SubagentStop`, `end`.
 
 ### 3.4 State
 
-- Lives in `${CLAUDE_PLUGIN_DATA}`, which resolves to `<config-dir>/plugins/data/{id}/`, is created on first reference, survives plugin updates, and is deleted when the plugin is uninstalled from its last scope. Never in the user's repo. Two details measured during verification, both of which broke the test plugin the measurements ran from ([`docs/VERIFICATION.md`](./docs/VERIFICATION.md) describes that plugin, which is deliberately not shipped in this repository): the config dir is `$CLAUDE_CONFIG_DIR` when set, not always `~/.claude`; and a plugin loaded with `--plugin-dir` gets the id `{name}-inline`, not `{name}`. Tests must read `$CLAUDE_PLUGIN_DATA` from the hook environment rather than reconstruct the path.
+- Lives in `${CLAUDE_PLUGIN_DATA}`, which resolves to `<config-dir>/plugins/data/{id}/`, is created on first reference, survives plugin updates, and is deleted when the plugin is uninstalled from its last scope. Never in the user's repo. Two details measured during verification ([`docs/VERIFICATION.md`](./docs/VERIFICATION.md)): the config dir is `$CLAUDE_CONFIG_DIR` when set, not always `~/.claude`; and a plugin loaded with `--plugin-dir` gets the id `{name}-inline`, not `{name}`. Tests must read `$CLAUDE_PLUGIN_DATA` from the hook environment rather than reconstruct the path.
 - Not in `${CLAUDE_PLUGIN_ROOT}`: that path changes on every update, and the docs say explicitly not to write state there.
 - Keyed by a run id, with `session_id` recorded as a non-authoritative hint. Session-keyed state cannot survive the cross-session gates of §3.9; D11 records the re-derivation, whose remaining details bind when the emitter writes state.
 - Holds: the current node; `outputs`, a per-node map of the resolved JSON payload each completed step produced, which is the context later steps interpolate; retry counters keyed by edge id; a step count against the run-wide ceiling; the graph hash; and a status of `running` or `awaiting`, with the gate being awaited in a separate optional `gate` field rather than folded into the status string.
@@ -296,7 +297,7 @@ A run of a two-step graph therefore traces as `start`, `SubagentStop`, `begin`, 
 
 Never parsed out of the transcript, and never harvested from tool calls.
 
-**No artifact manifest.** An earlier design added a third tier, a record of the paths each step touched, populated from a `PostToolUse` hook. It is not part of this design and was never necessary: an undeclared write is by definition one the next step was not told to consume. D25 records the removal and why the hook it depended on cannot exist here.
+**No artifact manifest.** There is no third tier recording the paths each step touched, populated from a `PostToolUse` hook. Such a record is unnecessary here: an undeclared write is by definition one the next step was not told to consume. D25 records the decision and why the hook it would depend on cannot exist on this backend.
 
 ### 3.6 Generated step wrappers
 
@@ -397,7 +398,7 @@ A platform lacking any of these cannot host a backend without a workaround, and 
 
 ## §5 Decision ledger
 
-The ledger is its own document: [`docs/DECISIONS.md`](./docs/DECISIONS.md). It records D1 through D25 in the format *what was decided, what else was considered, why*, including the rejected paths, the dead ends, the reversal chain that produced the dispatch mechanism (§5.1 there), and the dependency sweep that re-derived every decision against what justified it.
+The ledger is its own document: [`docs/DECISIONS.md`](./docs/DECISIONS.md). It records D1 through D25 in the format *what was decided, what else was considered, why*, including the rejected paths, the dead ends, and the reversal chain that produced the dispatch mechanism (§5.1 there).
 
 D-numbers are stable. They are cited from this document, from the other documents in `docs/`, and from comments in the source, so they are never renumbered or reused.
 
@@ -455,7 +456,7 @@ Caveat, semantic parity only: the inline lane inherits L10's 10,000-character ou
 
 **Skills as nodes, resolved by execution.** The `skills` frontmatter field preloads full skill content into a generated wrapper at startup, without modifying the user's file (§3.6). The end-to-end run confirms the body arrives and is usable: the child's tools were narrowed to `Glob`, which can list paths but cannot read file contents, so the step returning the marker string proves the body was injected into its context rather than looked up from disk. What remains is narrower than "behaves identically": a preloaded skill's *instructions* are in context, but nothing was tested about its `scripts/`, `references/`, or `assets/` tiers, which progressive disclosure loads on demand.
 
-**A reason string beside a judge's verdict. Proposed, unimplemented.** An earlier version of §1.5 had a natural-language guard return a typed verdict *plus* a free-text reason, with the reason recorded in the trace, so that "why did review loop three times" was answerable from the trace alone. Nothing implements it: there is no reason field on the judge guard in the IR, none in the evaluator, and none in the trace. It is recorded here as an idea rather than dropped, because it is purely additive: no routing would depend on it, so adding it later changes what a run records and not how it moves.
+**A reason string beside a judge's verdict. Proposed, unimplemented.** A natural-language guard could return a typed verdict *plus* a free-text reason, with the reason recorded in the trace, so that "why did review loop three times" is answerable from the trace alone. Nothing implements it: there is no reason field on the judge guard in the IR, none in the evaluator, and none in the trace. It stays on the table because it is purely additive: no routing would depend on it, so adding it later changes what a run records and not how it moves.
 
 **Codex orchestration seam.** Open. §4.1.
 

@@ -33,7 +33,7 @@ The version is part of the claim. L1 records that the subagent spawn depth defau
 
 ## The harness is not part of this repository
 
-Both measurements ran from a local development harness: a minimal Claude Code plugin plus a shell driver. That harness is deliberately not shipped, is excluded by `.gitignore`, and nothing in this repository invokes it. This document therefore describes what it did and what it found, rather than telling a reader to run it. Re-deriving the claims means rebuilding an equivalent minimal plugin; the shape needed is described below.
+Both measurements ran from a local development harness: a minimal Claude Code plugin plus a shell driver. That harness is deliberately not shipped, is excluded by `.gitignore`, and nothing in this repository invokes it. Re-deriving the claims means rebuilding an equivalent minimal plugin; the shape needed is described below.
 
 ## The nesting spike
 
@@ -54,14 +54,14 @@ Four load-bearing assumptions, asserted as six individual checks:
 
 **Check D is the one with no workaround.** If a `block` decision on `SubagentStop` does not redirect the runner, the actuation channel §3.3 rests on does not exist and the design needs rethinking. A, B and C all have fallbacks; D does not.
 
-**Check C was tightened after the first green run.** The child's `tools` was narrowed to `Glob`, which cannot read file contents, so returning the marker proves the skill body was injected rather than looked up from disk.
+**Check C requires a tool set that cannot read files.** The child's `tools` was narrowed to `Glob`, which cannot read file contents, so returning the marker proves the skill body was injected rather than looked up from disk. Without that narrowing the check proves nothing.
 
-**Four harness bugs had to be fixed before the platform was reached at all**, and each would have read as a design failure if it had not been chased down:
+**Four platform behaviours stand between a plausible-looking plugin and a hook that fires at all.** Each one presents as a design failure until it is traced to its cause:
 
-- ESM/CJS module-type inheritance: the dispatcher emitted as `.js` inherited `"type": "module"` from an ancestor `package.json` and died with `ReferenceError: require is not defined` on every hook fire (§3.1).
-- A hard-coded `~/.claude` data path: the config directory is `$CLAUDE_CONFIG_DIR` when set (§3.4).
-- A `{name}` versus `{name}-inline` plugin id: a `--plugin-dir` load gets the `-inline` suffix, so `$CLAUDE_PLUGIN_DATA` must be read from the hook environment rather than reconstructed (§3.4).
-- `--debug` swallowing the trailing positional prompt, because it takes an optional filter argument (D18).
+- ESM/CJS module-type inheritance: a dispatcher emitted as `.js` inherits `"type": "module"` from an ancestor `package.json` and dies with `ReferenceError: require is not defined` on every hook fire (§3.1).
+- The data path cannot be hard-coded to `~/.claude`: the config directory is `$CLAUDE_CONFIG_DIR` when set (§3.4).
+- `{name}` versus `{name}-inline` plugin id: a `--plugin-dir` load gets the `-inline` suffix, so `$CLAUDE_PLUGIN_DATA` must be read from the hook environment rather than reconstructed (§3.4).
+- `--debug` swallows the trailing positional prompt, because it takes an optional filter argument (D18).
 
 ## The entrypoint probe
 
@@ -166,11 +166,11 @@ The version-sensitive claims, and what confirming each one requires:
 - `claude plugin validate --strict` does not validate `commands/` either, consistent with it covering only the manifest and `hooks.json`
 
 **Verified by execution, the first end-to-end run, `2.1.229`, 13 August 2026 (§3.2, §3.3):**
-- A `block` decision on `UserPromptExpansion` **cancels the command's expansion** and prints the reason. It does not hand the conversation an instruction, which is what the same decision does on `SubagentStop`. A dispatcher that blocks here seeds a run and strands it: nothing is spawned, and nothing remains that could spawn it. Measured after an implementation assumed the two events behaved alike
+- A `block` decision on `UserPromptExpansion` **cancels the command's expansion** and prints the reason. It does not hand the conversation an instruction, which is what the same decision does on `SubagentStop`. A dispatcher that blocks here seeds a run and strands it: nothing is spawned, and nothing remains that could spawn it. The two events are opposite in effect on the same decision, so neither can be inferred from the other
 - Letting the expansion through instead puts the command's **body** in front of the model, which is what starts a run. Corroborated twice: the entrypoint probe's command body came back verbatim when its hook exited 0, and the run command's body spawns the runner
 - A full two-step graph then runs to completion under the transition table. The trace reads `start`, `SubagentStop`, `begin`, `SubagentStop`, `advance` (`draft` to `check` via edge `draft:1`), `SubagentStop`, `end`, and the run's state file is deleted at the terminal node
 - **The judge round trip works against a real model.** Trace: `begin`, `SubagentStop`, `ask` (the dispatcher blocks with the question), `SubagentStop` (the runner replies), `advance` on the `yes` edge. The two-pass mechanism is forced by the platform, since a command hook cannot ask a model anything and parallel hooks cannot be pipelined, and the runner did comply with a request for a single word
-- **A gate parks and resumes across a session boundary.** One run, two sessions: the first parks at the gate with `node` already moved to the node it will resume into, and a second session with no prior knowledge of the run releases it and drives it to `end`. This is the D11 re-derivation working: state keyed by run id, with the session recorded only as a hint. Keyed by `session_id` as originally specified, the second session could not have found the run at all
+- **A gate parks and resumes across a session boundary.** One run, two sessions: the first parks at the gate with `node` already moved to the node it will resume into, and a second session with no prior knowledge of the run releases it and drives it to `end`. This is D11's state design working: state keyed by run id, with the session recorded only as a hint. Keyed by `session_id` instead, the second session could not have found the run at all
 - The parent conversation cannot see any of this. It reported that the wrong step had run and that the runner had ignored its instruction, while the trace showed both steps running in order. That is the third time a parent has misread a run it could not see inside, and it is L9 behaving exactly as documented rather than a defect
 
 **Searched for and not found:**

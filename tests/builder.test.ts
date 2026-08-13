@@ -1539,9 +1539,10 @@ describe("unguarded cycle detection", () => {
   });
 
   it("refuses a bare limit on an unconditional back edge, which bounded nothing", () => {
-    // This used to compile, and the test that certified it asserted only that
-    // compile() did not throw. The evaluator reads `limit` on the retry path
-    // alone, so the loop below spun forever with a ceiling written on it.
+    // The evaluator reads `limit` on the retry path alone, so a limit on an
+    // unconditional edge bounds nothing and the loop below spins forever with a
+    // ceiling written on it. A test asserting only that compile() did not throw
+    // would certify exactly that graph.
     const wf = workflow({ name: "bounded" });
     wf.step("a", { skill: "s" });
     wf.step("b", { skill: "s" });
@@ -1636,12 +1637,12 @@ describe("unguarded cycle detection", () => {
 
 /**
  * The only tests here that reach into the evaluator, for one specific reason:
- * the defect they cover was the builder and the evaluator disagreeing about
- * what `limit` means. The lint counted any limit as a loop ceiling; the
+ * the builder and the evaluator have to agree about what `limit` means. The
  * evaluator consults `edge.limit` only when a guard fails and the edge's
- * `otherwise` is a retry. A test that stopped at "compile() did not throw"
- * therefore certified graphs that provably never terminate, so these drive the
- * compiled graph and require it to stop.
+ * `otherwise` is a retry, so a lint that counted any limit as a loop ceiling
+ * would pass graphs that provably never terminate, and a test that stopped at
+ * "compile() did not throw" would certify them. These drive the compiled graph
+ * and require it to stop.
  */
 describe("limit, at runtime", () => {
   /** One node, one guarded exit, retrying while the guard fails. */
@@ -1685,8 +1686,7 @@ describe("limit, at runtime", () => {
   });
 
   it("refuses the inert-limit cycle, because nothing on that path ever reads the limit", () => {
-    // Hand-built, because the builder now refuses to author this shape, which is
-    // the fix. Before it did, and `isUnbounded()` read the limit as a ceiling.
+    // Hand-built, because the builder refuses to author this shape.
     const nodes: IrNode[] = [
       { id: "a", skill: "s" },
       { id: "b", skill: "s" },
