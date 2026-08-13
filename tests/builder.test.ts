@@ -1,12 +1,13 @@
 import { describe, expect, it } from "vitest";
 
-import { END, judge, lintGraph, retry, when, workflow } from "../src/builder.js";
+import { END, judge, lintGraph, parsePrompt, retry, when, workflow } from "../src/builder.js";
 import { evaluate, observationsFor } from "../src/evaluate.js";
 import { canonicalize, graphHash } from "../src/hash.js";
 import type {
   Guard,
   IrEdge,
   IrNode,
+  JsonValue,
   ObservationRequest,
   ObservationResult,
   RunState,
@@ -506,7 +507,7 @@ describe("output shorthand", () => {
     const wf = workflow({ name: "o" });
     wf.step("a", {
       skill: "review-changes",
-      prompt: "Review {{research.notes}}",
+      prompt: "Review the diff at depth {{params.depth}}",
       params: { depth: 2 },
       model: "opus",
       maxTurns: 7,
@@ -519,7 +520,7 @@ describe("output shorthand", () => {
     expect(nodeById(wf.compile(), "a")).toEqual({
       id: "a",
       skill: "review-changes",
-      prompt: "Review {{research.notes}}",
+      prompt: "Review the diff at depth {{params.depth}}",
       params: { depth: 2 },
       model: "opus",
       maxTurns: 7,
@@ -1164,6 +1165,70 @@ const throwCases: ThrowCase[] = [
     ],
   },
   {
+    name: "step() with a prompt placeholder that is neither form",
+    act: () => workflow({ name: "v" }).step("a", { skill: "s", prompt: "Use {{research.notes}}" }),
+    expected: [
+      /step\("a"\) has a prompt placeholder minflow cannot read: \{\{research\.notes\}\}/,
+      /the only forms are \{\{params\.key\}\}/,
+      /rendered into the step verbatim/,
+    ],
+  },
+  {
+    name: "step() with a prompt placeholder that is never closed",
+    act: () =>
+      workflow({ name: "v" }).step("a", { skill: "s", prompt: "Use {{ctx.research.notes" }),
+    expected: [
+      /step\("a"\) has a prompt placeholder minflow cannot read: \{\{ctx\.research\.notes/,
+      /never closed/,
+    ],
+  },
+  {
+    name: "step() reading a param it does not declare",
+    act: () =>
+      workflow({ name: "v" }).step("a", {
+        skill: "s",
+        prompt: "Depth {{params.depth}}",
+        params: { topic: "graphs" },
+      }),
+    expected: [
+      /step\("a"\) prompt reads \{\{params\.depth\}\}, which names no param it declares/,
+      /Declared params: topic/,
+    ],
+  },
+  {
+    name: "step() reading a param when it declares none at all",
+    act: () => workflow({ name: "v" }).step("a", { skill: "s", prompt: "Depth {{params.depth}}" }),
+    expected: [/Declared params: \(none\)/],
+  },
+  {
+    name: "step() parking a ctx reference in a param value, out of sight of every prompt check",
+    act: () =>
+      workflow({ name: "v" }).step("a", {
+        skill: "s",
+        prompt: "Plan with {{params.hint}}.",
+        params: { hint: "{{ctx.research.notes}}" },
+      }),
+    expected: [
+      /step\("a"\) param "hint" holds \{\{ctx\.research\.notes\}\}/,
+      /A param is a compile-time constant and a ctx reference is not/,
+      /Write the reference in the prompt/,
+    ],
+  },
+  {
+    name: "step() writing a params reference into a param value, which nothing expands",
+    act: () =>
+      workflow({ name: "v" }).step("a", {
+        skill: "s",
+        prompt: "Plan with {{params.hint}}.",
+        params: { topic: "graphs", hint: "about {{params.topic}}" },
+      }),
+    expected: [
+      /step\("a"\) param "hint" holds \{\{params\.topic\}\}/,
+      /never expanded again/,
+      /second substitution pass nothing performs/,
+    ],
+  },
+  {
     name: "entry() naming an unknown node",
     act: () => twoSteps("v").entry("aa"),
     expected: [/entry\("aa"\) names an unknown node/, /Known nodes: a, b/],
@@ -1482,13 +1547,15 @@ describe("every throw path, by message", () => {
   }
 
   it("enumerates every rejection path, not merely every throw statement", () => {
-    // 54 rows over 27 `throw` statements: requireText() and assertGuard() are
+    // 60 rows over 30 `throw` statements: requireText() and assertGuard() are
     // each reached from many call sites with a different message, the retry
-    // ceiling is refused once per shape of bad number, and the unknown-node
-    // message itself has two renderings depending on whether any step has been
-    // declared yet. This length is a drift guard. Deleting a row has to be a
-    // deliberate edit.
-    expect(throwCases).toHaveLength(54);
+    // ceiling is refused once per shape of bad number, an unreadable placeholder
+    // is refused once per way of being unreadable, a template in a param value
+    // is refused once per substitutable form, and both the unknown-node and
+    // unknown-param messages have two renderings depending on whether anything
+    // has been declared yet. This length is a drift guard. Deleting a row has to
+    // be a deliberate edit.
+    expect(throwCases).toHaveLength(60);
   });
 });
 
@@ -1793,6 +1860,537 @@ describe("unguarded cycle detection", () => {
     const ir = wf.compile();
     expect(edgeById(ir, "plan:1").gate).toBe("approve-plan");
     expect(edgeById(ir, "implement:1").goto).toBe("plan");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Prompt templates
+// ---------------------------------------------------------------------------
+
+describe("parsePrompt", () => {
+  it("reports each placeholder in the order it was written, with its form", () => {
+    expect(parsePrompt("Plan from {{ctx.research.notes.0}} at depth {{ params.depth }}.")).toEqual([
+      { kind: "ctx", node: "research", path: "notes.0", text: "{{ctx.research.notes.0}}" },
+      { kind: "params", key: "depth", text: "{{ params.depth }}" },
+    ]);
+  });
+
+  it("finds nothing in a prompt that interpolates nothing", () => {
+    expect(parsePrompt("Write the plan.")).toEqual([]);
+  });
+
+  it("quotes only the head of an unclosed placeholder, flattened onto one line", () => {
+    // Everything after an unclosed "{{" is one placeholder as far as the parser
+    // can tell, and a prompt is often pages long. An error that pastes all of it,
+    // line breaks included, buries the one thing the reader has to see.
+    const [found] = parsePrompt("Use {{ctx.research\n  .notes and a long tail that keeps going");
+    expect(found).toMatchObject({
+      kind: "invalid",
+      reason: expect.stringContaining("never closed"),
+    });
+    expect(found?.text.startsWith("{{ctx.research .notes")).toBe(true);
+    expect(found?.text).toHaveLength(43); // 40 quoted characters, then the ellipsis
+  });
+});
+
+/**
+ * A step's own params are known at the call that declares them, so a typo in one
+ * is refused there rather than at compile(). Everything in this block is about
+ * the half of the check that needs no graph.
+ */
+describe("params placeholders, at the authoring line", () => {
+  function stepWith(prompt: string, params?: Record<string, JsonValue>) {
+    const wf = workflow({ name: "p" });
+    return () =>
+      params === undefined
+        ? wf.step("a", { skill: "s", prompt })
+        : wf.step("a", { skill: "s", prompt, params });
+  }
+
+  it("accepts a reference to a param the step declares", () => {
+    const wf = workflow({ name: "p" });
+    wf.step("a", {
+      skill: "s",
+      prompt: "Search {{params.topic}} to depth {{params.depth}}.",
+      params: { topic: "graphs", depth: 2 },
+    });
+    wf.entry("a");
+    wf.edge("a", END);
+    expect(nodeById(wf.compile(), "a").prompt).toBe(
+      "Search {{params.topic}} to depth {{params.depth}}.",
+    );
+  });
+
+  it("refuses a key the step does not declare, naming what was written and what exists", () => {
+    const message = messageOf(stepWith("Search {{params.topic}}.", { subject: "graphs" }));
+    expect(message).toMatch(/step\("a"\) prompt reads \{\{params\.topic\}\}/);
+    expect(message).toMatch(/names no param it declares/);
+    expect(message).toMatch(/Declared params: subject/);
+  });
+
+  it("says plainly when the step declares no params at all", () => {
+    expect(messageOf(stepWith("Search {{params.topic}}."))).toMatch(/Declared params: \(none\)/);
+  });
+
+  it("does not accept an inherited property as a declared param", () => {
+    // `"constructor" in params` is true for every object literal, so a
+    // membership test that is not an own-property test would let this through
+    // and emit a step whose prompt interpolates a function.
+    expect(messageOf(stepWith("{{params.constructor}}", { topic: "graphs" }))).toMatch(
+      /names no param it declares/,
+    );
+  });
+
+  it("refuses a placeholder that is neither form, naming the offending text", () => {
+    const message = messageOf(stepWith("Review {{research.notes}}."));
+    expect(message).toMatch(/step\("a"\) has a prompt placeholder minflow cannot read/);
+    expect(message).toMatch(/\{\{research\.notes\}\}/);
+    expect(message).toMatch(/the only forms are \{\{params\.key\}\}/);
+  });
+
+  it("refuses a placeholder that is never closed", () => {
+    expect(messageOf(stepWith("Review {{ctx.research.notes."))).toMatch(
+      /placeholder that is never closed/,
+    );
+  });
+
+  it("refuses a params reference carrying a path, since a param is one scalar", () => {
+    expect(messageOf(stepWith("{{params.topic.name}}", { topic: "graphs" }))).toMatch(
+      /names exactly one of this step's declared scalars/,
+    );
+  });
+
+  it("refuses a ctx reference with no path into the payload", () => {
+    expect(messageOf(stepWith("{{ctx.research}}"))).toMatch(
+      /names a node and then a path into that step's payload/,
+    );
+  });
+
+  it("refuses a placeholder that names nothing", () => {
+    expect(messageOf(stepWith("Review {{}}."))).toMatch(/it names nothing/);
+  });
+});
+
+/**
+ * The half that needs the whole graph. A `{{ctx.node.path}}` reference reads a
+ * payload that exists only once that step has run, so it is legal exactly when
+ * the step it names dominates the one reading it: every route from entry passes
+ * through it. A weaker rule admits a template that resolves on one route and not
+ * another, which is invisible on the page and only shows up on the route that
+ * skipped.
+ */
+describe("ctx placeholders, against the whole graph", () => {
+  /** research -> plan -> END, with the prompt under test on "plan". */
+  function chain(prompt: string, declaresOutput = true) {
+    const wf = workflow({ name: "chain" });
+    wf.step(
+      "research",
+      declaresOutput
+        ? { skill: "research-topic", output: { notes: "string" } }
+        : { skill: "research-topic" },
+    );
+    wf.step("plan", { skill: "write-plan", prompt });
+    wf.entry("research");
+    wf.edge("research", "plan");
+    wf.edge("plan", END);
+    return wf;
+  }
+
+  it("accepts a reference to the step immediately before it", () => {
+    const ir = chain("Plan from {{ctx.research.notes}}.").compile();
+    expect(nodeById(ir, "plan").prompt).toBe("Plan from {{ctx.research.notes}}.");
+  });
+
+  it("refuses a reference to a step that declares no output, since running is not producing", () => {
+    // Dominance settles that "research" ran. It settles nothing about whether it
+    // recorded a payload: a step with no schema is under no obligation to
+    // produce one, and a guard that reads no payload lane leaves it having
+    // produced none, so this reference is a run-time failure on a graph that
+    // compiled clean.
+    const message = messageOf(() => chain("Plan from {{ctx.research.notes}}.", false).compile());
+    expect(message).toMatch(/node "plan" prompt reads \{\{ctx\.research\.notes\}\}/);
+    expect(message).toMatch(/"research" declares no output/);
+    expect(message).toMatch(/Running is not producing/);
+    expect(message).toMatch(/Declare what "research" produces, with output or with schema/);
+  });
+
+  const opaqueSchemas: [string, JsonValue][] = [
+    ["a bare object", { type: "object" }],
+    ["an empty properties map", { type: "object", properties: {} }],
+    ["a reference to a definition", { $ref: "#/$defs/Notes" }],
+  ];
+
+  for (const [shape, schema] of opaqueSchemas) {
+    it(`accepts a reference to a step whose schema names no properties: ${shape}`, () => {
+      // The other side of the two checks above. A schema is the promise that the
+      // step produces something; naming the fields is a further promise it does
+      // not have to make, and a schema making only the first still supports a
+      // reference. An empty properties map is the same case wearing a key: with
+      // additionalProperties left open it forbids no field, so there is still
+      // nothing a path can be checked against.
+      const wf = workflow({ name: "opaque" });
+      wf.step("research", { skill: "s", schema });
+      wf.step("plan", { skill: "s", prompt: "Plan from {{ctx.research.notes}}." });
+      wf.entry("research");
+      wf.edge("research", "plan");
+      wf.edge("plan", END);
+      expect(nodeById(wf.compile(), "plan").prompt).toBe("Plan from {{ctx.research.notes}}.");
+    });
+  }
+
+  it("refuses a path the producer's schema cannot hold, listing what it declares", () => {
+    // "research" declares notes and nothing else, so "summary" is not a value
+    // the payload can carry however the step behaves. Provably wrong at compile
+    // time, which is the only kind of path fault worth refusing.
+    const message = messageOf(() => chain("Plan from {{ctx.research.summary}}.").compile());
+    expect(message).toMatch(/node "plan" prompt reads \{\{ctx\.research\.summary\}\}/);
+    expect(message).toMatch(/"research" declares no "summary" in its output/);
+    expect(message).toMatch(/It declares: notes/);
+  });
+
+  it("checks the first segment only, since a declared property may hold any shape", () => {
+    // "notes" is declared as a string here and the reference reads into it as if
+    // it were structured. That is odd, and it is not provably wrong: a schema
+    // constrains what a step is asked for, and this check exists to refuse what
+    // cannot be there rather than to guess at what is merely unusual.
+    const ir = chain("Plan from {{ctx.research.notes.0.text}}.").compile();
+    expect(nodeById(ir, "plan").prompt).toBe("Plan from {{ctx.research.notes.0.text}}.");
+  });
+
+  it("accepts a reference reached through both arms of a branch", () => {
+    // Two routes into "ship", start -> research -> triage -> ship and
+    // start -> research -> triage -> polish -> ship. Both pass through
+    // "research", which is what makes the reference legal, and "research" is not
+    // the entry, so the dominance walk actually has to run.
+    const wf = workflow({ name: "diamond" });
+    wf.step("start", { skill: "s" });
+    wf.step("research", { skill: "s", output: { notes: "string" } });
+    wf.step("triage", { skill: "s" });
+    wf.step("polish", { skill: "s" });
+    wf.step("ship", { skill: "s", prompt: "Ship using {{ctx.research.notes}}." });
+    wf.entry("start");
+    wf.edge("start", "research");
+    wf.edge("research", "triage");
+    wf.branch("triage", judge("Is the diff small?"), { yes: "ship", no: "polish" });
+    wf.edge("polish", "ship");
+    wf.edge("ship", END);
+    expect(nodeById(wf.compile(), "ship").prompt).toBe("Ship using {{ctx.research.notes}}.");
+  });
+
+  it("refuses a reference a branch can skip, and names the route that skips it", () => {
+    // "triage" routes straight to "plan" on the quick arm, so on that route
+    // "research" never ran and there is no payload to interpolate.
+    const wf = workflow({ name: "skippable" });
+    wf.step("triage", { skill: "s" });
+    wf.step("research", { skill: "s", output: { notes: "string" } });
+    wf.step("plan", { skill: "s", prompt: "Plan from {{ctx.research.notes}}." });
+    wf.entry("triage");
+    wf.branch("triage", judge("Do we know enough?"), { no: "research", yes: "plan" });
+    wf.edge("research", "plan");
+    wf.edge("plan", END);
+    const message = messageOf(() => wf.compile());
+    expect(message).toMatch(/node "plan" prompt reads \{\{ctx\.research\.notes\}\}/);
+    expect(message).toMatch(/"research" does not run on every route to "plan"/);
+    expect(message).toMatch(/triage -> plan reaches "plan" without passing through "research"/);
+  });
+
+  it("counts an otherwise divert as a route, since the run can take one", () => {
+    // The only route that skips "b" is the divert out of "a". A check that
+    // followed goto edges alone would call this graph sound and emit a step whose
+    // prompt interpolates a payload that was never produced.
+    const wf = workflow({ name: "divert" });
+    wf.step("a", { skill: "s" });
+    wf.step("b", { skill: "s", output: { notes: "string" } });
+    wf.step("rescue", { skill: "s" });
+    wf.step("c", { skill: "s", prompt: "Continue from {{ctx.b.notes}}." });
+    wf.entry("a");
+    wf.edge("a", "b", when.exitZero("npm test"), { otherwise: "rescue" });
+    wf.edge("b", "c");
+    wf.edge("rescue", "c");
+    wf.edge("c", END);
+    expect(messageOf(() => wf.compile())).toMatch(
+      /a -> rescue -> c reaches "c" without passing through "b"/,
+    );
+  });
+
+  it("is not fooled by a loop back into the graph", () => {
+    // A check that read "d is reachable from b" as "b always ran before d" calls
+    // this legal, because the loop makes d reachable from b. It is not: the
+    // route a -> c -> d skips "b" entirely.
+    const wf = workflow({ name: "loop" });
+    wf.step("a", { skill: "s" });
+    wf.step("b", { skill: "s", output: { notes: "string" } });
+    wf.step("c", { skill: "s" });
+    wf.step("d", { skill: "s", prompt: "Use {{ctx.b.notes}}." });
+    wf.entry("a");
+    wf.edge("a", "b", when.exitZero("npm test"));
+    wf.edge("a", "c");
+    wf.edge("b", "d");
+    wf.edge("c", "d");
+    wf.edge("d", "b", when.field("again").truthy());
+    wf.edge("d", END);
+    expect(messageOf(() => wf.compile())).toMatch(
+      /a -> c -> d reaches "d" without passing through "b"/,
+    );
+  });
+
+  it("accepts a reference downstream of a retry loop, and terminates walking it", () => {
+    // The mirror of the case above, and the case that pins termination. "bundle"
+    // runs on every route into "ship", so the walk that looks for a route around
+    // it finds none, and the implement/review loop it has to exhaust first does
+    // not pass through "bundle". A walk that did not mark where it had been would
+    // circle those two forever rather than answer.
+    const wf = workflow({ name: "retry-loop" });
+    wf.step("implement", { skill: "s" });
+    wf.step("review", { skill: "s" });
+    wf.step("bundle", { skill: "s", output: { artifact: "string" } });
+    wf.step("ship", { skill: "s", prompt: "Ship {{ctx.bundle.artifact}}." });
+    wf.entry("implement");
+    wf.edge("implement", "review");
+    wf.branch("review", judge("Any unresolved findings?"), { yes: "implement", no: "bundle" });
+    wf.edge("bundle", "ship");
+    wf.edge("ship", END);
+    expect(nodeById(wf.compile(), "ship").prompt).toBe("Ship {{ctx.bundle.artifact}}.");
+  });
+
+  it("refuses a reference to a node that does not exist, naming the typo", () => {
+    const message = messageOf(() => chain("Plan from {{ctx.reserch.notes}}.").compile());
+    expect(message).toMatch(/node "plan" prompt reads \{\{ctx\.reserch\.notes\}\}/);
+    expect(message).toMatch(/"reserch" is not a node in this graph/);
+    expect(message).toMatch(/Declared nodes: research, plan/);
+  });
+
+  it("refuses a step reading its own output, which does not exist while it runs", () => {
+    const message = messageOf(() => chain("Plan from {{ctx.plan.notes}}.").compile());
+    expect(message).toMatch(/node "plan" prompt reads \{\{ctx\.plan\.notes\}\}, which is its own/);
+    expect(message).toMatch(/has to name an earlier step/);
+    // Not the dominance line: a node trivially lies on every route to itself, so
+    // the general check would either say nothing or offer a route as a witness
+    // that reads as nonsense.
+    expect(message).not.toMatch(/does not run on every route/);
+  });
+
+  it("leaves an unreachable node's reference to the unreachable line", () => {
+    // Nothing reaches "island", so there is no route to it that skips anything
+    // and no dominance question to answer. Saying both would bury the one line
+    // that names the actual fault.
+    const wf = workflow({ name: "island" });
+    wf.step("a", { skill: "s", output: { notes: "string" } });
+    wf.step("island", { skill: "s", prompt: "Use {{ctx.a.notes}}." });
+    wf.entry("a");
+    wf.edge("a", END);
+    wf.edge("island", END);
+    const message = messageOf(() => wf.compile());
+    expect(message).toMatch(/unreachable nodes: island/);
+    expect(message).not.toMatch(/does not run on every route/);
+  });
+});
+
+/**
+ * The way around the dominance check, rather than a hole in it.
+ *
+ * A backend substitutes a node's params into its prompt and the host then
+ * substitutes run context into the result, both over the same string. A ctx
+ * reference parked in a param value is therefore resolved at run time exactly
+ * like one written in the prompt, while being invisible to every check that
+ * reads `node.prompt`, which is the only text either the builder or `lintGraph`
+ * ever parses.
+ */
+describe("templates hidden in param values", () => {
+  /**
+   * The graph the dominance check exists to refuse: two arms out of "triage",
+   * only one of them through "research", and "plan" reading research's payload.
+   * Written in the prompt it is refused by name. The point of these tests is
+   * that writing it into a param does not buy a way past that.
+   */
+  function skippableProducer(planOptions: Parameters<ReturnType<typeof workflow>["step"]>[1]) {
+    const wf = workflow({ name: "smuggled" });
+    wf.step("triage", { skill: "s" });
+    wf.step("research", { skill: "s", output: { notes: "string" } });
+    return () => {
+      wf.step("plan", planOptions);
+      wf.entry("triage");
+      wf.branch("triage", judge("Do we know enough?"), { no: "research", yes: "plan" });
+      wf.edge("research", "plan");
+      wf.edge("plan", END);
+      return wf.compile();
+    };
+  }
+
+  it("refuses a ctx reference in a param value, on the graph dominance already refuses", () => {
+    // The same reference in the prompt of the same graph throws the dominance
+    // line, and the check has to be no weaker for being routed through a param.
+    const throughPrompt = messageOf(
+      skippableProducer({ skill: "s", prompt: "Plan from {{ctx.research.notes}}." }),
+    );
+    expect(throughPrompt).toMatch(/"research" does not run on every route to "plan"/);
+
+    const throughParam = messageOf(
+      skippableProducer({
+        skill: "s",
+        prompt: "Plan with {{params.hint}}.",
+        params: { hint: "{{ctx.research.notes}}" },
+      }),
+    );
+    expect(throughParam).toMatch(/step\("plan"\) param "hint" holds \{\{ctx\.research\.notes\}\}/);
+    expect(throughParam).toMatch(/A param is a compile-time constant and a ctx reference is not/);
+    expect(throughParam).toMatch(/Write the reference in the prompt/);
+  });
+
+  it("refuses one even where the producer does dominate, since a param is still a constant", () => {
+    // Nothing about the graph makes a param a template. The prompt is where a
+    // ctx reference is read, and it is read there whatever route the run takes.
+    const wf = workflow({ name: "dominating" });
+    wf.step("research", { skill: "s", output: { notes: "string" } });
+    const message = messageOf(() =>
+      wf.step("plan", {
+        skill: "s",
+        prompt: "Plan with {{params.hint}}.",
+        params: { hint: "Notes: {{ctx.research.notes}}" },
+      }),
+    );
+    expect(message).toMatch(/step\("plan"\) param "hint" holds \{\{ctx\.research\.notes\}\}/);
+  });
+
+  it("descends into arrays and objects, because a param value is any JSON", () => {
+    // A check reading only top-level strings is a check with a nested hole in
+    // it, and nesting costs the author nothing.
+    const wf = workflow({ name: "nested" });
+    const message = messageOf(() =>
+      wf.step("plan", {
+        skill: "s",
+        params: { hints: { earlier: ["see {{ctx.research.notes}}"] } },
+      }),
+    );
+    expect(message).toMatch(/step\("plan"\) param "hints\.earlier\.0" holds/);
+    expect(message).toMatch(/\{\{ctx\.research\.notes\}\}/);
+  });
+
+  it("refuses a params reference in a param value, which nothing would ever expand", () => {
+    // Substitution is one pass over the prompt, so a placeholder arriving as a
+    // replacement is not rescanned: it reaches the step as the literal text
+    // {{params.topic}}. Expanding it instead would mean a second pass, which is
+    // a templating language nobody asked this to be.
+    const wf = workflow({ name: "second-pass" });
+    const message = messageOf(() =>
+      wf.step("plan", {
+        skill: "s",
+        prompt: "Plan with {{params.hint}}.",
+        params: { topic: "graphs", hint: "about {{params.topic}}" },
+      }),
+    );
+    expect(message).toMatch(/step\("plan"\) param "hint" holds \{\{params\.topic\}\}/);
+    expect(message).toMatch(/never expanded again/);
+    expect(message).toMatch(/second substitution pass nothing performs/);
+  });
+
+  it("leaves an ordinary param value alone, braces and all", () => {
+    // The other side: params are the cheap half of the template and most values
+    // are plain data. Text that is neither substitutable form is inert, so
+    // refusing it would forbid a param that legitimately carries braces.
+    const wf = workflow({ name: "ordinary" });
+    wf.step("plan", {
+      skill: "s",
+      prompt: "Render {{params.shape}} at depth {{params.depth}}.",
+      params: { shape: { fields: ["a", "b"] }, depth: 2, template: "{{name}} of {}" },
+    });
+    wf.entry("plan");
+    wf.edge("plan", END);
+    expect(nodeById(wf.compile(), "plan").params).toEqual({
+      shape: { fields: ["a", "b"] },
+      depth: 2,
+      template: "{{name}} of {}",
+    });
+  });
+
+  it("reports it from lintGraph too, for an IR that never passed through step()", () => {
+    const nodes: IrNode[] = [
+      {
+        id: "a",
+        skill: "s",
+        schema: { type: "object", properties: { notes: { type: "string" } } },
+      },
+      { id: "b", skill: "s", prompt: "Use {{params.hint}}.", params: { hint: "{{ctx.a.notes}}" } },
+    ];
+    const edges: IrEdge[] = [
+      { id: "a:1", from: "a", event: "pass", guard: { kind: "always" }, goto: "b" },
+      { id: "b:1", from: "b", event: "pass", guard: { kind: "always" }, goto: END },
+    ];
+    expect(lintGraph({ entry: "a", nodes, edges })).toEqual([
+      expect.stringMatching(/node "b" param "hint" holds \{\{ctx\.a\.notes\}\}/),
+    ]);
+  });
+
+  it("checks params on a node that has no prompt of its own", () => {
+    // The prompt is what carries a reference into a run, but it is not what
+    // makes a param value a constant. A check hung off the presence of a prompt
+    // would pass this node and then pass it again the moment a prompt was added.
+    const wf = workflow({ name: "no-prompt" });
+    expect(
+      messageOf(() => wf.step("plan", { skill: "s", params: { hint: "{{ctx.a.b}}" } })),
+    ).toMatch(/step\("plan"\) param "hint" holds \{\{ctx\.a\.b\}\}/);
+  });
+});
+
+/**
+ * The same prompt checks, on an IR that never passed through `step()`. The IR is
+ * plain data and a second front-end can hand us one directly, so the two local
+ * faults the builder throws on have to be reported here as well.
+ */
+describe("lintGraph on prompts in an IR the builder never built", () => {
+  function lintPrompt(node: IrNode): string[] {
+    const edges: IrEdge[] = [
+      { id: `${node.id}:1`, from: node.id, event: "pass", guard: { kind: "always" }, goto: END },
+    ];
+    return lintGraph({ entry: node.id, nodes: [node], edges });
+  }
+
+  it("returns an unreadable placeholder as a line rather than throwing", () => {
+    expect(lintPrompt({ id: "a", skill: "s", prompt: "Use {{research.notes}}." })).toEqual([
+      expect.stringMatching(/node "a" has a prompt placeholder minflow cannot read/),
+    ]);
+  });
+
+  it("returns a params key the node does not declare", () => {
+    expect(
+      lintPrompt({
+        id: "a",
+        skill: "s",
+        prompt: "Depth {{params.depth}}.",
+        params: { topic: "g" },
+      }),
+    ).toEqual([expect.stringMatching(/node "a" prompt reads .+Declared params: topic/s)]);
+  });
+
+  it("says a bad reference once, however many times the prompt writes it", () => {
+    const problems = lintPrompt({
+      id: "a",
+      skill: "s",
+      prompt: "Use {{ctx.gone.notes}} and again {{ctx.gone.notes}}.",
+    });
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toMatch(/"gone" is not a node in this graph/);
+  });
+
+  it("has nothing to say about a prompt whose references all resolve", () => {
+    const nodes: IrNode[] = [
+      {
+        id: "a",
+        skill: "s",
+        schema: { type: "object", properties: { notes: { type: "string" } } },
+      },
+      {
+        id: "b",
+        skill: "s",
+        prompt: "Use {{ctx.a.notes}} at {{params.depth}}.",
+        params: { depth: 2 },
+      },
+    ];
+    const edges: IrEdge[] = [
+      { id: "a:1", from: "a", event: "pass", guard: { kind: "always" }, goto: "b" },
+      { id: "b:1", from: "b", event: "pass", guard: { kind: "always" }, goto: END },
+    ];
+    expect(lintGraph({ entry: "a", nodes, edges })).toEqual([]);
   });
 });
 

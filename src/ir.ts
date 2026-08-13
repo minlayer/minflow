@@ -61,9 +61,26 @@ export interface IrNode {
   id: NodeId;
   /** The user's skill this node invokes. */
   skill: string;
-  /** Template over the run context, producing the invocation. */
+  /**
+   * The step's task, as a template over the run context.
+   *
+   * Two placeholder forms, and the difference is when each is resolved:
+   *
+   * - `{{params.key}}` names one of this node's own {@link IrNode.params}. It is
+   *   fixed when the graph compiles, so a backend substitutes it at emit time.
+   * - `{{ctx.node.dot.path}}` reads a path out of an earlier step's payload,
+   *   which only exists once that step has run, so a host substitutes it from
+   *   `RunState.outputs` at spawn time.
+   *
+   * A `ctx` reference is legal only when the node it names **dominates** this
+   * one, meaning every path from the entry node reaches this node through it.
+   * Anything weaker permits a graph whose branches decide whether the value
+   * exists, and a template that resolves on one route and not another is a
+   * failure the author cannot see when writing it. Dominance is decidable from
+   * the graph alone, so it is a compile error rather than a runtime one.
+   */
   prompt?: string;
-  /** Scalars interpolated inline into the prompt. */
+  /** Scalars this node's own prompt may interpolate as `{{params.key}}`. */
   params?: Record<string, JsonValue>;
   /** Structured-output contract for the step, as JSON Schema. */
   schema?: JsonValue;

@@ -640,6 +640,119 @@ function fence(language: string, contents: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Prompt templates
+// ---------------------------------------------------------------------------
+
+/**
+ * The two placeholder forms a node's prompt may carry (see `IrNode.prompt`).
+ *
+ * Held as sources rather than as regular expressions because a `g` flag carries
+ * a `lastIndex` between calls, and the same pattern is both replaced with and
+ * tested against. Surrounding whitespace is tolerated so that `{{ ctx.a.b }}`
+ * and `{{ctx.a.b}}` are one reference rather than one reference and one hole.
+ *
+ * The dispatcher carries the same two patterns, because the compiled graph is
+ * the IR verbatim and a run therefore sees the template rather than the copy
+ * substituted into a wrapper here.
+ */
+const PARAM_REFERENCE = String.raw`\{\{\s*params\.([^{}\s]+?)\s*\}\}`;
+const CTX_REFERENCE = String.raw`\{\{\s*ctx\.([^{}\s]+?)\s*\}\}`;
+/**
+ * Either form, so any rendered fragment can be tested for one. Composed from the
+ * two above rather than written out a third time, since a placeholder minflow
+ * substitutes has exactly one spelling and this file is where it is fixed.
+ */
+const ANY_REFERENCE = `(?:${PARAM_REFERENCE})|(?:${CTX_REFERENCE})`;
+
+/**
+ * A value interpolated into prose: a string as itself, anything else as its
+ * canonical JSON.
+ *
+ * The string case is the one that has to be special. `canonicalize("notes.md")`
+ * is `"notes.md"` with the quotes, and a quoted JSON literal dropped into the
+ * middle of a sentence the author wrote is a different sentence.
+ */
+function interpolated(value: JsonValue): string {
+  return typeof value === "string" ? value : canonicalize(value);
+}
+
+/**
+ * Whether rendered text still names a value nothing here can supply.
+ *
+ * Both forms count, and a wrapper is checked for them wherever it quotes the
+ * graph rather than only in its task. `ctx` is the obvious one: it reads a
+ * payload that does not exist until the step it names has run.
+ *
+ * A residual `params` reference is the same fault by another route.
+ * {@link promptWithParams} substitutes in one pass and never rescans what it
+ * wrote, so a param whose own value is a template comes out of it still a
+ * placeholder. Either way the model is shown a placeholder and reads it as part
+ * of its instructions, which is the failure the deferral exists to prevent.
+ */
+function hasPlaceholder(text: string): boolean {
+  return new RegExp(ANY_REFERENCE).test(text);
+}
+
+/**
+ * `node.prompt` with the node's own params substituted, or `undefined` when the
+ * node has no prompt.
+ *
+ * Params are fixed when the graph compiles, so this is the half of the template
+ * a backend can resolve while it writes the file. The `ctx` half cannot be
+ * resolved here at all: it reads a payload that does not exist until the step it
+ * names has run.
+ *
+ * An unknown key is a compile error rather than a placeholder left in place. A
+ * step handed a literal `{{params.depth}}` reads it as part of its instructions,
+ * and nothing downstream can tell that apart from a task that meant to say that.
+ */
+function promptWithParams(node: IrNode): string | undefined {
+  const prompt = node.prompt;
+  if (prompt === undefined) return undefined;
+  const params = node.params ?? {};
+  return prompt.replace(new RegExp(PARAM_REFERENCE, "g"), (_match: string, key: string) => {
+    // Own properties only, so `{{params.constructor}}` is a missing param rather
+    // than a walk up the prototype chain into something that is not JSON.
+    const value = Object.hasOwn(params, key) ? params[key] : undefined;
+    if (value === undefined) {
+      throw new Error(
+        `minflow: node "${node.id}" interpolates {{params.${key}}}, but declares no param ` +
+          `"${key}". Declare it on the step, or correct the name in the prompt.`,
+      );
+    }
+    return interpolated(value);
+  });
+}
+
+/**
+ * What a wrapper says in place of a prompt that still names run context.
+ *
+ * A `{{ctx.…}}` reference reads an earlier step's payload, which exists only
+ * once that step has run, so this file can hold neither the resolved text nor
+ * the unresolved text: a step shown a raw placeholder reads it as part of the
+ * task, which is worse than being shown no task at all. The dispatcher resolves
+ * it at spawn time and hands the whole task over in the instruction, so the
+ * wrapper carries the static role and the instruction carries the concrete work.
+ */
+const DEFERRED_TASK = [
+  "Your task quotes output from an earlier step, which exists only once the run reaches you,",
+  "so it arrives in the instruction you are spawned with rather than here. Do what that",
+  "instruction says.",
+].join("\n");
+
+/**
+ * What a wrapper prints in place of a param value that is still a template.
+ *
+ * The Parameters section sits directly below the task and renders each value the
+ * graph declares, so a value carrying template text puts in front of the model
+ * exactly what the deferral above keeps out of it. The value is deferred rather
+ * than printed for the same reason the task is: nothing at compile time can fill
+ * it, and a placeholder shown to a step is read as part of the step's
+ * instructions.
+ */
+const DEFERRED_VALUE = "(not resolved here; it arrives in the instruction you are spawned with)";
+
+// ---------------------------------------------------------------------------
 // Manifest
 // ---------------------------------------------------------------------------
 
@@ -873,8 +986,11 @@ function stepBody(
     ].join("\n"),
   );
 
-  if (node.prompt !== undefined) {
-    sections.push(["## Task", "", node.prompt.trimEnd()].join("\n"));
+  const prompt = promptWithParams(node);
+  if (prompt !== undefined) {
+    sections.push(
+      ["## Task", "", hasPlaceholder(prompt) ? DEFERRED_TASK : prompt.trimEnd()].join("\n"),
+    );
   }
 
   const params = node.params;
@@ -883,9 +999,16 @@ function stepBody(
     // key order carries no meaning and never reaches the hash. Rendering it in
     // insertion order would make the emitted bytes depend on how the graph was
     // typed rather than on what it says.
+    //
+    // A value that is still a template is deferred instead of printed. The
+    // rendered form is what gets tested, so a placeholder nested inside an
+    // object or an array is caught along with a bare one.
     const lines = Object.keys(params)
       .sort()
-      .map((key) => `- \`${key}\`: ${canonicalize(params[key])}`);
+      .map((key) => {
+        const rendered = canonicalize(params[key]);
+        return `- \`${key}\`: ${hasPlaceholder(rendered) ? DEFERRED_VALUE : rendered}`;
+      });
     if (lines.length > 0) {
       sections.push(["## Parameters", "", ...lines].join("\n"));
     }
@@ -1774,9 +1897,12 @@ function budgetSpent(detail) {
   );
 }
 
-// Hook output is capped at 10,000 characters, so a payload quoted into a judge
-// question gets a budget well inside that cap.
-const QUESTION_PAYLOAD_LIMIT = 4000;
+// Hook output is capped at 10,000 characters, and two of the things this file
+// writes into it are payloads of no bounded size: the JSON a judge is asked
+// about, and a value a prompt interpolates out of an earlier step. One budget
+// for both, well inside the cap, so a large payload costs a marker rather than a
+// decision the platform truncates or discards.
+const QUOTED_PAYLOAD_LIMIT = 4000;
 
 function readJson(file) {
   try {
@@ -1934,29 +2060,190 @@ function deliveryFor(graph, state) {
   return { inline: inline, files: files };
 }
 
+// The two placeholder forms a node prompt may carry. Both are resolved here and
+// not only in the wrapper, because the compiled graph is the IR verbatim: this
+// file reads the template exactly as it was authored.
+//
+// A ctx reference names a step in its first segment and a path into that step's
+// payload in the rest, so a node id containing a dot cannot be named. The
+// emitter splits it the same way, and the two have to agree or a reference the
+// author was told resolves against one step would resolve against another.
+const PARAM_PLACEHOLDER = /\{\{\s*params\.([^{}\s]+?)\s*\}\}/g;
+const CTX_PLACEHOLDER = /\{\{\s*ctx\.([^{}\s]+?)\s*\}\}/g;
+
+// The params form again, unanchored and without the g flag, so whatever the
+// params pass leaves behind can be reported as it reads. That pass replaces
+// every reference it finds and never rescans what it wrote, so a params
+// reference still standing afterwards is one a param's own value introduced.
+//
+// Only the params form is checked, and only between the two passes. A ctx
+// reference the params pass introduced is resolved by the pass that follows it,
+// and text that looks like a placeholder after that pass came out of a step's
+// payload, where it is data this file did not write and must not police.
+// Either form, in one pattern. Resolving both in a single scan is what makes a
+// spliced placeholder impossible: String.replace walks the ORIGINAL string and
+// never rescans what it substituted, so a param value that contributes a brace
+// cannot combine with neighbouring text into a reference. Two sequential passes
+// could, and did: a prompt reading "{{params.open}}{ctx.a.b}}" with a param
+// holding a single brace assembled a ctx reference during the first pass that
+// the second pass then resolved, having never faced the check that the step it
+// names always runs.
+const ANY_PLACEHOLDER = /\{\{\s*(params|ctx)\.([^{}\s]+?)\s*\}\}/g;
+
+// A value interpolated into prose: a string as itself, anything else as JSON.
+// Quoting a string would put a JSON literal in the middle of a sentence the
+// author wrote. Clipped per value, since a payload has no size bound and the
+// instruction it lands in shares the hook's output cap.
+function interpolatedValue(value) {
+  return clip(typeof value === "string" ? value : JSON.stringify(value, null, 2));
+}
+
+// A step's recorded payload, or a path into it, read the way a field guard reads
+// one: numeric segments index arrays, and only own properties count, so
+// "constructor" is absent rather than a walk up the prototype chain.
+function readOutputPath(outputs, reference) {
+  const cut = reference.indexOf(".");
+  const nodeId = cut === -1 ? reference : reference.slice(0, cut);
+  const path = cut === -1 ? "" : reference.slice(cut + 1);
+  if (outputs === null || typeof outputs !== "object" || !Object.hasOwn(outputs, nodeId)) {
+    return { error: 'step "' + nodeId + '" has recorded no output in this run' };
+  }
+  let current = outputs[nodeId];
+  const segments = path === "" ? [] : path.split(".");
+  for (const segment of segments) {
+    if (current === null || current === undefined) {
+      current = undefined;
+      break;
+    }
+    if (Array.isArray(current)) {
+      if (!/^\d+$/.test(segment)) {
+        current = undefined;
+        break;
+      }
+      current = current[Number(segment)];
+      continue;
+    }
+    if (typeof current !== "object" || !Object.hasOwn(current, segment)) {
+      current = undefined;
+      break;
+    }
+    current = current[segment];
+  }
+  if (current === undefined) {
+    return { error: 'step "' + nodeId + '" produced no "' + path + '"' };
+  }
+  // Null stops the run; an empty string does not, and the difference is a
+  // judgment call rather than something the JSON says. An empty string is a
+  // value a step can genuinely have produced, so the sentence the author wrote
+  // is rendered with nothing where the value goes and the run carries on. A null
+  // is the step naming the key and putting no value behind it, which is the same
+  // unmet contract as a path that resolves to nothing, and interpolating it
+  // would write the word null into the task as though that were the answer.
+  if (current === null) {
+    return {
+      error:
+        'step "' + nodeId + '" recorded null ' +
+        (path === "" ? "as its whole output" : 'at "' + path + '"') +
+        ", which is a value it did not produce rather than an empty one",
+    };
+  }
+  return { value: current };
+}
+
+// The node's prompt with both placeholder forms resolved: its own params, fixed
+// when the graph compiled, and the run context, which exists only once the steps
+// it names have run.
+//
+// An unresolvable reference stops the run rather than spawning the step with a
+// hole in its task, and rather than handing it the placeholder as if it were
+// prose. A graph compiled by minflow's builder cannot reach this: the builder
+// refuses a ctx reference unless the step it names runs on every path to this
+// one, so the value is on record by the time a run arrives. The IR is plain data
+// and another front-end can hand us anything, which is what this defends.
+function taskFor(graph, state) {
+  const node = graph.nodes.find(function (candidate) {
+    return candidate !== null && typeof candidate === "object" && candidate.id === state.node;
+  });
+  if (!node || typeof node.prompt !== "string") return { text: "" };
+  const params = node.params !== null && typeof node.params === "object" ? node.params : {};
+  const outputs = state.outputs !== null && typeof state.outputs === "object" ? state.outputs : {};
+
+  let failure = null;
+  const stop = function (detail) {
+    if (failure === null) failure = detail;
+    return "";
+  };
+  const text = node.prompt.replace(ANY_PLACEHOLDER, function (match, kind, reference) {
+    if (kind === "params") {
+      if (!Object.hasOwn(params, reference)) {
+        return stop(
+          "its prompt interpolates {{params." + reference + "}}, which the step does not declare",
+        );
+      }
+      return interpolatedValue(params[reference]);
+    }
+    const found = readOutputPath(outputs, reference);
+    if (found.error) {
+      return stop("its prompt interpolates {{ctx." + reference + "}}, but " + found.error);
+    }
+    return interpolatedValue(found.value);
+  });
+  // Nothing scans the result. Placeholder-shaped text in it came out of a param
+  // value or a step's payload, where it is data this file did not write, and a
+  // workflow whose subject is templates may carry it legitimately.
+
+  if (failure !== null) {
+    return {
+      error:
+        'step "' + state.node + '" cannot be started: ' + failure +
+        ". A graph compiled by minflow's builder cannot reach this, because the builder refuses " +
+        "a ctx reference unless the step it names runs on every path to this one; an IR from " +
+        "another front-end can. Fix the template, or the step it reads from.",
+    };
+  }
+  return { text: text };
+}
+
 // The instruction the runner acts on: spawn one named agent, pass it one text.
 // The runner has the Agent tool and nothing else, so this is the only shape it
 // can execute, and paraphrase is the standing risk (SPEC L7).
+//
+// Returns the text, or the reason there is none. A step that cannot be given its
+// task is not spawned with a partial one.
 function stepInstruction(graph, state) {
   const agent = PLUGIN.agents[state.node];
-  if (typeof agent !== "string") return null;
+  if (typeof agent !== "string") {
+    return {
+      error: 'no agent is registered for node "' + state.node + '". Regenerate the plugin.',
+    };
+  }
+  const task = taskFor(graph, state);
+  if (task.error) return task;
+
   const delivery = deliveryFor(graph, state);
-  const task = ['Run step "' + state.node + '" of the "' + PLUGIN.workflow + '" workflow.'];
+  // Paragraphs, not one run-on line: a prompt is authored text and may carry its
+  // own line breaks, so joining everything with spaces would reflow it.
+  const paragraphs = ['Run step "' + state.node + '" of the "' + PLUGIN.workflow + '" workflow.'];
+  if (task.text.trim() !== "") paragraphs.push(task.text.trim());
+  const obligations = [];
   for (const file of delivery.files) {
-    task.push("Write your JSON payload to " + file + ", relative to the project root.");
+    obligations.push("Write your JSON payload to " + file + ", relative to the project root.");
   }
   if (delivery.inline) {
-    task.push(
+    obligations.push(
       "End your final message with your JSON payload as a single fenced json block, with " +
         "nothing after it.",
     );
   }
-  return [
-    "Spawn the subagent " + qualified(agent) + " with the Agent tool, and pass it exactly this " +
-      "text, verbatim:",
-    "",
-    task.join(" "),
-  ].join("\n");
+  if (obligations.length > 0) paragraphs.push(obligations.join(" "));
+  return {
+    text: [
+      "Spawn the subagent " + qualified(agent) + " with the Agent tool, and pass it exactly this " +
+        "text, verbatim:",
+      "",
+      paragraphs.join("\n\n"),
+    ].join("\n"),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -2332,8 +2619,8 @@ function takeAnswer(scratch, event) {
 }
 
 function clip(text) {
-  if (text.length <= QUESTION_PAYLOAD_LIMIT) return text;
-  return text.slice(0, QUESTION_PAYLOAD_LIMIT) + "\n... truncated: hook output is capped.";
+  if (text.length <= QUOTED_PAYLOAD_LIMIT) return text;
+  return text.slice(0, QUOTED_PAYLOAD_LIMIT) + "\n... truncated: hook output is capped.";
 }
 
 function judgeReason(request, state) {
@@ -2561,8 +2848,8 @@ function act(graph, state, transition) {
 
   if (transition.kind === "advance") {
     const instruction = stepInstruction(graph, transition.state);
-    if (instruction === null) {
-      report('no agent is registered for node "' + transition.to + '". Regenerate the plugin.');
+    if (instruction.error) {
+      report(instruction.error);
       return;
     }
     saveState(departed(transition.state));
@@ -2570,7 +2857,7 @@ function act(graph, state, transition) {
       [
         'minflow: step "' + state.node + '" is done; the run advances to "' + transition.to + '".',
         "",
-        instruction,
+        instruction.text,
       ].join("\n"),
     );
     return;
@@ -2578,8 +2865,8 @@ function act(graph, state, transition) {
 
   if (transition.kind === "retry") {
     const instruction = stepInstruction(graph, transition.state);
-    if (instruction === null) {
-      report('no agent is registered for node "' + transition.node + '". Regenerate the plugin.');
+    if (instruction.error) {
+      report(instruction.error);
       return;
     }
     saveState(departed(transition.state));
@@ -2588,7 +2875,7 @@ function act(graph, state, transition) {
         'minflow: step "' + transition.node + '" runs again, attempt ' + transition.attempt + ": " +
           transition.reason,
         "",
-        instruction,
+        instruction.text,
       ].join("\n"),
     );
     return;
@@ -2673,8 +2960,8 @@ function onSubagentStop(event, state) {
   // block-and-redirect the spike verified on this event.
   if (scratch.start === true) {
     const first = stepInstruction(graph, state);
-    if (first === null) {
-      report('no agent is registered for node "' + state.node + '". Regenerate the plugin.');
+    if (first.error) {
+      report(first.error);
       return;
     }
     scratch.start = false;
@@ -2690,7 +2977,7 @@ function onSubagentStop(event, state) {
         'minflow: run ' + state.runId + ' of the "' + PLUGIN.workflow + '" begins at step "' +
           state.node + '".',
         "",
-        first,
+        first.text,
       ].join("\n"),
     );
     return;

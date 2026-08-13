@@ -322,6 +322,69 @@ function schemaOverFileIr(): WorkflowIr {
   return wf.compile();
 }
 
+/**
+ * SPEC §1.3's own shape: a step whose task quotes an earlier step's payload.
+ *
+ * Both halves of the template are here, and they resolve at different times.
+ * `research` interpolates its own params, which are fixed when the graph
+ * compiles. `plan` interpolates `research`'s notes, which exist only once
+ * research has run, and `research` is on every path to `plan`, so the reference
+ * is one a compiled graph may legally carry.
+ */
+function interpolatingIr(): WorkflowIr {
+  const wf = workflow({ name: "interpolating" });
+  wf.step("research", {
+    skill: "research-topic",
+    prompt: "Research {{params.topic}} to depth {{params.depth}}.",
+    params: { topic: "widget latency", depth: 3 },
+    output: { notes: "string" },
+  });
+  wf.step("plan", {
+    skill: "write-plan",
+    prompt: "Write a plan from these notes:\n\n{{ctx.research.notes}}",
+  });
+  wf.entry("research");
+  wf.edge("research", "plan");
+  wf.edge("plan", END);
+  return wf.compile();
+}
+
+/**
+ * A compiled graph with one node's prompt rewritten afterwards, standing in for
+ * an IR that reached the emitter without passing through the builder.
+ *
+ * The hash is left exactly as compiled. `emit` copies it into the dispatcher and
+ * into the graph file from this one object, so the two still agree and a run
+ * reaches the node under test rather than stopping on a hash mismatch.
+ */
+function withPrompt(ir: WorkflowIr, nodeId: NodeId, prompt: string): WorkflowIr {
+  return {
+    ...ir,
+    nodes: ir.nodes.map((node) => (node.id === nodeId ? { ...node, prompt } : node)),
+  };
+}
+
+/**
+ * The same rewrite, for a node's prompt and its params at once.
+ *
+ * Params are where a placeholder hides from the task: the Task section defers a
+ * template it cannot finish, and the Parameters section renders every declared
+ * value directly below it. The builder refuses a ctx reference inside a param,
+ * so a graph shaped like this reaches the emitter only from a front-end that
+ * does not check, which is the case the emitter has to survive.
+ */
+function withPromptAndParams(
+  ir: WorkflowIr,
+  nodeId: NodeId,
+  prompt: string,
+  params: Record<string, JsonValue>,
+): WorkflowIr {
+  return {
+    ...ir,
+    nodes: ir.nodes.map((node) => (node.id === nodeId ? { ...node, prompt, params } : node)),
+  };
+}
+
 /** A step whose payload is read from a file rather than from its final message. */
 function fileLaneIr(): WorkflowIr {
   const wf = workflow({ name: "file-lane" });
@@ -1972,6 +2035,164 @@ describe("a run, driven through the emitted dispatcher", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Run context, interpolated at spawn time
+// ---------------------------------------------------------------------------
+
+describe("a prompt's run context, resolved by the emitted dispatcher", () => {
+  it("puts an earlier step's value into the next step's instruction", async () => {
+    await withPlugin(interpolatingIr(), (plugin) => {
+      // The entry step first, whose template has only params in it. The compiled
+      // graph is the IR verbatim, so the dispatcher reads the template rather
+      // than the copy the wrapper already has substituted, and has to resolve
+      // that half again here.
+      const begun = plugin.begin();
+      expect(begun.reason).toContain("Research widget latency to depth 3.");
+      expect(begun.reason).not.toContain("{{params.");
+
+      // And then the half no compile-time substitution could have made: the
+      // value did not exist until the step above returned it.
+      const notes = "Latency is dominated by the queue.";
+      const advanced = plugin.fire(stopped(reported({ notes })));
+      expect(advanced.reason).toContain("interpolating:step-plan");
+      expect(advanced.reason).toContain("Write a plan from these notes:");
+      expect(advanced.reason).toContain(notes);
+      expect(advanced.reason).not.toContain("{{ctx");
+      expect(plugin.onlyRun().outputs).toEqual({ research: { notes } });
+    });
+  });
+
+  it("stops when a ctx path resolves to nothing, rather than spawning a step with a hole", async () => {
+    // Unreachable from the builder, which refuses a ctx reference the graph does
+    // not prove is on record by the time the step runs. This is the same IR
+    // arriving from somewhere that does not check.
+    const ir = withPrompt(interpolatingIr(), "plan", "Plan from {{ctx.research.findings}}.");
+    await withPlugin(ir, (plugin) => {
+      plugin.begin();
+      const stalled = plugin.fire(stopped(reported({ notes: "Some notes." })));
+
+      expect(stalled.decision).toBeNull();
+      expect(stalled.stderr).toContain('produced no "findings"');
+      // The message says where such a graph can come from, since a reader whose
+      // graph came from the builder would otherwise go looking for a bug there.
+      expect(stalled.stderr).toContain("another front-end");
+      // Neither an empty substitution nor the literal placeholder: the step is
+      // not spawned at all.
+      expect(stalled.stderr).not.toContain("interpolating:step-plan");
+      expect(stalled.stderr).not.toContain("Plan from .");
+    });
+  });
+
+  it("names the step when the reference is to one that has recorded nothing", async () => {
+    const ir = withPrompt(interpolatingIr(), "plan", "Plan from {{ctx.nowhere.notes}}.");
+    await withPlugin(ir, (plugin) => {
+      plugin.begin();
+      const stalled = plugin.fire(stopped(reported({ notes: "Some notes." })));
+      expect(stalled.decision).toBeNull();
+      expect(stalled.stderr).toContain('step "nowhere" has recorded no output');
+    });
+  });
+
+  it("interpolates an empty string, and stops on a null, which is not an empty value", async () => {
+    // Two payloads that both read as "no notes" and are not the same event. An
+    // empty string is a value a step can genuinely have produced, so the
+    // sentence the author wrote renders with nothing where the value goes and
+    // the run carries on. A null is the step naming the key and putting no value
+    // behind it: interpolating it writes the word null into the task as though
+    // that were the answer, and the run advances with nobody any the wiser.
+    await withPlugin(interpolatingIr(), (plugin) => {
+      plugin.begin();
+      const advanced = plugin.fire(stopped(reported({ notes: "" })));
+      expect(advanced.reason).toContain("interpolating:step-plan");
+      expect(advanced.reason).toContain("Write a plan from these notes:");
+      expect(plugin.onlyRun().outputs).toEqual({ research: { notes: "" } });
+    });
+
+    await withPlugin(interpolatingIr(), (plugin) => {
+      plugin.begin();
+      const stalled = plugin.fire(stopped(reported({ notes: null })));
+      expect(stalled.decision).toBeNull();
+      // Stopped with the same clarity a path that resolves to nothing gets.
+      expect(stalled.stderr).toContain('recorded null at "notes"');
+      expect(stalled.stderr).toContain("rather than an empty one");
+      expect(stalled.stderr).not.toContain("interpolating:step-plan");
+    });
+  });
+
+  it("inserts what a param value says, and never resolves it as a placeholder", async () => {
+    // A param whose own value is template text. Substitution is a single scan
+    // over the original prompt, so what a value contributes is inserted and
+    // never looked at again: it reaches the step as the text the author wrote.
+    const ir = withPromptAndParams(interpolatingIr(), "plan", "Write it {{params.style}}.", {
+      style: "{{params.depth}}",
+      depth: 3,
+    });
+    await withPlugin(ir, (plugin) => {
+      plugin.begin();
+      const fired = plugin.fire(stopped(reported({ notes: "Some notes." })));
+      expect(fired.reason).toContain("Write it {{params.depth}}.");
+      expect(fired.reason).not.toContain("Write it 3.");
+    });
+  });
+
+  it("cannot have a ctx reference spliced together out of a param value", async () => {
+    // The bypass a single scan exists to close. Written directly, this reference
+    // is refused at compile time, because "research" does not run on every path
+    // to "plan". Assembled from a brace a param contributes, it used to survive:
+    // the params pass produced "{{ctx.research.notes}}" and the ctx pass then
+    // resolved a reference that had never faced that check. One scan reads the
+    // original text only, so the fragments never meet.
+    const ir = withPromptAndParams(
+      interpolatingIr(),
+      "plan",
+      "Plan {{params.open}}{ctx.research.notes}}.",
+      { open: "{" },
+    );
+    await withPlugin(ir, (plugin) => {
+      plugin.begin();
+      const fired = plugin.fire(stopped(reported({ notes: "CANARY-NOTES" })));
+      expect(fired.reason).toContain("Plan {{ctx.research.notes}}.");
+      expect(fired.reason).not.toContain("CANARY-NOTES");
+    });
+  });
+
+  it("interpolates an object or an array as readable JSON, never as [object Object]", async () => {
+    // Pins what a non-string value becomes. A payload arriving in a step's
+    // instructions as [object Object] is a step told nothing, and the run
+    // advances normally while it happens.
+    const ir = withPrompt(interpolatingIr(), "plan", "Write a plan from {{ctx.research}}.");
+    await withPlugin(ir, (plugin) => {
+      plugin.begin();
+      const advanced = plugin.fire(
+        stopped(reported({ notes: { summary: "queueing dominates", sources: ["a", "b"] } })),
+      );
+      expect(advanced.reason).toContain("interpolating:step-plan");
+      expect(advanced.reason).not.toContain("[object Object]");
+      // Pretty-printed, so the shape reads as well as the values do.
+      expect(advanced.reason).toContain('"summary": "queueing dominates"');
+      expect(advanced.reason).toContain('"sources": [\n      "a",\n      "b"\n    ]');
+    });
+  });
+
+  it("clips a large interpolated value, since a payload has no bound and hook output does", async () => {
+    await withPlugin(interpolatingIr(), (plugin) => {
+      plugin.begin();
+      const huge = "x".repeat(9000);
+      const advanced = plugin.fire(stopped(reported({ notes: huge })));
+
+      // Hook output is capped at 10,000 characters. A payload interpolated whole
+      // would spend the cap on one value, and a decision the platform truncates
+      // or discards is a run that stops with nothing to read.
+      expect(advanced.reason).toContain("truncated: hook output is capped");
+      expect(advanced.reason).not.toContain("x".repeat(4100));
+      expect(advanced.reason.length).toBeLessThan(10000);
+      // Still an instruction, and still carrying the head of the value.
+      expect(advanced.reason).toContain("interpolating:step-plan");
+      expect(advanced.reason).toContain("x".repeat(3900));
+    });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Agents
 // ---------------------------------------------------------------------------
 
@@ -2161,6 +2382,91 @@ describe("the step wrappers", () => {
     expect(wrapper).toContain("Research the topic and write up what you found.");
     expect(wrapper).toContain("- `depth`: 3");
     expect(wrapper).toContain('"additionalProperties": false');
+  });
+
+  it("substitutes the node's own params into the task, at compile time", () => {
+    // Params are known when the graph compiles, so the wrapper carries the
+    // finished sentence rather than a template the step would have to read as
+    // prose.
+    const wrapper = fileOf(emit(interpolatingIr()), "agents/step-research.md");
+    expect(wrapper).toContain("## Task\n\nResearch widget latency to depth 3.\n");
+    expect(wrapper).not.toContain("{{params.");
+    // A string arrives as itself. Rendered the way the parameter list renders
+    // it, the sentence would read: Research "widget latency" to depth 3.
+    expect(wrapper).not.toContain('Research "widget latency"');
+    // And the parameter list is unaffected: it is a list of values, so there the
+    // quoted form is the right one.
+    expect(wrapper).toContain('- `topic`: "widget latency"');
+  });
+
+  it("refuses at compile time a params reference the node does not declare", () => {
+    // Left in place it would reach the step as literal text, and nothing
+    // downstream can tell that apart from a task that meant to say that.
+    const ir = withPrompt(interpolatingIr(), "research", "Research {{params.tpoic}}.");
+    expect(() => emit(ir)).toThrow(/declares no param "tpoic"/);
+  });
+
+  it("keeps a task that still names run context out of the wrapper entirely", () => {
+    const wrapper = fileOf(emit(interpolatingIr()), "agents/step-plan.md");
+    // The value exists only once research has run, so this file can hold neither
+    // the resolved text nor the unresolved text: a step shown the placeholder
+    // reads it as part of its task, which is worse than being shown no task.
+    expect(wrapper).not.toContain("{{ctx");
+    expect(wrapper).not.toContain("Write a plan from these notes");
+    // Still told where the task will come from, so the gap is not a mystery.
+    expect(wrapper).toContain("## Task");
+    expect(wrapper).toContain("arrives in the instruction you are spawned with");
+    // A prompt with nothing left to resolve is still rendered in full.
+    expect(fileOf(emit(interpolatingIr()), "agents/step-research.md")).toContain(
+      "## Task\n\nResearch widget latency",
+    );
+  });
+
+  it("lets no placeholder into a wrapper anywhere, task or parameters", () => {
+    // The deferral above covers the Task section. The Parameters section renders
+    // each declared value directly below it, so a param carrying template text
+    // puts in front of the model the very thing the deferral keeps out, through
+    // the section next door.
+    const ir = withPromptAndParams(
+      interpolatingIr(),
+      "plan",
+      "Write a plan from {{ctx.research.notes}}, in {{params.style}}.",
+      {
+        style: "{{ctx.research.tone}}",
+        // Nested, because the check is on the rendered value rather than on a
+        // value that happens to be a bare placeholder string.
+        nested: { note: "{{ctx.research.notes}}" },
+        plain: "prose",
+      },
+    );
+    const files = emit(ir);
+    // Every wrapper, and the whole of each one rather than its Task section.
+    for (const [path, contents] of Object.entries(files)) {
+      if (!path.startsWith("agents/")) continue;
+      expect(`${path}: ${/\{\{\s*(?:params|ctx)\./.test(contents)}`).toBe(`${path}: false`);
+    }
+    // Deferred, not dropped: the section still lists every param, and says where
+    // the values it cannot print will come from.
+    const wrapper = fileOf(files, "agents/step-plan.md");
+    expect(wrapper).toContain("## Parameters");
+    expect(wrapper).toContain("- `style`: (not resolved here;");
+    expect(wrapper).toContain("- `nested`: (not resolved here;");
+    expect(wrapper).toContain('- `plain`: "prose"');
+  });
+
+  it("defers a task that a param's own value left a placeholder standing in", () => {
+    // The Task section's check is not for ctx alone. Substitution runs in one
+    // pass and never rescans what it wrote, so a param whose value is itself a
+    // template leaves a params placeholder in a prompt that names no ctx at all.
+    const ir = withPromptAndParams(interpolatingIr(), "plan", "Write it {{params.style}}.", {
+      style: "{{params.depth}}",
+      depth: 3,
+    });
+    const wrapper = fileOf(emit(ir), "agents/step-plan.md");
+    expect(wrapper).not.toContain("{{params.");
+    expect(wrapper).toContain("arrives in the instruction you are spawned with");
+    // A param that is a plain value still prints as one.
+    expect(wrapper).toContain("- `depth`: 3");
   });
 
   it("tells a step whose successor is gated that the run parks", () => {

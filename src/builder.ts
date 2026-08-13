@@ -392,6 +392,213 @@ function isRetryBudget(limit: number): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Prompt templates
+// ---------------------------------------------------------------------------
+
+/**
+ * One `{{...}}` occurrence in a node's prompt.
+ *
+ * The two legal forms differ in when they can be resolved at all. `params` names
+ * a scalar the node itself declares, which is fixed once the graph compiles, so
+ * a backend substitutes it at emit time. `ctx` names a path into an earlier
+ * step's payload, which exists only after that step has run, so the host
+ * substitutes it from `RunState.outputs` at spawn time.
+ *
+ * `invalid` is an occurrence that is neither. It is carried back rather than
+ * thrown because the two callers want different things from it:
+ * {@link WorkflowBuilder.step} throws at the authoring line, {@link lintGraph}
+ * collects one line per problem.
+ */
+export type PromptPlaceholder =
+  | { kind: "params"; key: string; text: string }
+  | { kind: "ctx"; node: NodeId; path: string; text: string }
+  | { kind: "invalid"; text: string; reason: string };
+
+/** What one dotted segment of a placeholder may hold. */
+const SEGMENT = /^[A-Za-z0-9_-]+$/;
+
+/** Keeps an unclosed placeholder from dragging the rest of the prompt into a message. */
+const EXCERPT = 40;
+
+/**
+ * Every placeholder in a prompt, in the order they were written.
+ *
+ * Strict on purpose. Anything that is not one of the two forms is reported
+ * rather than passed through, because an unsubstituted placeholder is not inert:
+ * it reaches the model verbatim, so the step runs with the literal text
+ * `{{ctx.research.notes}}` where its input should have been and nothing says so.
+ * A third form later is an edit to this function; guessing at one here is a
+ * prompt that is silently wrong.
+ */
+export function parsePrompt(prompt: string): PromptPlaceholder[] {
+  const found: PromptPlaceholder[] = [];
+  let cursor = 0;
+  for (;;) {
+    const open = prompt.indexOf("{{", cursor);
+    if (open === -1) return found;
+    const close = prompt.indexOf("}}", open + 2);
+    if (close === -1) {
+      found.push({
+        kind: "invalid",
+        text: excerpt(prompt.slice(open)),
+        reason: "it opens a placeholder that is never closed",
+      });
+      return found;
+    }
+    found.push(readPlaceholder(prompt.slice(open + 2, close), prompt.slice(open, close + 2)));
+    cursor = close + 2;
+  }
+}
+
+/** Reads one placeholder's contents, `text` being the whole thing as written. */
+function readPlaceholder(inner: string, text: string): PromptPlaceholder {
+  const invalid = (reason: string): PromptPlaceholder => ({ kind: "invalid", text, reason });
+  const written = inner.trim();
+  if (written === "") return invalid("it names nothing");
+  if (written.includes("{") || written.includes("}")) {
+    return invalid("it holds a brace, so the placeholder before it was probably left unclosed");
+  }
+
+  const [head, ...rest] = written.split(".");
+  if (!rest.every((segment) => SEGMENT.test(segment))) {
+    return invalid(
+      "one of its segments is empty or holds something other than letters, digits, underscores " +
+        "and hyphens",
+    );
+  }
+
+  if (head === "params") {
+    const [key, ...extra] = rest;
+    if (key === undefined || extra.length > 0) {
+      return invalid(
+        "a params reference names exactly one of this step's declared scalars, as in " +
+          "{{params.depth}}",
+      );
+    }
+    return { kind: "params", key, text };
+  }
+
+  if (head === "ctx") {
+    const [producer, ...path] = rest;
+    if (producer === undefined || path.length === 0) {
+      return invalid(
+        "a ctx reference names a node and then a path into that step's payload, as in " +
+          "{{ctx.research.notes}}",
+      );
+    }
+    return { kind: "ctx", node: producer, path: path.join("."), text };
+  }
+
+  return invalid(
+    "the only forms are {{params.key}}, naming one of this step's own params, and " +
+      "{{ctx.node.path}}, naming a path into an earlier step's payload",
+  );
+}
+
+function excerpt(text: string): string {
+  const flat = text.replace(/\s+/g, " ");
+  return flat.length <= EXCERPT ? flat : `${flat.slice(0, EXCERPT)}...`;
+}
+
+/**
+ * The unreadable-placeholder line, written once.
+ *
+ * The same fault is reported at two moments and has to read the same way at
+ * both: `step()` throws it at the call being written, {@link lintGraph} returns
+ * it for a graph that arrived from a front-end which is not the builder.
+ * `subject` is the only difference.
+ */
+function unreadablePrompt(subject: string, placeholder: { text: string; reason: string }): string {
+  return (
+    `${subject} has a prompt placeholder minflow cannot read: ${placeholder.text}, because ` +
+    `${placeholder.reason}. A placeholder nothing substitutes is rendered into the step verbatim.`
+  );
+}
+
+/** The unknown-param line, likewise written once for both callers. */
+function unknownParam(subject: string, text: string, params: Record<string, JsonValue>): string {
+  const keys = Object.keys(params);
+  return (
+    `${subject} prompt reads ${text}, which names no param it declares. Declared params: ` +
+    `${keys.length === 0 ? "(none)" : keys.join(", ")}. A params placeholder is filled from the ` +
+    "step's own params when the graph is emitted, so nothing else can supply it."
+  );
+}
+
+/**
+ * Every placeholder written inside a node's param values, each with the path it
+ * sits at.
+ *
+ * A param value is text a backend splices into the prompt, and both
+ * substitution passes run over that one string: params first, run context
+ * second. A placeholder carried in a param value is therefore substituted like
+ * any other while being invisible to every check that reads `node.prompt`, which
+ * makes it a way around the dominance rule rather than a use of it.
+ *
+ * Param values are `JsonValue`, so the walk descends into arrays and objects
+ * instead of reading top-level strings only.
+ */
+function paramPlaceholders(
+  params: Record<string, JsonValue>,
+): { path: string; placeholder: PromptPlaceholder }[] {
+  const found: { path: string; placeholder: PromptPlaceholder }[] = [];
+  const walk = (value: JsonValue, path: string): void => {
+    if (typeof value === "string") {
+      for (const placeholder of parsePrompt(value)) found.push({ path, placeholder });
+    } else if (Array.isArray(value)) {
+      for (const [index, item] of value.entries()) walk(item, `${path}.${index}`);
+    } else if (value !== null && typeof value === "object") {
+      for (const [key, item] of Object.entries(value)) walk(item, `${path}.${key}`);
+    }
+  };
+  for (const [key, value] of Object.entries(params)) walk(value, key);
+  return found;
+}
+
+/**
+ * Why a placeholder inside a param value cannot stand, or undefined when it is
+ * inert.
+ *
+ * Only the two substitutable forms are refused. Anything else is text no
+ * substitution pass replaces, and refusing it would forbid a param that
+ * legitimately holds braces.
+ */
+function templatedParam(
+  subject: string,
+  path: string,
+  placeholder: PromptPlaceholder,
+): string | undefined {
+  if (placeholder.kind === "ctx") {
+    return (
+      `${subject} param "${path}" holds ${placeholder.text}. A param is a compile-time constant ` +
+      `and a ctx reference is not: it reads a payload that exists only once "${placeholder.node}" ` +
+      "has run. Params are substituted into the prompt before run context is, so a reference " +
+      "written here resolves at run time having never faced the check that the step it names " +
+      "always ran. Write the reference in the prompt, which is where a ctx reference is read."
+    );
+  }
+  if (placeholder.kind === "params") {
+    return (
+      `${subject} param "${path}" holds ${placeholder.text}. A param value is substituted into ` +
+      "the prompt as written and is never expanded again, so this placeholder reaches the step " +
+      "verbatim, and expanding it would take a second substitution pass nothing performs. Write " +
+      "the value out."
+    );
+  }
+  return undefined;
+}
+
+/** Every param-value fault on one node, as lines. Empty when the params are constants. */
+function paramProblems(subject: string, params: Record<string, JsonValue>): string[] {
+  const problems: string[] = [];
+  for (const { path, placeholder } of paramPlaceholders(params)) {
+    const problem = templatedParam(subject, path, placeholder);
+    if (problem !== undefined) problems.push(problem);
+  }
+  return problems;
+}
+
+// ---------------------------------------------------------------------------
 // The builder
 // ---------------------------------------------------------------------------
 
@@ -447,6 +654,32 @@ class Builder implements WorkflowBuilder {
       `step("${at}")`,
       'skill, e.g. { skill: "review-changes" }',
     );
+
+    // A prompt is a template, and its two placeholder forms are answerable at
+    // different moments. A params reference names one of this node's own
+    // scalars, which are right here, so a typo in one is caught at the line that
+    // wrote it. A ctx reference needs the whole edge set to decide whether the
+    // step it names has certainly run, and no edge exists yet, so it is left to
+    // lintGraph.
+    const params = options.params ?? {};
+
+    // A param is a constant, and both its value and this step's own prompt are
+    // right here, so a template hidden in a value is refused at the line that
+    // wrote it. This is not a stylistic rule: the substitution passes run over
+    // one string, params first and run context second, so a ctx reference
+    // written into a value would be resolved by the host without ever having
+    // been read as a reference by anything that checks one.
+    const [smuggled] = paramProblems(`step("${at}")`, params);
+    if (smuggled !== undefined) throw new Error(`minflow: ${smuggled}`);
+
+    for (const placeholder of parsePrompt(options.prompt ?? "")) {
+      if (placeholder.kind === "invalid") {
+        throw new Error(`minflow: ${unreadablePrompt(`step("${at}")`, placeholder)}`);
+      }
+      if (placeholder.kind === "params" && !Object.hasOwn(params, placeholder.key)) {
+        throw new Error(`minflow: ${unknownParam(`step("${at}")`, placeholder.text, params)}`);
+      }
+    }
 
     const node: IrNode = { id: at, skill };
     if (options.prompt !== undefined) node.prompt = options.prompt;
@@ -728,9 +961,14 @@ export interface LintableGraph {
  * built through the builder cannot reach an emitter in a broken state. It is
  * exported because the builder is not the only way to produce an IR: the IR is
  * plain data, a second front-end can hand us one directly, and that graph deserves
- * the same four checks. Several of them, an unconditional cycle in particular,
+ * the same checks. Several of them, an unconditional cycle in particular,
  * describe shapes the builder refuses to author at all, so this is the only
  * place they can still be caught, and the only place they can be tested.
+ *
+ * One of them has no earlier moment it could run at even for a graph the builder
+ * did author: a `{{ctx.node.path}}` reference is legal only when the step it
+ * names runs on every route to the reference, which is a property of the whole
+ * edge set and unknowable while a single step is being declared.
  *
  * @returns One line per problem, empty when the graph is sound.
  */
@@ -745,6 +983,7 @@ export function lintGraph(graph: LintableGraph): string[] {
     ...(missingEntry.length > 0 ? [] : unreachableProblems(graph.nodes, reachable, graph.entry)),
     ...deadEndProblems(graph.nodes, graph.edges, reachable),
     ...unguardedCycleProblems(graph.edges, reachable),
+    ...promptProblems(graph),
   ];
 }
 
@@ -764,15 +1003,20 @@ function entryProblems(nodes: IrNode[], entry: NodeId): string[] {
   ];
 }
 
-/** Nodes the run can actually arrive at, following both `goto` and `otherwise`. */
-function reachableFrom(entry: NodeId, edges: IrEdge[]): Set<NodeId> {
+/** Edges indexed by the node they leave, for any walk that follows the graph forwards. */
+function outgoingByNode(edges: IrEdge[]): Map<NodeId, IrEdge[]> {
   const outgoing = new Map<NodeId, IrEdge[]>();
   for (const edge of edges) {
     const list = outgoing.get(edge.from);
     if (list === undefined) outgoing.set(edge.from, [edge]);
     else list.push(edge);
   }
+  return outgoing;
+}
 
+/** Nodes the run can actually arrive at, following both `goto` and `otherwise`. */
+function reachableFrom(entry: NodeId, edges: IrEdge[]): Set<NodeId> {
+  const outgoing = outgoingByNode(edges);
   const seen = new Set<NodeId>([entry]);
   const queue: NodeId[] = [entry];
   while (queue.length > 0) {
@@ -935,6 +1179,189 @@ function unguardedCycleProblems(edges: IrEdge[], reachable: Set<NodeId>): string
       `unguarded cycle: ${cycle}. Every edge in it fires unconditionally with no limit, ` +
       "so the graph cannot terminate. Guard one of those edges, give it a limit, or gate it.",
   );
+}
+
+/**
+ * Every prompt placeholder that will not be substituted when the run reaches it.
+ *
+ * Two of the faults are local to a node and are already refused at `step()`.
+ * They are checked again here because the IR is plain data and a second
+ * front-end can hand us a graph the builder never saw.
+ *
+ * The third is why this check exists at all. `{{ctx.node.path}}` reads an
+ * earlier step's payload, so it resolves only if that step has certainly run,
+ * which means the step has to **dominate** the referencing node: every route
+ * from entry to the reference passes through it. Anything weaker is a template
+ * that resolves on one route and not another, which the author cannot see while
+ * writing it and the run discovers only on the route that skipped.
+ */
+function promptProblems(graph: LintableGraph): string[] {
+  const byId = new Map(graph.nodes.map((node) => [node.id, node] as const));
+  const problems: string[] = [];
+  for (const node of graph.nodes) {
+    const subject = `node "${node.id}"`;
+    const params = node.params ?? {};
+    // Checked whether or not the node has a prompt, and before it: a param
+    // carrying a template is the one route by which a reference reaches a run
+    // without appearing in `node.prompt` at all.
+    problems.push(...paramProblems(subject, params));
+    const prompt = node.prompt;
+    if (prompt === undefined) continue;
+    for (const placeholder of parsePrompt(prompt)) {
+      if (placeholder.kind === "invalid") {
+        problems.push(unreadablePrompt(subject, placeholder));
+      } else if (placeholder.kind === "params") {
+        if (!Object.hasOwn(params, placeholder.key)) {
+          problems.push(unknownParam(subject, placeholder.text, params));
+        }
+      } else {
+        const problem = ctxProblem(graph, byId, node.id, placeholder);
+        if (problem !== undefined) problems.push(problem);
+      }
+    }
+  }
+  // One prompt can carry the same placeholder twice, and the second line would
+  // repeat the first word for word.
+  return [...new Set(problems)];
+}
+
+/** Why a `ctx` reference cannot be honoured, or undefined when it can be. */
+function ctxProblem(
+  graph: LintableGraph,
+  byId: Map<NodeId, IrNode>,
+  reader: NodeId,
+  placeholder: { node: NodeId; path: string; text: string },
+): string | undefined {
+  const subject = `node "${reader}"`;
+  const producer = placeholder.node;
+
+  if (producer === reader) {
+    return (
+      `${subject} prompt reads ${placeholder.text}, which is its own output. A step's payload ` +
+      "exists only once that step has finished, so a ctx reference has to name an earlier step."
+    );
+  }
+  const declared = byId.get(producer);
+  if (declared === undefined) {
+    return (
+      `${subject} prompt reads ${placeholder.text}, but "${producer}" is not a node in this ` +
+      `graph. Declared nodes: ${[...byId.keys()].join(", ")}.`
+    );
+  }
+
+  // Dominance answers whether the producer ran, which is a weaker thing than
+  // whether it recorded anything. A step declaring no output contract promises
+  // no payload, and a guard that reads no payload lane leaves it having recorded
+  // none, so the reference resolves to a run-time failure on a graph that
+  // compiled clean.
+  if (declared.schema === undefined) {
+    return (
+      `${subject} prompt reads ${placeholder.text}, but "${producer}" declares no output. ` +
+      "Running is not producing: a step with no schema promises no payload, so nothing obliges " +
+      "it to record one and the reference has nothing to read. Declare what " +
+      `"${producer}" produces, with output or with schema.`
+    );
+  }
+
+  // Only the first segment, and only against a schema that names properties. A
+  // declared property may hold any shape, so a deeper segment is unusual rather
+  // than provably wrong, and this refuses what the schema says cannot be there
+  // rather than guessing at the rest.
+  const properties = declaredProperties(declared.schema);
+  const [head] = placeholder.path.split(".");
+  if (properties !== undefined && head !== undefined && !properties.includes(head)) {
+    return (
+      `${subject} prompt reads ${placeholder.text}, but "${producer}" declares no "${head}" in ` +
+      `its output. It declares: ${properties.join(", ")}. A ctx reference reads a path out of ` +
+      "the producer's payload, and only what its schema names is promised to be there."
+    );
+  }
+
+  const detour = routeAvoiding(graph, reader, producer);
+  if (detour === undefined) return undefined;
+  return (
+    `${subject} prompt reads ${placeholder.text}, but "${producer}" does not run on every route ` +
+    `to "${reader}": ${detour.join(" -> ")} reaches "${reader}" without passing through ` +
+    `"${producer}", so on that route there is nothing to interpolate. Read the value from a step ` +
+    `every route passes through, or make "${producer}" one of them.`
+  );
+}
+
+/**
+ * The property names a producer's schema declares, or undefined when it names
+ * none.
+ *
+ * Only an object schema carrying a `properties` object says what a payload
+ * holds. A `$ref`, a composition, or a bare `{ "type": "object" }` promises a
+ * payload without naming its fields, and an empty `properties` names none
+ * either, so in all of those there is nothing a path can be checked against.
+ */
+function declaredProperties(schema: JsonValue): string[] | undefined {
+  if (schema === null || typeof schema !== "object" || Array.isArray(schema)) return undefined;
+  const properties = schema.properties;
+  if (
+    properties === undefined ||
+    properties === null ||
+    typeof properties !== "object" ||
+    Array.isArray(properties)
+  ) {
+    return undefined;
+  }
+  const names = Object.keys(properties);
+  return names.length === 0 ? undefined : names;
+}
+
+/**
+ * A route from entry to `target` that never passes through `avoid`, or undefined
+ * when there is none.
+ *
+ * This is the dominance test itself rather than an approximation of it: `avoid`
+ * dominates `target` exactly when deleting `avoid` disconnects `target` from
+ * entry, since a surviving route is by definition a route that reaches the
+ * target without it. Running the test as a breadth-first walk makes the witness
+ * the same object as the answer, and the shortest such witness, so the error can
+ * show the route rather than assert a property of the graph the reader has to
+ * verify by hand.
+ *
+ * Cycles cost nothing. The walk marks a node the first time it is queued and
+ * never enters it twice, so a retry loop is traversed once like any other edge,
+ * and the parent links it leaves behind form a tree rather than a cycle.
+ *
+ * A target entry cannot reach at all has no route with or without `avoid`, so an
+ * unreachable node's `ctx` references say nothing here. They are covered by the
+ * unreachable check, which names the fault that actually stranded them.
+ */
+function routeAvoiding(graph: LintableGraph, target: NodeId, avoid: NodeId): NodeId[] | undefined {
+  // Entry is on every route by construction, so nothing can route around it.
+  if (graph.entry === avoid) return undefined;
+
+  const outgoing = outgoingByNode(graph.edges);
+  const cameFrom = new Map<NodeId, NodeId>();
+  const queue: NodeId[] = [graph.entry];
+  const seen = new Set<NodeId>(queue);
+  for (let head = 0; head < queue.length; head += 1) {
+    const node = queue[head];
+    if (node === undefined) break;
+    if (node === target) return routeTo(cameFrom, node);
+    for (const edge of outgoing.get(node) ?? []) {
+      for (const next of edgeTargets(edge)) {
+        if (isEnd(next) || next === avoid || seen.has(next)) continue;
+        seen.add(next);
+        cameFrom.set(next, node);
+        queue.push(next);
+      }
+    }
+  }
+  return undefined;
+}
+
+/** Follows the walk's parent links back to entry, then reads them forwards. */
+function routeTo(cameFrom: Map<NodeId, NodeId>, target: NodeId): NodeId[] {
+  const route = [target];
+  for (let node = cameFrom.get(target); node !== undefined; node = cameFrom.get(node)) {
+    route.push(node);
+  }
+  return route.reverse();
 }
 
 // ---------------------------------------------------------------------------

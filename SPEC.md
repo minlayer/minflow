@@ -95,7 +95,7 @@ The IR is the asset, so its contents are stated rather than implied. This is wha
 |---|---|
 | `id` | Node name, used as the state value |
 | `skill` | The user's skill this node invokes |
-| `prompt` | Template over `ctx`, producing the invocation |
+| `prompt` | Template over the run context, producing the invocation. `{{params.key}}` is fixed at compile time; `{{ctx.node.path}}` reads an earlier step's payload and is legal only when that step **dominates** this one, so the value is present on every route |
 | `params` | Scalars interpolated inline |
 | `schema` | Optional structured-output contract for the step |
 | `model` | Optional per-node model override |
