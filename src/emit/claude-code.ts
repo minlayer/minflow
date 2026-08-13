@@ -1779,22 +1779,6 @@ function stepInstruction(graph, state) {
   ].join("\n");
 }
 
-// A run segment starts in the main conversation, which has to spawn the runner
-// before the runner can spawn anything. Both levels are named explicitly so no
-// reader has to infer which agent the instruction is for.
-function runnerReason(headline, instruction) {
-  return [
-    "minflow: " + headline,
-    "",
-    "Spawn the subagent " + PLUGIN.runner + " with the Agent tool, and give it exactly this " +
-      "instruction, verbatim:",
-    "",
-    instruction,
-    "",
-    "Do not do the work yourself, and spawn nothing else.",
-  ].join("\n");
-}
-
 // ---------------------------------------------------------------------------
 // Payloads, and what the platform does to them
 // ---------------------------------------------------------------------------
@@ -1998,6 +1982,44 @@ function stripEdges(value) {
 // recorded as it arrived rather than repaired: the evaluator refuses an
 // undeclared verdict, and a run that stops on a bad answer is better than one
 // that routes on a guessed one.
+/**
+ * The spellings an answer to one judge question may legitimately take.
+ *
+ * A judge request carries a CLOSED verdict set when the author declared one,
+ * which branch() always does, since its route keys are that set. A guard written
+ * as judge(q).is("yes") declares no set. The request cannot carry the expected
+ * verdict either: two edges asking one question with different expected verdicts
+ * have to share a single observation, and would not if the expected verdict
+ * reached the observation key.
+ *
+ * So the spellings are recovered from the graph instead. Every judge guard that
+ * resolves to this key contributes the verdict it fires on. They are candidates
+ * for normalization, not a menu: an answer matching none of them is passed
+ * through unchanged, so an open question keeps comparing by equality, while an
+ * answer of "Yes." still routes an edge that fires on "yes".
+ */
+function judgeSpellings(graph, key) {
+  const found = [];
+  const visit = function (guard) {
+    if (guard === null || typeof guard !== "object") return;
+    if (guard.kind === "judge") {
+      const spec = { kind: "judge", question: guard.question, from: guard.from || runtime.DEFAULT_PAYLOAD_SOURCE };
+      if (Array.isArray(guard.verdicts) && guard.verdicts.length > 0) spec.verdicts = guard.verdicts;
+      if (runtime.observationKey(spec) === key && typeof guard.is === "string") {
+        if (found.indexOf(guard.is) === -1) found.push(guard.is);
+      }
+      return;
+    }
+    if (guard.kind === "not") return visit(guard.guard);
+    if (guard.kind === "all" || guard.kind === "any") {
+      const guards = Array.isArray(guard.guards) ? guard.guards : [];
+      for (const inner of guards) visit(inner);
+    }
+  };
+  for (const edge of graph.edges) visit(edge.guard);
+  return found;
+}
+
 function normalizeVerdict(message, verdicts) {
   const text = withoutMarkerLines(message === null || message === undefined ? "" : String(message));
   const lines = text
@@ -2010,6 +2032,7 @@ function normalizeVerdict(message, verdicts) {
     });
   const last = lines.length === 0 ? "" : lines[lines.length - 1];
   const cleaned = stripEdges(last);
+  // No spellings to match against at all, so there is nothing to fold to.
   if (!Array.isArray(verdicts) || verdicts.length === 0) return cleaned;
   const candidates = [cleaned].concat(
     cleaned.split(/\s+/).map(function (word) {
@@ -2414,11 +2437,12 @@ function onSubagentStop(event, state) {
       node: state.node,
     });
     block(
-      runnerReason(
-        'run ' + state.runId + ' of the "' + PLUGIN.workflow + '" workflow begins at step "' +
+      [
+        'minflow: run ' + state.runId + ' of the "' + PLUGIN.workflow + '" begins at step "' +
           state.node + '".',
+        "",
         first,
-      ),
+      ].join("\n"),
     );
     return;
   }
@@ -2427,6 +2451,7 @@ function onSubagentStop(event, state) {
 
   const resolved = {};
   let outstanding = null;
+  let spellings = [];
   for (const request of runtime.observationsFor(graph, state)) {
     if (request.kind === "judge") {
       const answer = scratch.answers[request.key];
@@ -2434,7 +2459,14 @@ function onSubagentStop(event, state) {
       // payload has to be read on this pass, while the runner's last message is
       // still the step's report rather than the answer to come.
       if (answer === undefined) {
-        if (outstanding === null) outstanding = request;
+        if (outstanding === null) {
+          outstanding = request;
+          // Declared set if there is one, recovered spellings otherwise, so a
+          // guard written as judge(q).is("yes") still folds "Yes." onto "yes".
+          spellings = Array.isArray(request.verdicts) && request.verdicts.length > 0
+            ? request.verdicts
+            : judgeSpellings(graph, request.key);
+        }
         continue;
       }
       resolved[request.key] = { ok: true, value: answer };
@@ -2447,7 +2479,11 @@ function onSubagentStop(event, state) {
     scratch.asking = {
       key: outstanding.key,
       question: outstanding.question,
-      verdicts: Array.isArray(outstanding.verdicts) ? outstanding.verdicts : null,
+      // What the answer may be folded onto. Declared verdicts close the set and
+      // an answer outside it is a broken contract; recovered spellings do not,
+      // and an answer matching none of them is simply not this edge's verdict.
+      verdicts: spellings.length > 0 ? spellings : null,
+      closed: Array.isArray(outstanding.verdicts) && outstanding.verdicts.length > 0,
     };
     saveState(withScratch(state, scratch));
     appendTrace(state.runId, {

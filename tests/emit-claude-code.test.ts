@@ -220,6 +220,24 @@ function judgedIr(): WorkflowIr {
   return wf.compile();
 }
 
+/**
+ * A judge written with .is(), which declares no verdict set at all.
+ *
+ * branch() closes the set with its route keys; this shape cannot, so it is the
+ * only path where a verdict has to be folded onto a spelling recovered from the
+ * graph rather than onto a declared one.
+ */
+function openJudgeIr(): WorkflowIr {
+  const wf = workflow({ name: "open-judge" });
+  wf.step("draft", { skill: "s" });
+  wf.step("build", { skill: "s" });
+  wf.entry("draft");
+  wf.edge("draft", "build", judge("Is it good?").is("yes"));
+  wf.edge("draft", END);
+  wf.edge("build", END);
+  return wf.compile();
+}
+
 /** A judged branch over a payload the judge reads from a file. */
 function judgedFileIr(): WorkflowIr {
   const wf = workflow({ name: "judged-file" });
@@ -1289,8 +1307,32 @@ describe("a run, driven through the emitted dispatcher", () => {
       const fired = plugin.fire(stopped("Standing by."));
       expect(fired.decision?.decision).toBe("block");
       expect(fired.reason).toContain("drivable:step-draft");
+      // A block on SubagentStop is read BY the runner, so it must name the step.
+      // Naming the runner here tells the runner to spawn a second runner, which
+      // then spawns the step: a redundant layer holding a context window open for
+      // the whole run, and a start path shaped unlike every other transition.
+      expect(fired.reason).not.toContain("drivable:runner");
       // And the marker is spent, so the next stop is a real step report.
       expect(plugin.onlyRun().host).toEqual({ node: "draft", steps: 0, answers: {} });
+    });
+  });
+
+  it("never tells the runner to spawn a runner, on any transition", async () => {
+    // The invariant behind the assertion above, checked across every kind of
+    // block a run can produce. Only a command body may name the runner, because
+    // only the conversation reads one.
+    await withPlugin(drivableIr(), (plugin) => {
+      const reasons = [
+        plugin.begin(),
+        plugin.fire(stopped(reported({ done: true }))),
+        plugin.fire(stopped("no payload here")),
+      ].map((fired) => fired.reason);
+
+      for (const reason of reasons) {
+        expect(reason).not.toContain("drivable:runner");
+      }
+      // And the run did move, so this is not vacuously true on empty reasons.
+      expect(reasons.filter((reason) => reason.includes("drivable:step-"))).not.toHaveLength(0);
     });
   });
 
@@ -1528,6 +1570,37 @@ describe("a run, driven through the emitted dispatcher", () => {
       expect(advanced.outputs).toEqual({ review: { findings: 2 } });
       // And the scratch is gone with the departure.
       expect(advanced.host).toBeUndefined();
+    });
+  });
+
+  it("folds a judge answer onto the verdict an .is() guard fires on", async () => {
+    // The guard declares no verdict set, so nothing closes the menu and the
+    // dispatcher has to recover "yes" from the graph in order to fold "Yes."
+    // onto it. Without that, a byte-exact compare fails, the guard reads as a
+    // plain false, and the run takes the next edge to END while reporting that
+    // it finished normally: a silent misroute rather than a visible stop.
+    await withPlugin(openJudgeIr(), (plugin) => {
+      plugin.begin();
+      const asked = plugin.fire(stopped("Drafted."));
+      expect(asked.reason).toContain("Is it good?");
+
+      const answered = plugin.fire(stopped("Yes."));
+      expect(answered.reason).toContain("open-judge:step-build");
+    });
+  });
+
+  it("leaves an answer no .is() guard names alone, since that set is open", async () => {
+    // The mirror of the case above. A declared set is closed and an answer
+    // outside it is a broken contract, but .is() declares nothing, so an answer
+    // of "no" is a legitimate verdict that simply is not this edge's, and the
+    // run should take the next edge rather than stop.
+    await withPlugin(openJudgeIr(), (plugin) => {
+      plugin.begin();
+      plugin.fire(stopped("Drafted."));
+      const answered = plugin.fire(stopped("no"));
+      expect(answered.decision).toBeNull();
+      expect(answered.stderr).toContain("finished");
+      expect(answered.stderr).not.toContain("observation-failed");
     });
   });
 
