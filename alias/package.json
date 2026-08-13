@@ -1,0 +1,43 @@
+{
+  "name": "@minlayer/minflow",
+  "version": "0.0.0",
+  "description": "Reserved namespace. The implementation is published as `minflow`.",
+  "keywords": [
+    "minflow",
+    "minlayer"
+  ],
+  "license": "MIT",
+  "author": "Ariel Arevalo <ariel@enki.cr>",
+  "homepage": "https://github.com/minlayer/minflow#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/minlayer/minflow.git",
+    "directory": "alias"
+  },
+  "bugs": {
+    "url": "https://github.com/minlayer/minflow/issues"
+  },
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    }
+  },
+  "main": "./index.js",
+  "types": "./index.d.ts",
+  "files": [
+    "index.js",
+    "index.d.ts"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "prepack": "cp ../LICENSE ."
+  }
+}
