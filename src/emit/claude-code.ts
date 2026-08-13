@@ -66,8 +66,17 @@
  * @packageDocumentation
  */
 
+import { observationsFor } from "../evaluate.js";
 import { canonicalize } from "../hash.js";
-import type { Guard, IrNode, JsonValue, NodeId, PayloadSource, WorkflowIr } from "../ir.js";
+import type {
+  Guard,
+  IrNode,
+  JsonValue,
+  NodeId,
+  PayloadSource,
+  RunState,
+  WorkflowIr,
+} from "../ir.js";
 import { DEFAULT_PAYLOAD_SOURCE } from "../ir.js";
 
 // ---------------------------------------------------------------------------
@@ -153,13 +162,19 @@ export interface EmitOptions {
 // ---------------------------------------------------------------------------
 
 /**
- * What a step has to produce, derived from the guards on its outgoing edges.
+ * What the guards leaving a node read, derived from the graph.
  *
  * The author declares a payload lane per *edge*, because delivery is a property
- * of the reader (SPEC §6.3). The obligation is the mirror image of that, per
- * *node*: the union of every lane the node's outgoing guards read. Nobody should
+ * of the reader (SPEC §6.3). This is the mirror image of that, per *node*: the
+ * union of every lane the node's outgoing guards read. Nobody should
  * hand-maintain this: a step that is told to write `notes/research.json` is
  * told because an edge out of it reads that path, and the compiler knows.
+ *
+ * The guards are not the whole of a step's payload obligation, so the wrapper's
+ * delivery section comes from {@link requestedLanes} instead: a node declaring a
+ * `schema` is asked for its payload whether or not a guard reads it. `inline`
+ * and `payloadFiles` here answer the narrower question of what the guards
+ * themselves read.
  */
 export interface DeliveryObligations {
   /** An outgoing guard reads the payload inline, i.e. from the final message. */
@@ -228,6 +243,47 @@ export function obligationsFor(ir: WorkflowIr, nodeId: NodeId): DeliveryObligati
   return obligations;
 }
 
+/**
+ * A run sitting at `nodeId`, which is the only thing `observationsFor` reads.
+ *
+ * The emitter has no run and never will: this is a probe, so that the question
+ * "what will this node be asked for" can be put to the evaluator's own seam
+ * rather than answered a second time here.
+ */
+function probeState(ir: WorkflowIr, nodeId: NodeId): RunState {
+  return {
+    runId: "",
+    graphHash: ir.hash,
+    node: nodeId,
+    status: "running",
+    attempts: {},
+    steps: 0,
+    outputs: {},
+  };
+}
+
+/**
+ * The payload lanes a step must deliver on: exactly the ones `observationsFor`
+ * will ask the host to resolve when the step finishes.
+ *
+ * Derived from that function rather than restated from the guards, because the
+ * two do not agree and the evaluator's answer is the one that decides a run. A
+ * node declaring a `schema` is asked for its payload on the default lane even
+ * when every guard leaving it reads a file, so a wrapper that read the guards
+ * alone would tell such a step to write only its file and then fail it at run
+ * time for the inline block nobody asked it for.
+ */
+function requestedLanes(ir: WorkflowIr, nodeId: NodeId): { inline: boolean; files: string[] } {
+  const files: string[] = [];
+  let inline = false;
+  for (const request of observationsFor(ir, probeState(ir, nodeId))) {
+    if (request.kind !== "payload" && request.kind !== "judge") continue;
+    if (request.from.lane === "file") push(files, request.from.path);
+    else inline = true;
+  }
+  return { inline, files };
+}
+
 // ---------------------------------------------------------------------------
 // Names
 // ---------------------------------------------------------------------------
@@ -273,6 +329,57 @@ export function pluginNameFor(ir: WorkflowIr, opts: EmitOptions = {}): string {
       `minflow: cannot derive a plugin name from "${source}". Plugin names are 1-64 ` +
         "characters of a-z, 0-9 and -, starting and ending alphanumeric. " +
         'Pass one explicitly, e.g. emit(ir, { name: "my-workflow" }).',
+    );
+  }
+  return name;
+}
+
+/**
+ * Strips the separators a command name may carry inside but not at either end.
+ *
+ * A name reduced to `.` or `..` by the fold is the traversal case, and it comes
+ * out of here empty, which is what makes it a compile error rather than a write
+ * one directory up.
+ */
+function trimCommandEnds(value: string): string {
+  return value.replace(/^[-._]+|[-._]+$/g, "");
+}
+
+/**
+ * A command name folded into the charset a command may actually be named in.
+ *
+ * A command name is three things at once: the basename of a file under
+ * {@link COMMANDS_DIR}, a literal embedded in an anchored matcher, and the
+ * string the dispatcher compares the hook payload's `command_name` against. The
+ * first of those is why a path separator can never survive: `../../evil` would
+ * otherwise be written outside the plugin directory entirely. `.`, `_` and `-`
+ * are kept because a command may legitimately carry a version, as in
+ * `approve-v1.0`, and every matcher escapes what it embeds.
+ *
+ * Length is left alone, unlike a plugin or agent name. The 64-character cap on
+ * those is a measured platform limit; no such limit was measured for a command,
+ * and truncating would silently fold the default run command of any workflow
+ * whose plugin name runs long onto its neighbours.
+ */
+function commandSlug(raw: string): string {
+  return trimCommandEnds(raw.toLowerCase().replace(/[^a-z0-9._-]+/g, "-"));
+}
+
+/**
+ * A command name, or an error at compile time naming what to pass instead.
+ *
+ * Nothing surviving the fold is the same failure {@link pluginNameFor} refuses:
+ * a command with no name defines no file, so the `UserPromptExpansion` matcher
+ * that names it can never fire and the plugin installs, validates, and does
+ * nothing.
+ */
+function commandNameFor(raw: string, source: string): string {
+  const name = commandSlug(raw);
+  if (name === "") {
+    throw new Error(
+      `minflow: cannot derive a command name from "${raw}" (${source}). Command names are ` +
+        "a-z, 0-9, ., _ and -, starting and ending alphanumeric. " +
+        'Pass one explicitly, e.g. emit(ir, { command: "run-my-workflow" }).',
     );
   }
   return name;
@@ -339,25 +446,51 @@ interface GateCommands {
 /**
  * Every gate in the graph, in edge order, with its two command names.
  *
- * Deriving a reject name is lossy the same way sanitizing a node id is:
- * `approve-plan` and `plan` both derive `reject-plan`, so the derived names are
- * de-duplicated against the resume names and against each other with the same
- * `-2`, `-3`, … scheme {@link agentNames} uses. Two gates sharing one reject
- * command would silently give the second gate no way to be rejected, and the
- * first gate's command would kill whichever run the dispatcher found first.
+ * Two collisions are possible and they are answered differently, because one is
+ * declared and the other is derived.
+ *
+ * A *resume* command is the name the author wrote and the name a reviewer is
+ * told to type, so a second claim on it is refused here, at compile time. A gate
+ * claiming the run command is the sharp case: both would be written to
+ * `commands/<name>.md`, the second overwriting the first, and the dispatcher
+ * tests the run command first, so the gate could never be released. Silently
+ * renaming it would leave the author's own documentation pointing at a command
+ * that does something else.
+ *
+ * A *reject* command is derived, and deriving is lossy the same way sanitizing a
+ * node id is: `approve-plan` and `plan` both derive `reject-plan`. Those step
+ * aside with the same `-2`, `-3`, … scheme {@link agentNames} uses, since no
+ * author wrote them down. Two gates sharing one reject command would silently
+ * give the second gate no way to be rejected, and the first gate's command would
+ * kill whichever run the dispatcher found first.
  */
-function gatesOf(ir: WorkflowIr): GateCommands[] {
-  const resumes: string[] = [];
-  const taken = new Set<string>();
+function gatesOf(ir: WorkflowIr, runCommand: string): GateCommands[] {
+  const resumes: { gate: string; resume: string }[] = [];
+  const seen = new Set<string>();
+  const taken = new Set<string>([runCommand]);
   for (const edge of ir.edges) {
-    if (edge.gate === undefined || taken.has(edge.gate)) continue;
-    taken.add(edge.gate);
-    resumes.push(edge.gate);
+    if (edge.gate === undefined || seen.has(edge.gate)) continue;
+    seen.add(edge.gate);
+    const resume = commandNameFor(edge.gate, `the gate "${edge.gate}"`);
+    if (taken.has(resume)) {
+      throw new Error(
+        `minflow: the gate "${edge.gate}" needs the command "${resume}", which is already ` +
+          (resume === runCommand
+            ? "the command that starts a run. Both would be written to the same file, and the " +
+              "dispatcher matches the run command first, so this gate could never be released. "
+            : "another gate's resume command, and one command cannot release two gates. ") +
+          "Rename the gate, or pass a different run command to emit().",
+      );
+    }
+    taken.add(resume);
+    resumes.push({ gate: edge.gate, resume });
   }
 
   const gates: GateCommands[] = [];
-  for (const gate of resumes) {
-    const base = rejectCommandFor(gate);
+  for (const { gate, resume } of resumes) {
+    // Derived from the folded resume command, never from the raw gate, so the
+    // reject command is inside the command charset by construction.
+    const base = rejectCommandFor(resume);
     let reject = base;
     let ordinal = 2;
     while (taken.has(reject)) {
@@ -365,9 +498,14 @@ function gatesOf(ir: WorkflowIr): GateCommands[] {
       ordinal += 1;
     }
     taken.add(reject);
-    gates.push({ gate, resume: gate, reject });
+    gates.push({ gate, resume, reject });
   }
   return gates;
+}
+
+/** The two commands of each gate, by the gate's own name. */
+function gateIndex(gates: GateCommands[]): Map<string, GateCommands> {
+  return new Map(gates.map((gate) => [gate.gate, gate]));
 }
 
 // ---------------------------------------------------------------------------
@@ -647,9 +785,13 @@ function runCommandFile(ir: WorkflowIr, pluginName: string): string {
   );
 }
 
-function gateCommandFiles(ir: WorkflowIr, pluginName: string): Record<string, string> {
+function gateCommandFiles(
+  ir: WorkflowIr,
+  pluginName: string,
+  gates: GateCommands[],
+): Record<string, string> {
   const files: Record<string, string> = {};
-  for (const gate of gatesOf(ir)) {
+  for (const gate of gates) {
     files[`${COMMANDS_DIR}/${gate.resume}.md`] = commandFor(
       `Approve the "${gate.gate}" gate and continue the run.`,
       spawnRunnerBody(
@@ -712,25 +854,12 @@ function runnerFor(ir: WorkflowIr, pluginName: string, runCommand: string): stri
   );
 }
 
-/**
- * Whether the step should end its final message with the payload.
- *
- * A guard that reads the inline lane settles it. Failing that, a node that
- * declares a `schema` still has an output contract and nowhere else to put it,
- * so it goes inline, the one place the host can always see it. A node with
- * neither is asked for nothing, which is the point of deriving rather than
- * demanding.
- */
-function deliversInline(node: IrNode, obligations: DeliveryObligations): boolean {
-  if (obligations.inline) return true;
-  return node.schema !== undefined && obligations.payloadFiles.length === 0;
-}
-
 function stepBody(
   ir: WorkflowIr,
   node: IrNode,
   obligations: DeliveryObligations,
   pluginName: string,
+  gates: Map<string, GateCommands>,
 ): string {
   const sections: string[] = [];
 
@@ -774,14 +903,18 @@ function stepBody(
     );
   }
 
+  // The lanes the evaluator will ask the host for, not the lanes the guards
+  // read: a node declaring a schema is asked for its payload either way, and a
+  // step told less than it will be held to fails a contract it never saw.
+  const lanes = requestedLanes(ir, node.id);
   const delivery: string[] = [];
-  for (const path of obligations.payloadFiles) {
+  for (const path of lanes.files) {
     delivery.push(
       `- Write your JSON payload to \`${path}\`. A transition out of this step reads it from ` +
         "there, so the run stops if it is missing or unparseable.",
     );
   }
-  if (deliversInline(node, obligations)) {
+  if (lanes.inline) {
     delivery.push(
       "- End your final message with your JSON payload as a single fenced `json` block, with " +
         "nothing after it. It is read from the message itself, so anything following it is " +
@@ -822,15 +955,20 @@ function stepBody(
   // A gated edge ends the run *segment* (SPEC §3.9): subagents cannot ask the
   // user anything, so sign-off is a fresh run started by a command. Worth
   // saying here, because otherwise the step's own stopping looks like a failure.
-  const gates: string[] = [];
+  const resumes: string[] = [];
   for (const edge of ir.edges) {
     if (edge.from !== node.id || edge.gate === undefined) continue;
-    if (!gates.includes(edge.gate)) gates.push(edge.gate);
+    // The gate's own name is not its command name: a gate is named for the
+    // sign-off it represents, and the command is that name folded into what a
+    // command may be called.
+    const found = gates.get(edge.gate);
+    if (found === undefined || resumes.includes(found.resume)) continue;
+    resumes.push(found.resume);
   }
-  if (gates.length > 0) {
+  if (resumes.length > 0) {
     // Namespaced: the bare form is an unknown command, so telling the reviewer
     // to run `/approve-plan` would send them to a dead end.
-    const commands = gates.map((gate) => `\`/${qualified(pluginName, gate)}\``).join(" or ");
+    const commands = resumes.map((resume) => `\`/${qualified(pluginName, resume)}\``).join(" or ");
     sections.push(
       [
         "## After this step",
@@ -850,6 +988,7 @@ function stepFor(
   agent: string,
   obligations: DeliveryObligations,
   pluginName: string,
+  gates: Map<string, GateCommands>,
 ): string {
   const fields: [string, string][] = [
     // No colon, ever: the platform reserves it for plugin scoping and refuses to
@@ -872,7 +1011,7 @@ function stepFor(
   if (node.maxTurns !== undefined) fields.push(["maxTurns", String(node.maxTurns)]);
   if (node.tools !== undefined) fields.push(["tools", yamlNameList(node.tools)]);
 
-  return frontmatter(fields, stepBody(ir, node, obligations, pluginName));
+  return frontmatter(fields, stepBody(ir, node, obligations, pluginName, gates));
 }
 
 // ---------------------------------------------------------------------------
@@ -1280,10 +1419,15 @@ function cloneState(state) {
   return next;
 }
 
-// Copies the state as a live run: no gate, status running, and no host scratch.
-// A transition means the host's multi-pass work at this node is finished.
+// Copies the state as a live run: no gate, status running.
+//
+// The host scratch comes along here as much as in cloneState. It belongs to the
+// host, and only the host knows when the multi-pass work it records is finished,
+// so clearing it here would silently discard work, including work tracking the
+// very node a retry is about to re-run. A host that wants it gone clears it on
+// its own side, where the decision is informed.
 function runningClone(state) {
-  return {
+  const next = {
     runId: state.runId,
     graphHash: state.graphHash,
     node: state.node,
@@ -1292,6 +1436,8 @@ function runningClone(state) {
     steps: state.steps,
     outputs: Object.assign({}, state.outputs),
   };
+  if (state.host !== undefined) next.host = Object.assign({}, state.host);
+  return next;
 }
 
 // The retry budget counts consecutive failures at a node, and departing settles
@@ -1589,10 +1735,44 @@ const ROOT = process.env.CLAUDE_PLUGIN_ROOT || path.join(__dirname, "..");
 // environment reports rather than against whatever cwd this process inherited.
 const PROJECT = process.env.CLAUDE_PROJECT_DIR || process.cwd();
 
-// Comfortably inside the platform's own hook timeout, because a hook that times
-// out is cancelled with its output discarded and renders no decision at all. A
-// guard that hangs should be reported here, where the message survives.
-const GUARD_TIMEOUT_MS = 45000;
+// One budget for a whole resolution pass, not one per command.
+//
+// A hook that outlives the platform's own timeout is cancelled and everything it
+// wrote is discarded, so it renders no decision at all: the runner stops for
+// real, the state is left at status "running", and nothing anywhere says why.
+// Several slow guards on one node reach that between them while each stays
+// comfortably inside a per-command limit, so they share a deadline instead, and
+// a guard that finds it spent reports that where the message survives.
+//
+// MINFLOW_GUARD_BUDGET_MS overrides it, for a host whose hook timeout has been
+// configured away from the default.
+const GUARD_BUDGET_MS = 45000;
+
+function guardBudgetMs() {
+  const override = Number(process.env.MINFLOW_GUARD_BUDGET_MS);
+  return Number.isFinite(override) && override > 0 ? override : GUARD_BUDGET_MS;
+}
+
+// Set once per resolution pass, so every guard command at a node shares it.
+let guardDeadline = null;
+
+function startGuardBudget() {
+  guardDeadline = Date.now() + guardBudgetMs();
+}
+
+function guardTimeLeft() {
+  return guardDeadline === null ? guardBudgetMs() : guardDeadline - Date.now();
+}
+
+function budgetSpent(detail) {
+  return (
+    "the " + guardBudgetMs() + "ms guard budget for this transition was spent " + detail +
+    ". Every guard command at a node shares one budget, because a hook that outlives the " +
+    "platform's timeout is cancelled and everything it wrote is discarded, which would stop " +
+    "the run with nothing to read. Make the guards faster, or raise MINFLOW_GUARD_BUDGET_MS " +
+    "to match a longer hook timeout."
+  );
+}
 
 // Hook output is capped at 10,000 characters, so a payload quoted into a judge
 // question gets a budget well inside that cap.
@@ -1914,16 +2094,27 @@ function readPayloadFile(target) {
 // we do not know the answer, so it resolves as a broken observation and the
 // evaluator turns that into an error rather than a route down an otherwise.
 function runGuardCommand(command) {
+  const remaining = guardTimeLeft();
+  if (remaining <= 0) {
+    return { ok: false, error: budgetSpent("before " + command + " could start") };
+  }
   const finished = childProcess.spawnSync(command, {
     shell: true,
     cwd: PROJECT,
     stdio: "ignore",
-    timeout: GUARD_TIMEOUT_MS,
+    timeout: remaining,
   });
-  if (finished.error) {
-    return { ok: false, error: "could not run " + command + ": " + finished.error.message };
-  }
-  if (typeof finished.status !== "number") {
+  // A command cut off by the deadline arrives as an error on some platforms and
+  // as a signal on others. The budget is what tells both apart from a command
+  // that genuinely could not run: spent means this one is what ran the pass out
+  // of time, and saying so is more use than naming the signal that killed it.
+  if (finished.error || typeof finished.status !== "number") {
+    if (guardTimeLeft() <= 0) {
+      return { ok: false, error: budgetSpent("while " + command + " was running") };
+    }
+    if (finished.error) {
+      return { ok: false, error: "could not run " + command + ": " + finished.error.message };
+    }
     return {
       ok: false,
       error:
@@ -1937,27 +2128,46 @@ function runGuardCommand(command) {
 // The one place delivery is visible. Above this the run is JSON; below it there
 // are files, exit codes and a final message.
 function resolveRequest(request, event, scratch, answered) {
-  if (request.kind === "exitZero") return runGuardCommand(request.command);
-  if (request.kind === "fileExists") {
-    return { ok: true, value: fs.existsSync(inProject(request.path)) };
+  if (request.kind === "exitZero" || request.kind === "fileExists") {
+    // Once per visit to a node, not once per hook fire. A node carrying both a
+    // mechanical guard and a judge guard is resolved again when the verdict
+    // arrives, and a command run twice for one transition is a test suite run
+    // twice, or a counter moved twice. The scratch is scoped to the node and the
+    // step count, so a fresh visit resolves everything again.
+    const cached = scratch.observations[request.key];
+    if (cached !== undefined) return cached;
+    const result =
+      request.kind === "exitZero"
+        ? runGuardCommand(request.command)
+        : { ok: true, value: fs.existsSync(inProject(request.path)) };
+    scratch.observations[request.key] = result;
+    return result;
   }
   if (request.kind === "payload") {
     const from = request.from || { lane: "inline" };
     if (from.lane === "file") return readPayloadFile(from.path);
     // The inline payload is whatever the runner said last, so it survives only
     // as long as the runner has not said anything since. A judge round trip
-    // replaces it with a verdict, which is why it is cached for the visit.
-    if (scratch.payload !== null) return { ok: true, value: scratch.payload.value };
+    // replaces it with a verdict, which is why the first reading of it is kept
+    // for the visit, failure included: a payload the step never wrote correctly
+    // has to be reported as that, not as a payload the round trip took away.
+    if (scratch.payload !== null) {
+      if (typeof scratch.payload.error === "string") {
+        return { ok: false, error: scratch.payload.error };
+      }
+      return { ok: true, value: scratch.payload.value };
+    }
     if (answered) {
       return {
         ok: false,
         error:
           "the inline payload is gone: the runner's last message was its answer to a judge " +
-          "question, not the step's report. Read this payload from a file lane instead.",
+          "question, and no reading of the step's own report was kept from the pass before " +
+          "it. Read this payload from a file lane instead.",
       };
     }
     const parsed = parseInlinePayload(event.last_assistant_message);
-    if (parsed.ok) scratch.payload = { value: parsed.value };
+    scratch.payload = parsed.ok ? { value: parsed.value } : { error: parsed.error };
     return parsed;
   }
   return { ok: false, error: "unsupported observation kind " + request.kind };
@@ -2053,13 +2263,21 @@ function normalizeVerdict(message, verdicts) {
 // again. state.host is where the asking is remembered between those two calls.
 // The evaluator carries it through untouched and never reads it.
 function scratchFor(state) {
-  const fresh =
-    { node: state.node, steps: state.steps, answers: {}, asking: null, payload: null, start: false };
+  const fresh = {
+    node: state.node,
+    steps: state.steps,
+    answers: {},
+    asking: null,
+    payload: null,
+    observations: {},
+    start: false,
+  };
   const host = state.host;
   if (host === null || host === undefined || typeof host !== "object") return fresh;
   // Scoped to this visit of this node. Every departure and every retry bumps
   // steps, so a second lap round a loop cannot reuse the verdict the first lap
-  // collected, and a stale answer can never decide a fresh visit.
+  // collected, and a stale answer or a stale exit code can never decide a fresh
+  // visit.
   if (host.node !== state.node || host.steps !== state.steps) return fresh;
   return {
     node: state.node,
@@ -2068,9 +2286,30 @@ function scratchFor(state) {
       host.answers && typeof host.answers === "object" ? Object.assign({}, host.answers) : {},
     asking: host.asking || null,
     payload: host.payload && typeof host.payload === "object" ? host.payload : null,
+    // What the mechanical observations came back as, keyed the way the evaluator
+    // keys them, so each command runs once for the visit rather than once per
+    // hook fire.
+    observations:
+      host.observations && typeof host.observations === "object"
+        ? Object.assign({}, host.observations)
+        : {},
     // Set when a run segment has just been started or resumed by a command, and
     // the runner has therefore not run a step yet.
     start: host.start === true,
+  };
+}
+
+// The scratch a run segment begins on: nothing observed, nothing asked, and the
+// marker saying the runner has been spawned by a command and has not run a step.
+function startingScratch(state) {
+  return {
+    node: state.node,
+    steps: state.steps,
+    answers: {},
+    asking: null,
+    payload: null,
+    observations: {},
+    start: true,
   };
 }
 
@@ -2078,6 +2317,7 @@ function withScratch(state, scratch) {
   const host = { node: scratch.node, steps: scratch.steps, answers: scratch.answers };
   if (scratch.asking !== null) host.asking = scratch.asking;
   if (scratch.payload !== null) host.payload = scratch.payload;
+  if (Object.keys(scratch.observations).length > 0) host.observations = scratch.observations;
   if (scratch.start === true) host.start = true;
   return Object.assign({}, state, { host: host });
 }
@@ -2178,8 +2418,7 @@ function startRun(event, sessionId) {
   // blocked SubagentStop hands one to the runner. Letting the expansion through
   // is what puts the command's own body in front of the model, and that body is
   // what spawns the runner.
-  saveState(withScratch(state, { node: state.node, steps: state.steps, answers: {},
-    asking: null, payload: null, start: true }));
+  saveState(withScratch(state, startingScratch(state)));
   linkSession(sessionId, runId);
   appendTrace(runId, {
     at: new Date().toISOString(),
@@ -2248,8 +2487,7 @@ function releaseGate(event, sessionId, gate) {
   }
   // Not blocked, for the reason given in startRun: the resume command's body is
   // what reaches the model and spawns a fresh runner.
-  saveState(withScratch(state, { node: state.node, steps: state.steps, answers: {},
-    asking: null, payload: null, start: true }));
+  saveState(withScratch(state, startingScratch(state)));
   linkSession(sessionId, state.runId);
   appendTrace(state.runId, {
     at: new Date().toISOString(),
@@ -2299,6 +2537,17 @@ function onCommand(event, sessionId, command) {
 // SubagentStop
 // ---------------------------------------------------------------------------
 
+// The state to persist once a transition is decided, with the visit's scratch
+// dropped. The evaluator carries the scratch through rather than deciding for
+// us, because only this side knows what it was tracking: a verdict, a parsed
+// payload and a guard's exit code are all answers about a step that has now run,
+// and none of them may decide the next visit to a node.
+function departed(state) {
+  const next = Object.assign({}, state);
+  delete next.host;
+  return next;
+}
+
 function act(graph, state, transition) {
   appendTrace(state.runId, {
     at: new Date().toISOString(),
@@ -2316,7 +2565,7 @@ function act(graph, state, transition) {
       report('no agent is registered for node "' + transition.to + '". Regenerate the plugin.');
       return;
     }
-    saveState(transition.state);
+    saveState(departed(transition.state));
     block(
       [
         'minflow: step "' + state.node + '" is done; the run advances to "' + transition.to + '".',
@@ -2333,7 +2582,7 @@ function act(graph, state, transition) {
       report('no agent is registered for node "' + transition.node + '". Regenerate the plugin.');
       return;
     }
-    saveState(transition.state);
+    saveState(departed(transition.state));
     block(
       [
         'minflow: step "' + transition.node + '" runs again, attempt ' + transition.attempt + ": " +
@@ -2349,7 +2598,7 @@ function act(graph, state, transition) {
     // No decision. A human gate ends the run segment: subagents cannot ask the
     // user anything, so sign-off arrives as a command in a later turn, possibly
     // in a later session (SPEC section 3.9).
-    saveState(transition.state);
+    saveState(departed(transition.state));
     const commands = PLUGIN.gates[transition.gate];
     report(
       "run " + state.runId + ' is parked at the "' + transition.gate + '" gate, before step "' +
@@ -2448,6 +2697,11 @@ function onSubagentStop(event, state) {
   }
 
   const answered = takeAnswer(scratch, event);
+
+  // One deadline for everything the pass is about to resolve, so that slow
+  // guards run out of budget here, visibly, rather than running out of the
+  // platform's hook timeout, which would discard this process's output whole.
+  startGuardBudget();
 
   const resolved = {};
   let outstanding = null;
@@ -2585,13 +2839,14 @@ function dispatcherFor(
   pluginName: string,
   runCommand: string,
   names: Record<NodeId, string>,
+  gateCommands: GateCommands[],
 ): string {
   // Namespaced, because these are compared against the hook payload's
   // `command_name`, which always arrives as `<plugin>:<command>`. Storing the
   // bare names here would leave the dispatcher unable to recognise the very
   // commands its own matcher let through.
   const gates: Record<string, JsonValue> = {};
-  for (const gate of gatesOf(ir)) {
+  for (const gate of gateCommands) {
     gates[gate.gate] = {
       resume: qualified(pluginName, gate.resume),
       reject: qualified(pluginName, gate.reject),
@@ -2654,17 +2909,20 @@ ${DISPATCHER_BODY}`;
  */
 export function emit(ir: WorkflowIr, opts: EmitOptions = {}): PluginFiles {
   const pluginName = pluginNameFor(ir, opts);
-  const runCommand = opts.command ?? `run-${pluginName}`;
+  // Folded before anything is named after it: a command name is also a file name
+  // under `commands/`, so an unchecked one writes wherever its separators point.
+  const runCommand = commandNameFor(opts.command ?? `run-${pluginName}`, "the run command");
   const names = agentNames(ir);
+  const gates = gatesOf(ir, runCommand);
   const commands = [runCommand];
-  for (const gate of gatesOf(ir)) {
+  for (const gate of gates) {
     commands.push(gate.resume, gate.reject);
   }
 
   const files: PluginFiles = {};
   files[MANIFEST_PATH] = manifestFor(ir, opts, pluginName);
   files[HOOKS_PATH] = hooksFor(pluginName, commands);
-  files[DISPATCHER_PATH] = dispatcherFor(ir, pluginName, runCommand, names);
+  files[DISPATCHER_PATH] = dispatcherFor(ir, pluginName, runCommand, names, gates);
   // Byte-identical for every graph. The dispatcher requires it rather than
   // reimplementing the transition rules, and it travels with the plugin rather
   // than being resolved from a node_modules that an installed plugin does not
@@ -2674,11 +2932,19 @@ export function emit(ir: WorkflowIr, opts: EmitOptions = {}): PluginFiles {
   // Every alternative in the UserPromptExpansion matcher needs a command that
   // actually exists, or the hook is unreachable and the plugin is inert.
   files[`${COMMANDS_DIR}/${runCommand}.md`] = runCommandFile(ir, pluginName);
-  Object.assign(files, gateCommandFiles(ir, pluginName));
+  Object.assign(files, gateCommandFiles(ir, pluginName, gates));
+  const byGate = gateIndex(gates);
   for (const node of ir.nodes) {
     const agent = names[node.id];
     if (agent === undefined) continue;
-    files[`agents/${agent}.md`] = stepFor(ir, node, agent, obligationsFor(ir, node.id), pluginName);
+    files[`agents/${agent}.md`] = stepFor(
+      ir,
+      node,
+      agent,
+      obligationsFor(ir, node.id),
+      pluginName,
+      byGate,
+    );
   }
   // Canonical, not insertion-ordered: this file is the graph's value on disk, and
   // it has to match for two graphs `graphHash` calls identical.
@@ -2698,7 +2964,12 @@ export function emit(ir: WorkflowIr, opts: EmitOptions = {}): PluginFiles {
  * overwritten and nothing is deleted, so regenerating over a stale directory
  * should be `rm -rf` then write (D7).
  *
- * @returns The absolute-or-relative paths written, in sorted order.
+ * Every path is checked to land inside `destDir` before anything is written, and
+ * the whole map is refused if one does not. This function takes a map, not a
+ * graph, so it cannot assume the map came from {@link emit}, and writing outside
+ * the directory a caller named is not a thing to do halfway.
+ *
+ * @returns The absolute paths written, in sorted order.
  */
 export async function writeFiles(files: PluginFiles, destDir: string): Promise<string[]> {
   // Imported here rather than at module scope so that importing the pure half of
@@ -2706,11 +2977,28 @@ export async function writeFiles(files: PluginFiles, destDir: string): Promise<s
   const fs = await import("node:fs/promises");
   const path = await import("node:path");
 
-  const written: string[] = [];
+  const root = path.resolve(destDir);
+  const targets: [relative: string, target: string, contents: string][] = [];
   for (const relative of Object.keys(files).sort()) {
     const contents = files[relative];
     if (contents === undefined) continue;
-    const target = path.join(destDir, ...relative.split("/"));
+    // Resolved rather than joined, because a `..` segment only shows where it
+    // leads once the path is normalized. An absolute key is refused outright
+    // instead of being reinterpreted as a path inside the destination, since a
+    // caller who named `/etc/hosts` did not mean `<destDir>/etc/hosts`.
+    const target = path.resolve(root, ...relative.split("/"));
+    if (path.isAbsolute(relative) || !target.startsWith(root + path.sep)) {
+      throw new Error(
+        `minflow: refusing to write "${relative}": a plugin file map may only name relative ` +
+          `paths inside the directory it is written to, and this one leaves "${root}". ` +
+          "Nothing was written.",
+      );
+    }
+    targets.push([relative, target, contents]);
+  }
+
+  const written: string[] = [];
+  for (const [, target, contents] of targets) {
     await fs.mkdir(path.dirname(target), { recursive: true });
     await fs.writeFile(target, contents, "utf8");
     written.push(target);

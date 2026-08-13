@@ -624,6 +624,53 @@ describe("when.*", () => {
       /when\.all\(\).+not a guard/s,
     );
   });
+
+  it("checks the arms of a composite written as raw data, not only its kind", () => {
+    // when.all() checks each argument as it builds one, so a composite that
+    // arrives already built is the only way an arm reaches an edge unchecked.
+    // The evaluator switches on `kind` with no arm for anything else, so this
+    // graph would not misroute, it would throw partway through a run.
+    const wf = twoSteps("arms");
+    const raw = { kind: "all", guards: [when.always(), { kind: "sometimes" }] };
+    // biome-ignore lint/suspicious/noExplicitAny: exercising the runtime check on bad input
+    const message = messageOf(() => wf.edge("a", END, raw as any));
+    expect(message).toMatch(/inside all\(\) argument 2/);
+    expect(message).toMatch(/kind "sometimes"/);
+  });
+
+  it("checks the arm of a raw not(), at any depth", () => {
+    const wf = twoSteps("arms");
+    const raw = { kind: "any", guards: [{ kind: "not", guard: "nope" }] };
+    // biome-ignore lint/suspicious/noExplicitAny: exercising the runtime check on bad input
+    const message = messageOf(() => wf.edge("a", END, raw as any));
+    expect(message).toMatch(/inside any\(\) argument 1 inside not\(\)/);
+    expect(message).toMatch(/got nope/);
+  });
+
+  it("rejects a raw composite with no guards array, which the evaluator cannot walk", () => {
+    const wf = twoSteps("arms");
+    // biome-ignore lint/suspicious/noExplicitAny: exercising the runtime check on bad input
+    const message = messageOf(() => wf.edge("a", END, { kind: "all" } as any));
+    expect(message).toMatch(/guard of kind "all" whose guards is not an array/);
+    expect(message).toMatch(/when\.all\(\.\.\.\)/);
+  });
+
+  it("still accepts a deep tree the when.* helpers built", () => {
+    // The other side of the same check: descending into every arm must not start
+    // rejecting the nesting the library exists to produce.
+    const wf = workflow({ name: "deep" });
+    wf.step("a", { skill: "s" });
+    wf.entry("a");
+    wf.edge(
+      "a",
+      END,
+      when.all(
+        when.not(when.any(when.always(), when.field("x").truthy())),
+        when.any(when.all(when.exitZero("t"), judge("Done?").is("yes"))),
+      ),
+    );
+    expect(wf.compile().edges).toHaveLength(1);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -966,6 +1013,57 @@ describe("otherwise", () => {
     expect(() => retry(1.5, "x")).toThrow(/positive whole number/);
   });
 
+  it("rejects the same counts on the raw retry form, which never passes through retry()", () => {
+    // The ceiling can enter an edge without going near retry(), so the check
+    // cannot live only there. A limit of 0 compiles to an edge that reads as
+    // bounded and can never retry once: the evaluator computes attempt 1, finds
+    // 1 > 0, and ends the run with "past its limit of 0" on the first failure the
+    // retry was written to absorb. A negative or a fraction below one is the same
+    // edge wearing a different number.
+    for (const limit of [0, -1, 0.5, 1.5]) {
+      const raw = { kind: "retry" as const, reason: "tests failing" };
+      // A string matcher, so the fractional cases compare literally rather than
+      // through a regex where "." matches anything.
+      expect(() => graphWith({ otherwise: raw, limit })).toThrow(
+        `sets limit ${limit}, which is not a positive whole number`,
+      );
+    }
+  });
+
+  it("rejects a hand-built retry spec carrying a bad ceiling of its own", () => {
+    // The third route a limit can take into an edge: an object shaped like what
+    // retry() returns, ceiling included, written by hand instead of called.
+    expect(() => graphWith({ otherwise: { kind: "retry", reason: "again", limit: 0 } })).toThrow(
+      /sets limit 0, which is not a positive whole number/,
+    );
+  });
+
+  it("accepts the smallest ceiling that can still retry", () => {
+    // The boundary on the other side, so the check cannot be tightened into
+    // rejecting the one-attempt budget that is the point of having a ceiling.
+    const edge = graphWith({ otherwise: { kind: "retry", reason: "tests failing" }, limit: 1 });
+    expect(edge.limit).toBe(1);
+    expect(edge.otherwise).toEqual({ kind: "retry", reason: "tests failing" });
+  });
+
+  it("rejects a raw retry with no reason, which sends the step back saying nothing", () => {
+    // retry(n, reason) refuses an empty reason; the raw form has to refuse it too.
+    // The reason is the whole message the retried node is handed, and the emitted
+    // dispatcher renders it as "attempt 1: " with nothing after the colon.
+    expect(() => graphWith({ otherwise: { kind: "retry", reason: "" } })).toThrow(
+      /edge\("a", "b"\) otherwise retry needs a non-empty reason/,
+    );
+  });
+
+  it("refuses an otherwise of an unknown kind rather than reading it as a retry", () => {
+    // Everything that is not a goto falls through to the retry arm, so a typo'd
+    // kind would compile into a retry with no reason at all.
+    expect(() =>
+      // biome-ignore lint/suspicious/noExplicitAny: exercising the runtime check on bad input
+      graphWith({ otherwise: { kind: "divert", node: "b" } as any }),
+    ).toThrow(/was given an "otherwise" of kind "divert"/);
+  });
+
   it("defaults the event to pass and the guard to always", () => {
     const wf = workflow({ name: "o" });
     wf.step("a", { skill: "s" });
@@ -1125,6 +1223,72 @@ const throwCases: ThrowCase[] = [
     act: () =>
       twoSteps("v").edge("a", "b", when.exitZero("t"), { otherwise: retry(3, "x"), limit: 5 }),
     expected: [/sets a limit twice/, /retry\(3, \.\.\.\) already/],
+  },
+  {
+    name: "edge() with a retry ceiling of zero, which forbids the first retry",
+    act: () =>
+      twoSteps("v").edge("a", "b", when.exitZero("t"), {
+        otherwise: { kind: "retry", reason: "x" },
+        limit: 0,
+      }),
+    expected: [
+      /edge\("a", "b"\) sets limit 0, which is not a positive whole number/,
+      /can never retry even once/,
+    ],
+  },
+  {
+    name: "edge() with a negative retry ceiling",
+    act: () =>
+      twoSteps("v").edge("a", "b", when.exitZero("t"), {
+        otherwise: { kind: "retry", reason: "x" },
+        limit: -2,
+      }),
+    expected: [/edge\("a", "b"\) sets limit -2, which is not a positive whole number/],
+  },
+  {
+    name: "edge() with a fractional retry ceiling",
+    act: () =>
+      twoSteps("v").edge("a", "b", when.exitZero("t"), {
+        otherwise: { kind: "retry", reason: "x" },
+        limit: 1.5,
+      }),
+    expected: [/edge\("a", "b"\) sets limit 1\.5, which is not a positive whole number/],
+  },
+  {
+    name: "edge() with a raw retry that names no reason",
+    act: () =>
+      twoSteps("v").edge("a", "b", when.exitZero("t"), {
+        otherwise: { kind: "retry", reason: "" },
+      }),
+    expected: [/edge\("a", "b"\) otherwise retry needs a non-empty reason/],
+  },
+  {
+    name: "edge() with an otherwise of a kind that is neither a goto nor a retry",
+    act: () =>
+      // biome-ignore lint/suspicious/noExplicitAny: exercising the runtime check on bad input
+      twoSteps("v").edge("a", "b", when.exitZero("t"), { otherwise: { kind: "divert" } as any }),
+    expected: [
+      /edge\("a", "b"\) was given an "otherwise" of kind "divert"/,
+      /node id, END, a \{ kind: "goto", node \} divert, or a retry/,
+    ],
+  },
+  {
+    name: "edge() with a raw composite whose arm is not a guard",
+    act: () =>
+      twoSteps("v").edge("a", END, {
+        kind: "all",
+        guards: [{ kind: "nope" }],
+      } as unknown as Guard),
+    expected: [/edge\("a", "__end__"\) inside all\(\) argument 1 .+not a guard/s, /kind "nope"/],
+  },
+  {
+    name: "edge() with a raw composite that has no guards array",
+    act: () => twoSteps("v").edge("a", END, { kind: "any" } as unknown as Guard),
+    expected: [
+      /edge\("a", "__end__"\) was given a guard of kind "any" whose guards is not an array/,
+      /got undefined/,
+      /when\.any\(\.\.\.\)/,
+    ],
   },
   {
     name: "edge() with a limit and no retry for it to bound",
@@ -1318,12 +1482,13 @@ describe("every throw path, by message", () => {
   }
 
   it("enumerates every rejection path, not merely every throw statement", () => {
-    // 47 rows over 24 `throw` statements: requireText() and assertGuard() are
-    // each reached from many call sites with a different message, and the
-    // unknown-node message itself has two renderings depending on whether any
-    // step has been declared yet. This length is a drift guard. Deleting a row
-    // has to be a deliberate edit.
-    expect(throwCases).toHaveLength(47);
+    // 54 rows over 27 `throw` statements: requireText() and assertGuard() are
+    // each reached from many call sites with a different message, the retry
+    // ceiling is refused once per shape of bad number, and the unknown-node
+    // message itself has two renderings depending on whether any step has been
+    // declared yet. This length is a drift guard. Deleting a row has to be a
+    // deliberate edit.
+    expect(throwCases).toHaveLength(54);
   });
 });
 
@@ -1628,6 +1793,57 @@ describe("unguarded cycle detection", () => {
     const ir = wf.compile();
     expect(edgeById(ir, "plan:1").gate).toBe("approve-plan");
     expect(edgeById(ir, "implement:1").goto).toBe("plan");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The entry, on a graph the builder never built
+// ---------------------------------------------------------------------------
+
+/**
+ * `entry` is the one id in a graph that nothing else has to mention, so no
+ * lookup anywhere else catches a typo in it. The builder checks it at `.entry()`
+ * against the declared nodes, which leaves lintGraph() carrying the check alone
+ * for every IR that arrives from a front-end which is not the builder.
+ */
+describe("lintGraph on an entry that names nothing", () => {
+  const nodes: IrNode[] = [
+    { id: "research", skill: "s" },
+    { id: "plan", skill: "s" },
+  ];
+  const edges: IrEdge[] = [
+    { id: "research:1", from: "research", event: "pass", guard: { kind: "always" }, goto: "plan" },
+    { id: "plan:1", from: "plan", event: "pass", guard: { kind: "always" }, goto: END },
+  ];
+
+  it("names the entry, and does not bury it under a list of every node in the graph", () => {
+    // The walk is seeded with the id it was given, so a typo strands every node
+    // and the unreachable line lists the whole graph: true, and useless, because
+    // each node it names is fine and the one thing that is wrong is not in it.
+    const problems = lintGraph({ entry: "reserch", nodes, edges });
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toMatch(/entry "reserch" is not a node in this graph/);
+    expect(problems[0]).toMatch(/Declared nodes: research, plan/);
+    expect(problems.join("\n")).not.toMatch(/unreachable/);
+  });
+
+  it("keeps reporting unreachable nodes when the entry itself is sound", () => {
+    // The suppression is conditional on the entry being missing. Made
+    // unconditional, it would silently retire the unreachable check.
+    const orphaned: IrNode[] = [...nodes, { id: "orphan", skill: "s" }];
+    const withOrphan: IrEdge[] = [
+      ...edges,
+      { id: "orphan:1", from: "orphan", event: "pass", guard: { kind: "always" }, goto: END },
+    ];
+    expect(lintGraph({ entry: "research", nodes: orphaned, edges: withOrphan })).toEqual([
+      expect.stringMatching(/unreachable nodes: orphan/),
+    ]);
+  });
+
+  it("says so plainly when there are no nodes to have named", () => {
+    expect(lintGraph({ entry: "research", nodes: [], edges: [] })).toEqual([
+      expect.stringMatching(/entry "research" is not a node .+Declared nodes: \(none declared\)/s),
+    ]);
   });
 });
 

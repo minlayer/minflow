@@ -43,6 +43,24 @@ not at all.
 - **Zero idle footprint.** An emitted plugin must not run anything when no
   workflow is running. Every hook registration is matcher-scoped (D9).
 
+## The evaluator exists twice
+
+A shipped plugin has no `node_modules` to resolve `minflow` from, so the Claude
+Code backend vendors `observationsFor` and `evaluate` into the plugin as a
+CommonJS copy. That copy is a string literal, `RUNTIME_SOURCE`, inside
+`src/emit/claude-code.ts`.
+
+**A semantic change to `src/evaluate.ts` needs the matching edit in
+`RUNTIME_SOURCE`.** A differential test runs both implementations over many
+graphs, nodes and resolution modes and requires identical output, so divergence
+fails the suite rather than shipping. Fix both sides in one change.
+
+Two mechanical traps in that file. `RUNTIME_SOURCE` and the dispatcher body are
+`String.raw` templates, so **no backtick and no dollar-brace may appear anywhere
+inside them, comments included**: one backtick ends the template and the file
+stops compiling. And the emitted dispatcher is CommonJS with no bundler, so it
+can require only what ships beside it.
+
 ## Commands
 
 ```bash

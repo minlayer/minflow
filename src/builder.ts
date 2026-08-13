@@ -127,6 +127,10 @@ export interface EdgeOptions {
    * when a guard fails and the edge's `otherwise` is a retry (see `IrEdge.limit`
    * in the IR). Setting it on an edge with no retry is therefore rejected rather
    * than accepted as a loop ceiling it cannot be.
+   *
+   * It counts retries, so it has to be a positive whole number. A ceiling below
+   * one attempt is refused here rather than at run time, where the first failure
+   * is already past it.
    */
   limit?: number;
   /** The discretized input this edge keys on. Defaults to `"pass"`. */
@@ -367,12 +371,24 @@ export function judge(question: string, options: LaneOptions = {}): JudgeSpec {
  * because retry counters are keyed by edge id.
  */
 export function retry(limit: number, reason: string): RetrySpec {
-  if (!Number.isInteger(limit) || limit < 1) {
+  if (!isRetryBudget(limit)) {
     throw new Error(
       `minflow: retry(${String(limit)}, ...) needs a positive whole number of attempts.`,
     );
   }
   return { kind: "retry", reason: requireText(reason, 'retry(n, "...")', "reason"), limit };
+}
+
+/**
+ * A retry ceiling counts attempts, so it has to admit at least one whole one.
+ *
+ * Anything else is an edge that reads as bounded and is not: with a ceiling of
+ * zero, a negative, or a fraction below one, the evaluator computes attempt 1,
+ * finds it past the ceiling, and ends the run on the very failure the retry was
+ * written to absorb.
+ */
+function isRetryBudget(limit: number): boolean {
+  return Number.isInteger(limit) && limit >= 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -477,6 +493,16 @@ class Builder implements WorkflowBuilder {
       this.#requireTarget(otherwise.node, context);
       extras.otherwise = { kind: "goto", node: otherwise.node };
     } else if (otherwise !== undefined) {
+      // Everything left is a retry, in one of its two forms. An object wearing
+      // any other kind would fall into this arm and be rewritten as a retry with
+      // no reason, so it is named and refused instead.
+      const kind: string = otherwise.kind;
+      if (kind !== "retry") {
+        throw new Error(
+          `minflow: ${context} was given an "otherwise" of kind "${kind}". It has to be a node ` +
+            'id, END, a { kind: "goto", node } divert, or a retry.',
+        );
+      }
       // `retry(n, reason)` carries the ceiling; the IR keeps it on the edge, so
       // it is split off here rather than smuggled inside `otherwise`.
       const carried = (otherwise as { limit?: number }).limit;
@@ -489,7 +515,24 @@ class Builder implements WorkflowBuilder {
         }
         extras.limit = carried;
       }
-      extras.otherwise = { kind: "retry", reason: otherwise.reason };
+      // The reason is what the retried node is handed to act on, so an empty one
+      // sends the step back with nothing said about why it is running again.
+      extras.otherwise = {
+        kind: "retry",
+        reason: requireText(otherwise.reason, `${context} otherwise retry`, "reason"),
+      };
+    }
+
+    // Checked here rather than only in retry(), because a limit reaches an edge
+    // by three routes: the option, the ceiling retry() carries, and a hand-built
+    // spec carrying one of its own. Only the middle route passes through retry().
+    if (extras.limit !== undefined && !isRetryBudget(extras.limit)) {
+      throw new Error(
+        `minflow: ${context} sets limit ${String(extras.limit)}, which is not a positive whole ` +
+          "number of attempts. A ceiling below one attempt makes an edge that reads as bounded " +
+          "and can never retry even once: the first failure is already past it, so the run ends " +
+          "on the failure the retry exists to absorb.",
+      );
     }
 
     // `limit` is the ceiling on `otherwise: retry` and is read nowhere else, so
@@ -671,7 +714,6 @@ class Builder implements WorkflowBuilder {
 // Whole-graph checks
 // ---------------------------------------------------------------------------
 
-/** Nodes the run can actually arrive at, following both `goto` and `otherwise`. */
 /** The shape the graph lint needs: a compiled IR, or a draft that has no hash yet. */
 export interface LintableGraph {
   entry: NodeId;
@@ -686,7 +728,7 @@ export interface LintableGraph {
  * built through the builder cannot reach an emitter in a broken state. It is
  * exported because the builder is not the only way to produce an IR: the IR is
  * plain data, a second front-end can hand us one directly, and that graph deserves
- * the same three checks. Several of them, an unconditional cycle in particular,
+ * the same four checks. Several of them, an unconditional cycle in particular,
  * describe shapes the builder refuses to author at all, so this is the only
  * place they can still be caught, and the only place they can be tested.
  *
@@ -694,13 +736,35 @@ export interface LintableGraph {
  */
 export function lintGraph(graph: LintableGraph): string[] {
   const reachable = reachableFrom(graph.entry, graph.edges);
+  const missingEntry = entryProblems(graph.nodes, graph.entry);
   return [
-    ...unreachableProblems(graph.nodes, reachable, graph.entry),
+    ...missingEntry,
+    // Nothing is reachable from an entry that is not a node, so the unreachable
+    // line would list the entire graph and say nothing about the entry that
+    // stranded it. One true line beats a true list that names the wrong problem.
+    ...(missingEntry.length > 0 ? [] : unreachableProblems(graph.nodes, reachable, graph.entry)),
     ...deadEndProblems(graph.nodes, graph.edges, reachable),
     ...unguardedCycleProblems(graph.edges, reachable),
   ];
 }
 
+/**
+ * The entry has to name a declared node.
+ *
+ * It is the one id in the graph that no edge has to mention, so nothing else
+ * here can catch a typo in it: every other check reads it as the seed of the
+ * walk and reports the consequences instead.
+ */
+function entryProblems(nodes: IrNode[], entry: NodeId): string[] {
+  if (nodes.some((node) => node.id === entry)) return [];
+  const known = nodes.length === 0 ? "(none declared)" : nodes.map((node) => node.id).join(", ");
+  return [
+    `entry "${entry}" is not a node in this graph. Declared nodes: ${known}. ` +
+      "A run starts at entry, so it has nowhere to begin.",
+  ];
+}
+
+/** Nodes the run can actually arrive at, following both `goto` and `otherwise`. */
 function reachableFrom(entry: NodeId, edges: IrEdge[]): Set<NodeId> {
   const outgoing = new Map<NodeId, IrEdge[]>();
   for (const edge of edges) {
@@ -937,6 +1001,7 @@ function assertGuard(value: Guard, context: string, index?: number): void {
   const unfinishedJudge =
     kind === "judge" && typeof (candidate as { is?: unknown }).is !== "string";
   if (isObject && !unfinishedJudge && GUARD_KINDS.has(String(kind))) {
+    assertArms(value, where);
     return;
   }
   const unfinishedField =
@@ -954,6 +1019,34 @@ function assertGuard(value: Guard, context: string, index?: number): void {
     detail = `got ${describeValue(candidate)}`;
   }
   throw new Error(`minflow: ${where} was given something that is not a guard: ${detail}.`);
+}
+
+/**
+ * A composite is only as sound as its arms, so the check descends into them.
+ *
+ * `when.all`, `when.any` and `when.not` check what they are handed as they build
+ * it, but a composite written as raw IR data reaches an edge without passing
+ * through any of them. The evaluator switches on `kind` with no arm for anything
+ * else, so a bad sub-guard is not a route that never fires: it is a transition
+ * that throws mid-run, long after the line that wrote it.
+ */
+function assertArms(guard: Guard, where: string): void {
+  if (guard.kind === "not") {
+    assertGuard(guard.guard, `${where} inside not()`);
+    return;
+  }
+  if (guard.kind !== "all" && guard.kind !== "any") return;
+  const arms: unknown = guard.guards;
+  if (!Array.isArray(arms)) {
+    throw new Error(
+      `minflow: ${where} was given a guard of kind "${guard.kind}" whose guards is not an ` +
+        `array: got ${describeValue(arms)}. Build it with when.${guard.kind}(...), ` +
+        "which always has one.",
+    );
+  }
+  for (const [position, arm] of arms.entries()) {
+    assertGuard(arm as Guard, `${where} inside ${guard.kind}()`, position);
+  }
 }
 
 function describeValue(value: unknown): string {

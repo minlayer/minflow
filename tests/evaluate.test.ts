@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { evaluate, observationKey, observationsFor } from "../src/evaluate.js";
+import { canonicalize } from "../src/hash.js";
 import type {
   FieldOp,
   Guard,
@@ -46,6 +47,7 @@ interface StateOverrides {
   attempts?: Record<string, number>;
   outputs?: Record<string, JsonValue>;
   graphHash?: string;
+  host?: Record<string, JsonValue>;
 }
 
 function makeState(over: StateOverrides = {}): RunState {
@@ -62,6 +64,7 @@ function makeState(over: StateOverrides = {}): RunState {
   // `toEqual` a state with no `gate` key at all, so every existing fixture
   // comparison would change meaning if this were assigned unconditionally.
   if (over.gate !== undefined) state.gate = over.gate;
+  if (over.host !== undefined) state.host = over.host;
   return state;
 }
 
@@ -218,6 +221,55 @@ describe("observationKey", () => {
       }),
     ).toBe(
       'judge:{"from":{"lane":"file","path":"r.json"},"question":"ok?","verdicts":["yes","no"]}',
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The canonical form
+// ---------------------------------------------------------------------------
+
+/**
+ * `hash.ts` owns the definition of canonical and the evaluator uses that one.
+ * An observation key is a wire format the host caches against, and the graph
+ * hash is what a resume compares itself to, so a second definition living here
+ * would let one value mean two things depending on which module read it, with
+ * nothing in the build comparing the two rules. Every case below is a value the
+ * two rules answer differently, which is what makes them evidence that only one
+ * rule is in play.
+ */
+describe("the canonical form", () => {
+  it("names a circular value instead of overflowing the stack on it", () => {
+    const cyclic: Record<string, unknown> = { n: 1 };
+    cyclic.self = cyclic;
+    const payload = { box: cyclic } as unknown as JsonValue;
+    const run = () => decide(field("box", "equals", { n: 1 }), withPayload(payload));
+    // A `RangeError` from a blown stack also stops the run, so the type and the
+    // message are the assertion: the host has to be told which contract it
+    // broke, and "Maximum call stack size exceeded" tells it nothing.
+    expect(run).toThrow(TypeError);
+    expect(run).toThrow(/circular reference/);
+  });
+
+  it("rejects a bigint rather than quietly reading it as null", () => {
+    const big = BigInt(1) as unknown as JsonValue;
+    // A canonical form with no bigint case renders both `1n` and `null` as
+    // "null", so this guard would hold: a comparison nobody wrote, decided in
+    // favour of a value that has no JSON representation at all.
+    expect(() => decide(field("big", "equals", null), withPayload({ big }))).toThrow(
+      /bigint has no JSON representation/,
+    );
+  });
+
+  it("honours toJSON, comparing a value as what it serializes to", () => {
+    const when = new Date("1999-12-31T00:00:00.000Z") as unknown as JsonValue;
+    // Pinned against `canonicalize` itself, so the guard's answer is tied to the
+    // shared rule rather than to a string this test happens to like. Without
+    // `toJSON` the date reads as an object with no own keys and the comparison
+    // fails while looking like an honest mismatch.
+    expect(canonicalize(when)).toBe('"1999-12-31T00:00:00.000Z"');
+    expect(decide(field("when", "equals", "1999-12-31T00:00:00.000Z"), withPayload({ when }))).toBe(
+      "hold",
     );
   });
 });
@@ -1695,6 +1747,135 @@ describe("otherwise", () => {
 });
 
 // ---------------------------------------------------------------------------
+// The host's scratch
+// ---------------------------------------------------------------------------
+
+/**
+ * `RunState.host` is scratch space the host owns outright: the evaluator never
+ * reads it, never writes it, and carries it through untouched. It exists
+ * because some observations cannot be resolved in one pass, a model verdict
+ * being the clear case, so the host needs somewhere durable to record what it
+ * has already asked and what came back.
+ *
+ * A transition that dropped it would strand that work with no error raised
+ * anywhere, and the worst case is the one that looks safest: a retry, which
+ * would discard the record of the very node it is about to re-run. Clearing it
+ * is a decision only the host can make, because only the host knows whether the
+ * work is finished.
+ */
+describe("state.host", () => {
+  const SCRATCH: Record<string, JsonValue> = {
+    asking: { key: "judge:q", question: "Is the review clean?" },
+    answers: { "judge:earlier": "clean" },
+  };
+
+  const testsKey = observationKey({ kind: "exitZero", command: "npm test" });
+  const retrying = makeIr([
+    {
+      id: "e1",
+      from: "a",
+      event: "pass",
+      guard: { kind: "exitZero", command: "npm test" },
+      goto: "b",
+      otherwise: { kind: "retry", reason: "tests failing" },
+      limit: 3,
+    },
+  ]);
+
+  const paths: Array<{
+    name: string;
+    graph: WorkflowIr;
+    resolved: Record<string, ObservationResult>;
+    over: StateOverrides;
+    kind: string;
+  }> = [
+    {
+      name: "an advance",
+      graph: makeIr([{ id: "e1", from: "a", event: "pass", guard: ALWAYS, goto: "b" }]),
+      resolved: {},
+      over: {},
+      kind: "advance",
+    },
+    {
+      name: "a retry of the very node it is tracking",
+      graph: retrying,
+      resolved: { [testsKey]: { ok: true, value: false } },
+      over: {},
+      kind: "retry",
+    },
+    {
+      name: "parking at a gate",
+      graph: makeIr([
+        { id: "e1", from: "a", event: "pass", guard: ALWAYS, goto: "b", gate: "approve-plan" },
+      ]),
+      resolved: {},
+      over: {},
+      kind: "gate",
+    },
+    {
+      name: "the end of the run",
+      graph: makeIr([{ id: "e1", from: "a", event: "pass", guard: ALWAYS, goto: END }]),
+      resolved: {},
+      over: {},
+      kind: "end",
+    },
+    {
+      name: "a divert through otherwise",
+      graph: makeIr([
+        {
+          id: "e1",
+          from: "a",
+          event: "pass",
+          guard: NEVER,
+          goto: "b",
+          otherwise: { kind: "goto", node: "c" },
+        },
+      ]),
+      resolved: {},
+      over: {},
+      kind: "advance",
+    },
+    {
+      // The control: the error paths copy the state verbatim, so this row holds
+      // whatever the departing paths do, and fails only if that copy stops
+      // carrying the scratch.
+      name: "an error transition",
+      graph: makeIr([{ id: "e1", from: "a", event: "pass", guard: ALWAYS, goto: "b" }]),
+      resolved: {},
+      over: { graphHash: "stale" },
+      kind: "error",
+    },
+  ];
+
+  for (const path of paths) {
+    it(`survives ${path.name}`, () => {
+      const state = makeState({ ...path.over, host: SCRATCH });
+      const transition = evaluate(path.graph, state, path.resolved);
+      expect(transition.kind).toBe(path.kind);
+      expect(transition.state.host).toEqual(SCRATCH);
+    });
+  }
+
+  it("is copied, so the caller cannot reach into a persisted state through it", () => {
+    const scratch: Record<string, JsonValue> = { answers: {} };
+    const graph = makeIr([{ id: "e1", from: "a", event: "pass", guard: ALWAYS, goto: "b" }]);
+    const transition = evaluate(graph, makeState({ host: scratch }), {});
+    expect(transition.state.host).not.toBe(scratch);
+    scratch.asking = "judge:q";
+    expect(transition.state.host).toEqual({ answers: {} });
+  });
+
+  it("stays absent when the state carries none", () => {
+    // Absent, not present and empty. A host that persists this state and reads
+    // `host` back to decide whether a question is outstanding must be able to
+    // tell "nothing was ever recorded" from "a record exists and is empty".
+    const graph = makeIr([{ id: "e1", from: "a", event: "pass", guard: ALWAYS, goto: "b" }]);
+    const transition = evaluate(graph, makeState(), {});
+    expect(Object.hasOwn(transition.state, "host")).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Purity
 // ---------------------------------------------------------------------------
 
@@ -1712,7 +1893,12 @@ describe("purity", () => {
   ]);
 
   it("never mutates the state it is given", () => {
-    const state = makeState({ steps: 7, attempts: { e1: 1, e2: 5 }, outputs: { z: { k: 1 } } });
+    const state = makeState({
+      steps: 7,
+      attempts: { e1: 1, e2: 5 },
+      outputs: { z: { k: 1 } },
+      host: { answers: { "judge:q": "clean" } },
+    });
     const snapshot = clone(state);
 
     evaluate(graph, state, withPayload({ status: "ok" }));

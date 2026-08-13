@@ -18,6 +18,7 @@ import {
 import { evaluate, observationsFor } from "../src/evaluate.js";
 import type {
   JsonValue,
+  NodeId,
   ObservationRequest,
   ObservationResult,
   PayloadSource,
@@ -221,6 +222,48 @@ function judgedIr(): WorkflowIr {
 }
 
 /**
+ * One transition that needs both a command and a verdict.
+ *
+ * The command is what makes the round trip countable: a judge question costs two
+ * hook fires, and everything mechanical at the node is resolved on both of them
+ * unless the host remembers what it already found out. `printf` appends a byte
+ * per run, so the file is the count.
+ */
+function tickAndJudgeIr(): WorkflowIr {
+  const wf = workflow({ name: "tick-and-judge" });
+  wf.step("review", { skill: "s" });
+  wf.step("fix", { skill: "s" });
+  wf.entry("review");
+  wf.edge(
+    "review",
+    "fix",
+    when.all(when.exitZero("printf x >> ticks.txt"), judge("Any findings?").is("yes")),
+  );
+  wf.edge("review", END);
+  wf.edge("fix", END);
+  return wf.compile();
+}
+
+/**
+ * Two slow guard commands on one node, neither slow enough to matter alone.
+ *
+ * This is the shape a per-command timeout cannot bound: each command is well
+ * inside any sane per-command limit, and together they outlive the hook.
+ */
+function slowGuardsIr(): WorkflowIr {
+  const wf = workflow({ name: "slow-guards" });
+  wf.step("build", { skill: "s" });
+  wf.step("ship", { skill: "s" });
+  wf.entry("build");
+  // Two commands, not one twice: identical commands share an observation key and
+  // would be resolved once however the budget worked.
+  wf.edge("build", "ship", when.all(when.exitZero("sleep 1"), when.exitZero("sleep 1 && true")));
+  wf.edge("build", END);
+  wf.edge("ship", END);
+  return wf.compile();
+}
+
+/**
  * A judge written with .is(), which declares no verdict set at all.
  *
  * branch() closes the set with its route keys; this shape cannot, so it is the
@@ -253,6 +296,29 @@ function judgedFileIr(): WorkflowIr {
     },
   );
   wf.edge("fix", "review");
+  return wf.compile();
+}
+
+/**
+ * Two nodes whose payload obligation their own guards understate.
+ *
+ * Each declares an output contract and is left by a guard reading a file lane,
+ * one a field guard and one a judge. `observationsFor` adds an inline payload
+ * request for any node declaring a schema, so both are asked for two lanes while
+ * their guards name one, which is the disagreement a wrapper can be wrong about.
+ */
+function schemaOverFileIr(): WorkflowIr {
+  const wf = workflow({ name: "schema-over-file" });
+  wf.step("scan", { skill: "s", output: { clean: "boolean" } });
+  wf.step("review", { skill: "s", output: { findings: "number" } });
+  wf.entry("scan");
+  wf.edge("scan", "review", when.field("clean").truthy(), {
+    from: { lane: "file", path: "out/scan.json" },
+  });
+  wf.branch("review", judge("Ship it?", { from: { lane: "file", path: "out/review.json" } }), {
+    yes: END,
+    no: "scan",
+  });
   return wf.compile();
 }
 
@@ -464,6 +530,31 @@ function resolvedFrom(
     }
   }
   return resolved;
+}
+
+/**
+ * The payload lanes `observationsFor` will have the host resolve at a node, as
+ * `inline` and `file:<path>` labels. Sorted, because order is another test's.
+ */
+function demandedLanes(ir: WorkflowIr, node: NodeId): string[] {
+  const lanes: string[] = [];
+  for (const request of observationsFor(ir, stateAt(ir, node))) {
+    if (request.kind !== "payload" && request.kind !== "judge") continue;
+    const lane = request.from.lane === "file" ? `file:${request.from.path}` : "inline";
+    if (!lanes.includes(lane)) lanes.push(lane);
+  }
+  return lanes.sort();
+}
+
+/** The same labels, read back out of a step wrapper's delivery section. */
+function promisedLanes(wrapper: string): string[] {
+  const lanes: string[] = [];
+  for (const match of wrapper.matchAll(/Write your JSON payload to `([^`]+)`/g)) {
+    const path = match[1];
+    if (path !== undefined && !lanes.includes(`file:${path}`)) lanes.push(`file:${path}`);
+  }
+  if (wrapper.includes("fenced `json` block")) lanes.push("inline");
+  return lanes.sort();
 }
 
 /** Recursively freezes, so any write inside `emit` throws instead of passing. */
@@ -949,6 +1040,60 @@ describe("a gate's two commands", () => {
   });
 });
 
+describe("a command name", () => {
+  it("is folded into a name that cannot leave the commands directory", () => {
+    // A command name is also a file name. `opts.command` reaches
+    // `commands/<name>.md` directly, so a separator in it writes wherever it
+    // points, outside the plugin and outside anything the caller named.
+    const files = emit(tinyIr(), { command: "../../evil" });
+    expect(Object.keys(files)).toContain(`${COMMANDS_DIR}/evil.md`);
+    for (const path of Object.keys(files)) {
+      expect(`${path}: ${path.split("/").includes("..")}`).toBe(`${path}: false`);
+    }
+    // The matcher and the dispatcher's routing table carry the folded name too.
+    // Folding the file name alone would leave a command that exists under a name
+    // neither of them recognises, so the plugin would install and do nothing.
+    expect(matcherFor(files, "UserPromptExpansion").source).toBe("^tiny-flow:evil$");
+    expect(fileOf(files, DISPATCHER_PATH)).toContain('"runCommand": "tiny-flow:evil"');
+  });
+
+  it("is refused at compile time when nothing legal survives the fold", () => {
+    expect(() => emit(tinyIr(), { command: "../.." })).toThrow(/cannot derive a command name/);
+    expect(() => emit(gatedIr(["!!!"]))).toThrow(/cannot derive a command name/);
+  });
+
+  it("folds a gate's command without touching the gate's own name", () => {
+    // The gate names a sign-off and is what a parked run stores; its command is
+    // that name folded into what a command may be called. Folding the state key
+    // as well would strand every run parked before the recompile.
+    const files = emit(gatedIr(["Approve Plan!"]));
+    expect(Object.keys(files)).toContain(`${COMMANDS_DIR}/approve-plan.md`);
+    expect(pluginConstant(files).gates).toEqual({
+      "Approve Plan!": { resume: "gated:approve-plan", reject: "gated:reject-plan" },
+    });
+    // And the step before the gate tells its reviewer the command, not the gate.
+    expect(fileOf(files, "agents/step-s0.md")).toContain("/gated:approve-plan");
+  });
+
+  it("refuses a gate that claims the run command, which could never release it", () => {
+    // Both would be written to commands/run-gated.md, the gate's overwriting the
+    // run command's, and the dispatcher matches the run command first, so this
+    // gate would have no way to be released at all.
+    expect(() => emit(gatedIr(["run-gated"]))).toThrow(/could never be released/);
+    // The same collision approached from the other side.
+    expect(() => emit(gatedIr(["approve-plan"]), { command: "approve-plan" })).toThrow(
+      /could never be released/,
+    );
+    // And two gates cannot share one resume command either: one command file
+    // cannot mean two gates, and the second would be unreleasable the same way.
+    expect(() => emit(gatedIr(["approve plan", "approve-plan"]))).toThrow(
+      /cannot release two gates/,
+    );
+    // A gate whose command merely resembles the run command is fine.
+    expect(() => emit(gatedIr(["run-gated-later"]))).not.toThrow();
+  });
+});
+
 // ---------------------------------------------------------------------------
 // The dispatcher
 // ---------------------------------------------------------------------------
@@ -1134,6 +1279,8 @@ interface Harness {
   onlyRun(): RunState;
   /** Writes a file into the project directory the guards resolve against. */
   write(relative: string, contents: string): void;
+  /** Reads a file back out of that directory, or `""` when it is not there. */
+  read(relative: string): string;
   /**
    * Every trace entry written for every run, in order.
    *
@@ -1187,8 +1334,16 @@ function reported(value: JsonValue, prefix = ""): string {
  * it, with `$CLAUDE_PLUGIN_DATA`, `$CLAUDE_PLUGIN_ROOT` and `$CLAUDE_PROJECT_DIR`
  * pointing at three directories the test owns. Nothing is written anywhere near
  * the repository, and the whole tree is removed afterwards.
+ *
+ * `env` adds to the hook environment, which is how a test reaches the knobs a
+ * real host would set: the guard budget in particular, since waiting out the
+ * default would cost the suite three quarters of a minute per assertion.
  */
-async function withPlugin(ir: WorkflowIr, body: (harness: Harness) => void): Promise<void> {
+async function withPlugin(
+  ir: WorkflowIr,
+  body: (harness: Harness) => void,
+  env: Record<string, string> = {},
+): Promise<void> {
   const { fs, os, path } = await nodeModules();
   const { spawnSync } = await import("node:child_process");
   const sync = await import("node:fs");
@@ -1214,6 +1369,7 @@ async function withPlugin(ir: WorkflowIr, body: (harness: Harness) => void): Pro
             CLAUDE_PLUGIN_DATA: dataDir,
             CLAUDE_PLUGIN_ROOT: pluginDir,
             CLAUDE_PROJECT_DIR: projectDir,
+            ...env,
           },
         });
         // A hook that exits non-zero, or throws its way out of main, is a
@@ -1268,6 +1424,10 @@ async function withPlugin(ir: WorkflowIr, body: (harness: Harness) => void): Pro
         const target = path.join(projectDir, ...relative.split("/"));
         sync.mkdirSync(path.dirname(target), { recursive: true });
         sync.writeFileSync(target, contents, "utf8");
+      },
+      read(relative) {
+        const target = path.join(projectDir, ...relative.split("/"));
+        return sync.existsSync(target) ? sync.readFileSync(target, "utf8") : "";
       },
       editGraph(change) {
         const graph = JSON.parse(sync.readFileSync(graphFile, "utf8")) as Record<string, JsonValue>;
@@ -1709,6 +1869,88 @@ describe("a run, driven through the emitted dispatcher", () => {
     });
   });
 
+  it("runs each guard command once per visit, not once per hook fire", async () => {
+    await withPlugin(tickAndJudgeIr(), (plugin) => {
+      plugin.begin();
+
+      // Pass one: the command runs, and the unanswered judge question ends the
+      // pass. Pass two brings the answer, and the transition is decided from the
+      // exit code pass one already established.
+      const asked = plugin.fire(stopped("Reviewed."));
+      expect(asked.reason).toContain("Any findings?");
+      expect(plugin.read("ticks.txt")).toBe("x");
+
+      const answered = plugin.fire(stopped("yes"));
+      expect(answered.reason).toContain("tick-and-judge:step-fix");
+      // One transition, one run of the command. A guard command is arbitrary
+      // shell: `npm test` twice is a suite run twice, and a counter moved twice
+      // is a graph whose own guard changed the thing it was measuring.
+      expect(plugin.read("ticks.txt")).toBe("x");
+    });
+  });
+
+  it("resolves a guard again on the next visit, since the scratch is scoped to one", async () => {
+    // The other half of the cache: it is scoped to a node and a step count, so
+    // it can shorten one visit and can never decide the next one. Without this
+    // the fix above would be a cache that outlives its answer.
+    await withPlugin(tickAndJudgeIr(), (plugin) => {
+      plugin.begin();
+      plugin.fire(stopped("Reviewed."));
+      plugin.fire(stopped("yes"));
+      expect(plugin.read("ticks.txt")).toBe("x");
+
+      // fix has one unconditional edge to END, so the run finishes there. A
+      // second run walks the same node again and pays for the command again.
+      plugin.fire(stopped("Fixed."));
+      plugin.begin();
+      plugin.fire(stopped("Reviewed again."));
+      expect(plugin.read("ticks.txt")).toBe("xx");
+    });
+  });
+
+  it("stops with a budget it can name when the guards outlive the hook", async () => {
+    await withPlugin(
+      slowGuardsIr(),
+      (plugin) => {
+        plugin.begin();
+        const stalled = plugin.fire(stopped("Built it."));
+
+        // Neither command is slow on its own, and a per-command bound would let
+        // both through. The hook they share is what has a deadline, and a hook
+        // cancelled for outrunning it is discarded whole: no decision, no
+        // message, a runner that stops for real and a state left at "running"
+        // with nothing to explain it. Stopping here is the visible alternative.
+        expect(stalled.decision).toBeNull();
+        expect(stalled.stderr).toContain("observation-failed");
+        expect(stalled.stderr).toContain("guard budget");
+        expect(stalled.stderr).toContain("sleep 1 && true");
+        // And it did not quietly take the transition anyway.
+        expect(stalled.stderr).not.toContain("slow-guards:step-ship");
+      },
+      { MINFLOW_GUARD_BUDGET_MS: "1200" },
+    );
+  });
+
+  it("names the payload that never parsed, not the round trip that followed it", async () => {
+    await withPlugin(judgedIr(), (plugin) => {
+      plugin.begin();
+
+      // The step returns no payload at all, on a pass that also has a judge
+      // question to ask, so nothing is reported until the answer arrives.
+      const asked = plugin.fire(stopped("Reviewed it, but I forgot the JSON."));
+      expect(asked.reason).toContain("Any unresolved findings?");
+
+      const answered = plugin.fire(stopped("no"));
+      expect(answered.decision).toBeNull();
+      expect(answered.stderr).toContain("observation-failed");
+      // The cause is a payload the step never wrote. Reporting the judge round
+      // trip instead sends a reader to redesign a lane that was working, over a
+      // step that simply did not do what it was told.
+      expect(answered.stderr).toContain("no JSON payload could be parsed");
+      expect(answered.stderr).not.toContain("the inline payload is gone");
+    });
+  });
+
   it("stops when the payload cannot be parsed, rather than reading it as false", async () => {
     await withPlugin(drivableIr(), (plugin) => {
       plugin.begin();
@@ -1995,7 +2237,32 @@ describe("derived delivery obligations", () => {
     const wrapper = fileOf(emit(exampleIr()), "agents/step-research.md");
     expect(wrapper).toContain("Write your JSON payload to `.minflow/research.json`");
     // The author declared the lane on the edge; nobody hand-maintained this.
-    expect(wrapper).not.toContain("fenced `json` block");
+    // The inline block is asked for as well, and only because this node declares
+    // a schema: `observationsFor` adds a payload request on the default lane for
+    // any node that does, whatever its guards read. A wrapper that decided the
+    // question from the guards alone would leave this step's contract unmet.
+    expect(wrapper).toContain("fenced `json` block");
+
+    // A node with the same file lane and no schema is told about the file only.
+    expect(fileOf(emit(fileLaneIr()), "agents/step-scan.md")).not.toContain("fenced `json` block");
+  });
+
+  it("asks for exactly the lanes the evaluator will demand, on every node", () => {
+    // The two sides of one contract, computed and compared rather than pinned to
+    // a string. The wrapper is written at compile time and the demand is made at
+    // run time, by `observationsFor`, so nothing but this stops them drifting:
+    // a step told to write only a file, whose node also declares a schema, is
+    // failed at run time for an inline payload nobody ever asked it for.
+    for (const ir of [exampleIr(), tinyIr(), schemaOverFileIr(), repeatedLaneIr(), judgedIr()]) {
+      const files = emit(ir);
+      const names = agentNames(ir);
+      for (const node of ir.nodes) {
+        const wrapper = fileOf(files, `agents/${names[node.id]}.md`);
+        expect(`${node.id}: ${promisedLanes(wrapper).join(", ")}`).toBe(
+          `${node.id}: ${demandedLanes(ir, node.id).join(", ")}`,
+        );
+      }
+    }
   });
 
   it("asks for the inline lane when that is what a guard reads", () => {
@@ -2133,6 +2400,40 @@ describe("writeFiles", () => {
       await expect(writeFiles(rebuilt, dir)).resolves.toEqual(written);
       expect(await fs.readFile(manifest, "utf8")).toBe(fileOf(rebuilt, MANIFEST_PATH));
       expect(await fs.readFile(manifest, "utf8")).toContain('"version": "9.9.9"');
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a path that leaves the directory it was given, and writes nothing", async () => {
+    const { fs, os, path } = await nodeModules();
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "minflow-escape-"));
+    try {
+      const dest = path.join(dir, "plugin");
+      // This function takes a map, not a graph, so it cannot assume the map came
+      // from emit(). A path that leaves the destination is refused here, at the
+      // one place in the emitter that touches a filesystem, rather than trusted
+      // to have been sanitized upstream.
+      const escapes = [
+        "../escaped.md",
+        "commands/../../escaped.md",
+        path.join(dir, "absolute.md"),
+        `${dir}-sibling/near-miss.md`,
+      ];
+      for (const relative of escapes) {
+        await expect(writeFiles({ [relative]: "x" }, dest)).rejects.toThrow(/refusing to write/);
+      }
+
+      // Whole-map refusal: the legal entry alongside an escaping one is not
+      // written either, so a rejected map leaves no half-plugin behind.
+      await expect(
+        writeFiles({ "commands/fine.md": "x", "../escaped.md": "x" }, dest),
+      ).rejects.toThrow(/refusing to write/);
+      expect(await fs.readdir(dir)).toEqual([]);
+
+      // The same relative path one directory deeper is inside, and is written.
+      await writeFiles({ "commands/fine.md": "x" }, dest);
+      expect(await fs.readFile(path.join(dest, "commands", "fine.md"), "utf8")).toBe("x");
     } finally {
       await fs.rm(dir, { recursive: true, force: true });
     }
