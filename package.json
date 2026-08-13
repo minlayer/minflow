@@ -1,0 +1,60 @@
+{
+  "name": "minflow",
+  "version": "0.0.0",
+  "description": "Early development. Name reserved for the minflow project.",
+  "keywords": [
+    "minflow",
+    "minlayer"
+  ],
+  "license": "MIT",
+  "author": "Ariel Arevalo <ariel@enki.cr>",
+  "homepage": "https://github.com/minlayer/minflow#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/minlayer/minflow.git"
+  },
+  "bugs": {
+    "url": "https://github.com/minlayer/minflow/issues"
+  },
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "CHANGELOG.md"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "clean": "rm -rf dist",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check .",
+    "format": "biome check --write .",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "check": "npm run lint && npm run typecheck && npm run test",
+    "prepublishOnly": "npm run clean && npm run build",
+    "publish:alias": "npm publish ./alias"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.2.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true
+  }
+}
