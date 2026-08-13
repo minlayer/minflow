@@ -11,14 +11,20 @@ describe("the public surface", () => {
     // means updating this line.
     expect(Object.keys(minflow).sort()).toEqual([
       "END",
+      "SKILL_FILE",
       "VERSION",
+      "checkSkills",
       "claudeCode",
+      "discoverSkills",
       "evaluate",
       "judge",
       "lintGraph",
       "observationKey",
       "observationsFor",
+      "parseSkill",
+      "preloadCost",
       "retry",
+      "toMermaid",
       "when",
       "workflow",
     ]);
@@ -65,6 +71,49 @@ describe("the public surface", () => {
     // And it emits a plugin whose entrypoint is reachable.
     const files = minflow.claudeCode.emit(ir);
     expect(Object.keys(files)).toContain("commands/run-research-and-ship.md");
+  });
+
+  it("renders a graph a reader can follow, including where it parks and retries", () => {
+    // SPEC section 1.3 trades the transition table's one-glance legibility for
+    // errors at the offending line, and names this as what buys it back. A
+    // diagram that omits the gate or the retry is not that.
+    const wf = minflow.workflow({ name: "readable" });
+    wf.step("plan", { skill: "write-plan" });
+    wf.step("ship", { skill: "ship-it" });
+    wf.entry("plan");
+    wf.gate("plan", "ship", { command: "approve-plan" });
+    wf.edge("ship", minflow.END, minflow.when.exitZero("npm test"), {
+      otherwise: minflow.retry(2, "tests failing"),
+    });
+
+    const diagram = minflow.toMermaid(wf.compile());
+    expect(diagram).toContain("flowchart");
+    expect(diagram).toContain("approve-plan");
+    expect(diagram).toContain("npm test exits 0");
+    expect(diagram).toContain("tests failing");
+  });
+
+  it("refuses to let a step name a skill that does not resolve", () => {
+    // The failure this prevents is silent: the platform skips a missing skill
+    // with only a debug-log warning, so the step runs without its instructions
+    // and the run reports nothing wrong.
+    const wf = minflow.workflow({ name: "skills" });
+    wf.step("research", { skill: "research-topic" });
+    wf.entry("research");
+    wf.edge("research", minflow.END);
+    const ir = wf.compile();
+
+    expect(minflow.checkSkills(ir, [])).not.toHaveLength(0);
+    expect(
+      minflow.checkSkills(ir, [
+        {
+          directory: "research-topic",
+          source: "./skills/research-topic/SKILL.md",
+          frontmatter: { name: "research-topic", description: "How to research a topic." },
+          bodyChars: 400,
+        },
+      ]),
+    ).toEqual([]);
   });
 
   it("exposes a semver version string", () => {

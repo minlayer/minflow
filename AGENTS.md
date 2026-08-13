@@ -13,6 +13,8 @@ src/ir.ts          the intermediate representation: types and nothing else
 src/hash.ts        canonical serialization and the graph hash
 src/evaluate.ts    the transition evaluator, pure
 src/builder.ts     the authoring surface, plus lintGraph
+src/mermaid.ts     the graph as a diagram, pure
+src/skills.ts      skill validation: a pure check plus a thin filesystem shell
 src/emit/          one directory per backend
 src/index.ts       the public surface
 ```

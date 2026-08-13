@@ -102,6 +102,33 @@ export * as claudeCode from "./emit/claude-code.js";
 export type { ObservationSpec } from "./evaluate.js";
 export { evaluate, observationKey, observationsFor } from "./evaluate.js";
 
+// --- Reading a graph -------------------------------------------------------
+//
+// The builder buys error locality and costs legibility: a graph is no longer
+// visible at a glance the way a transition table was. These are what buy it
+// back, so they are part of the surface rather than a convenience.
+//
+// toMermaid renders the graph as a flowchart, including the things easiest to
+// omit and most costly to miss: where a run parks for a human, what a retry's
+// ceiling is, and where a failing guard diverts to.
+
+export type { MermaidOptions } from "./mermaid.js";
+export { toMermaid } from "./mermaid.js";
+
+// --- Skills ----------------------------------------------------------------
+//
+// Claude Code skips a missing or policy-disabled skill with only a debug-log
+// warning, so a step whose skill does not resolve runs without its instructions
+// and reports nothing. Checking before emitting is therefore required rather
+// than advisable, and it cannot live in emit(), which is pure by design.
+//
+// checkSkills is the pure half and discoverSkills is the only part that reads a
+// filesystem. preloadCost is reported separately because an expensive skill is
+// information a caller may act on, not a fault.
+
+export type { DiscoveredSkill, SkillCost, SkillReferencingGraph } from "./skills.js";
+export { checkSkills, discoverSkills, parseSkill, preloadCost, SKILL_FILE } from "./skills.js";
+
 // --- The IR ----------------------------------------------------------------
 //
 // Types only. You need these to type a host, a guard, or anything else handling a
