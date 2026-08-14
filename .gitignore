@@ -30,8 +30,6 @@ Thumbs.db
 # Agent tooling
 .claude/
 
-# Copied in by alias/ prepack
-alias/LICENSE
 
 # Spike (local verification harness, not shipped)
 spike/

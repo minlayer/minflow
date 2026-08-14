@@ -148,16 +148,11 @@ npm install minflow
 
 ## Related packages
 
-`minflow` is the compiler. **minlayer** is a family of plugins for coding agents,
-built with it, and is not released yet: the names below are reserved and their
-published versions are placeholders.
-
 | Package | Status |
 | --- | --- |
 | [`minflow`](https://www.npmjs.com/package/minflow) | This package. The compiler, usable on its own. |
-| `@minlayer/*` | The plugin family, one package per coding agent. Not yet published. |
-| [`minlayer`](https://www.npmjs.com/package/minlayer), [`minlayer-claude`](https://www.npmjs.com/package/minlayer-claude) | Reserved names, placeholder releases. |
-| [`@minlayer/minflow`](https://www.npmjs.com/package/@minlayer/minflow) | Reserved namespace. Install `minflow` instead. |
+| [`minlayer`](https://www.npmjs.com/package/minlayer) | Reserved name, placeholder release. A family of plugins for coding agents, built with minflow. |
+| [`minlayer-claude`](https://www.npmjs.com/package/minlayer-claude) | Reserved name, placeholder release. |
 
 ## Development
 
