@@ -47,7 +47,13 @@ describe("the public surface", () => {
       model: "haiku",
       output: { notes: "string", sources: "string[]" },
     });
-    wf.step("plan", { skill: "write-plan" });
+    // The README documents this interpolation on this exact graph, so it is
+    // compiled here rather than left as prose that might not hold. It is legal
+    // because research is on every route to plan.
+    wf.step("plan", {
+      skill: "write-plan",
+      prompt: "Write a plan from:\n\n{{ctx.research.notes}}",
+    });
     wf.step("implement", { skill: "implement-plan", maxTurns: 25 });
     wf.step("review", { skill: "review-changes" });
 
@@ -71,6 +77,11 @@ describe("the public surface", () => {
     // And it emits a plugin whose entrypoint is reachable.
     const files = minflow.claudeCode.emit(ir);
     expect(Object.keys(files)).toContain("commands/run-research-and-ship.md");
+
+    // The wrapper must not show the step a placeholder it cannot resolve: the
+    // value arrives in the instruction the dispatcher writes at spawn time.
+    const wrapper = files["agents/step-plan.md"] ?? "";
+    expect(wrapper).not.toContain("{{ctx.");
   });
 
   it("renders a graph a reader can follow, including where it parks and retries", () => {

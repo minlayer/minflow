@@ -24,12 +24,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   resolved values. Nothing about how a value was obtained reaches it.
 - The Claude Code backend: `claudeCode.emit()` renders a plugin as a pure
   function returning a path to contents map, and `claudeCode.writeFiles()` puts
-  it on disk.
+  it on disk. The emitted plugin routes a run itself: it resolves the
+  observations a graph asks for, evaluates the transition, and drives the next
+  step, including a natural language verdict, a gate parked for human sign off,
+  and a retry to its limit.
+- Run context interpolation. A prompt may read an earlier step's output as
+  `{{ctx.node.path}}`, legal only when that step is on every route to this one,
+  so a value cannot be present on one branch and missing on another.
+- `checkSkills` and `discoverSkills`, because Claude Code skips a skill it
+  cannot resolve with only a debug log warning, so a step whose skill is missing
+  otherwise runs without its instructions and reports nothing wrong.
+- `toMermaid`, which renders a graph as a diagram, including where a run parks
+  for a human, a retry's ceiling, and where a failing guard diverts to.
 
 ### Notes
 
 - Platform behaviour is verified by execution against Claude Code `2.1.229`
-  rather than assumed. See `docs/VERIFICATION.md`.
+  rather than assumed, and several claims that seemed safe to infer turned out
+  to be wrong. See `docs/VERIFICATION.md`.
 - The API is unstable throughout the `0.0.x` line.
 
 ## [0.0.0]

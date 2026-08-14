@@ -47,6 +47,34 @@ a file on disk, a field of a step's output. `judge()` is the one conspicuous way
 to ask a model for a verdict, so reaching for judgment is a visible decision
 rather than an accident.
 
+A step reads an earlier step's output by interpolating it:
+
+```ts
+wf.step("plan", { skill: "write-plan", prompt: "Write a plan from:\n\n{{ctx.research.notes}}" });
+```
+
+That reference is legal only when `research` **dominates** `plan`, meaning every
+route through the graph reaches `plan` through `research`, so the value cannot be
+present on one branch and missing on another. When it is not, compiling fails and
+names a route that reaches `plan` while skipping `research`, rather than leaving
+you to find out on the branch nobody tested.
+
+Two things worth running before you ship a workflow:
+
+```ts
+import { checkSkills, discoverSkills, toMermaid } from "minflow";
+
+const problems = checkSkills(ir, await discoverSkills([".claude/skills"]));
+console.log(toMermaid(ir));
+```
+
+`checkSkills` matters more than it sounds. Claude Code skips a skill it cannot
+resolve with only a debug-log warning, so a step whose skill is missing runs
+without its instructions and the run reports nothing wrong. `toMermaid` is the
+reading path: the builder gives up the transition table's one-glance legibility
+in exchange for errors at the offending line, and the diagram buys it back,
+including where a run parks for a human and what a retry's ceiling is.
+
 ## Why a compiler
 
 The asset is the intermediate representation that `compile()` produces: a
@@ -86,8 +114,13 @@ registrations are scoped so that nothing fires during unrelated work.
 
 ## Status
 
-Working: the builder, the IR, the graph lint, the transition evaluator, and the
-Claude Code backend. 387 tests, no model required to run them.
+Working: the builder, the IR, the graph lint, the transition evaluator, run
+context interpolation, skill validation, Mermaid output, and the Claude Code
+backend. 557 tests, none of which need a model.
+
+A compiled workflow runs: the transition cycle, a judge verdict, a gate parked in
+one session and released in another, and a retry to its limit have each been
+driven end to end on a real install.
 
 Platform behaviour is verified by execution rather than assumed. The claims the
 design rests on were measured against Claude Code `2.1.229`, and
