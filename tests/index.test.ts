@@ -127,7 +127,13 @@ describe("the public surface", () => {
     ).toEqual([]);
   });
 
-  it("exposes a semver version string", () => {
+  it("exposes a semver version string that matches the package", async () => {
     expect(minflow.VERSION).toMatch(/^\d+\.\d+\.\d+/);
+
+    // Two sources of truth for one number drift silently, and the first symptom
+    // is a released package reporting the wrong version of itself.
+    const fs = await import("node:fs/promises");
+    const manifest = JSON.parse(await fs.readFile("package.json", "utf8")) as { version: string };
+    expect(minflow.VERSION).toBe(manifest.version);
   });
 });

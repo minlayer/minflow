@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.1] - 2026-08-13
+
 ### Added
 
 - The graph builder: `workflow()`, `step`, `entry`, `edge`, `gate`, `branch`,
@@ -52,5 +54,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Vitest test suite, and GitHub Actions for CI and publishing.
 - Placeholder release reserving the `minflow` package name on npm.
 
-[Unreleased]: https://github.com/minlayer/minflow/compare/v0.0.0...HEAD
+[Unreleased]: https://github.com/minlayer/minflow/compare/v0.0.1...HEAD
+[0.0.1]: https://github.com/minlayer/minflow/compare/v0.0.0...v0.0.1
 [0.0.0]: https://github.com/minlayer/minflow/releases/tag/v0.0.0
