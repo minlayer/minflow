@@ -213,6 +213,35 @@ Only ergonomics need a human session.
 
 **Known gaps accepted:** no code signing or provenance verification, and no portable secrets mechanism.
 
+### D26. Compliance is the goal; the specs are not yet worth complying with
+
+**Position:** minflow would rather be Agent Skills and Agent Plugins compliant than not. Both specifications are immature enough today that strict compliance would cost capability the design needs, so minflow keeps its own translation layer and negotiates incompatibilities as they surface.
+
+**What compliance costs right now, concretely:**
+
+- **`user-invocable` is not a standard Agent Skills field.** The standard's frontmatter is `name` and `description` required, with `license`, `compatibility`, `metadata` and an experimental `allowed-tools` optional. Its sibling `disable-model-invocation` is documented as a Claude Code extension, so this one almost certainly is too. Encapsulation is not a niche concern: without it every internal step of a compiled workflow is a separate public surface, and a compiled workflow's whole shape is one public entry over private steps (D27).
+- **Most component types are not portable at all.** Agent Plugins 1.0.0 permits exactly two, `skills/` and `mcp.json`. Commands, hooks, agents, rules and LSP servers are explicitly outside v1, which is to say every component that makes a workflow *run* is outside the standard on every client.
+
+**The test this position is held to.** The acceptable world is one where something is missing from minflow **because it is out of spec and genuinely niche**. The world we have is one where a fundamental encapsulation primitive is out of spec and most of the component surface is unstandardised. Until that inverts, compliance is a direction rather than a constraint.
+
+**What this does not license.** Emitting a schema violation where the schema is closed. D21 still holds: the manifest is ten fields and the graph hash goes under `extensions`, because an unknown top-level key is a violation whether or not a client tolerates it. The translation layer is for fields the standard has not reached, not for fields it has ruled on.
+
+**Revisit when** either specification adds an invocability field, or Agent Plugins standardises a component type minflow emits. Both are gaps somebody else has to close, so this is watched rather than worked.
+
+### D27. The entrypoint is a command, not a skill
+
+**Chosen:** a compiled workflow's single public surface is a slash command in `commands/`. Every skill it ships is private (D26).
+
+**Rejected:** exposing the entry as a user-invocable skill, which would be the more portable shape, since `skills/` is one of the two portable component types and `commands/` is not.
+
+**Why the less portable option wins anyway:** portability of the doorway buys nothing while the machine behind it is unportable. The dispatcher, the runner and the step wrappers are all outside the standard, so an entry skill on a non-Claude-Code client would open onto nothing. It also has an unverified actuation: the entrypoint fires `UserPromptExpansion`, which full-matches on `command_name`, and whether activating a skill produces that event at all is unmeasured.
+
+**What it costs, stated plainly:** a command is user-invocable only. A skill is also model-invocable, so an entry skill could let an agent start a workflow because it recognised the request, rather than requiring a human to type it. That capability is real and is given up here.
+
+**Not the entry node's own skill, in any case.** That skill belongs to a step. Invoking it directly would run one step's instructions with no run state, no graph and no routing, so publishing it would publish something broken. An entry skill, if it ever exists, is generated and does what the command body does.
+
+**Revisit when** a second backend exists, since that is the point at which a portable doorway starts being worth something.
+
 ### D22. Track the emerging portable orchestration API
 
 **Observed:** a third party has ported `agent()` / `parallel()` / `pipeline()` to run against Codex, Gemini, and pi, script shape unchanged.

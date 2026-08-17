@@ -35,18 +35,21 @@
 
 import { graphHash } from "./hash.js";
 import type {
+  AskQuestion,
+  AskQuestions,
+  AskSpec,
+  Edge,
   End,
   FieldOp,
+  Graph,
   Guard,
-  IrEdge,
-  IrNode,
   JsonValue,
+  Node,
   NodeId,
   Otherwise,
   PayloadSource,
-  WorkflowIr,
 } from "./ir.js";
-import { isEnd } from "./ir.js";
+import { COMMAND_OUTPUT_KEYS, isCommandNode, isEnd, templateOf } from "./ir.js";
 
 export { END } from "./ir.js";
 
@@ -93,6 +96,23 @@ export interface StepOptions {
   output?: OutputSpec;
 }
 
+/** Everything a command node can declare. Only `command` is required. */
+export interface RunOptions {
+  /**
+   * The command to execute, as a template over the run context.
+   *
+   * Takes the same `{{params.key}}` and `{{ctx.node.path}}` forms a prompt does,
+   * and is checked the same way, dominance included.
+   */
+  command: string;
+  /** Scalars interpolated inline into the command. */
+  params?: Record<string, JsonValue>;
+  /** Ceiling in milliseconds. Past it the host kills the command and errors. */
+  timeoutMs?: number;
+  /** Display grouping. */
+  phase?: string;
+}
+
 /**
  * What {@link retry} returns.
  *
@@ -124,7 +144,7 @@ export interface EdgeOptions {
    * Ceiling on `otherwise: retry`. Set for you when you pass {@link retry}.
    *
    * It bounds the retry path and nothing else. The evaluator reads it only
-   * when a guard fails and the edge's `otherwise` is a retry (see `IrEdge.limit`
+   * when a guard fails and the edge's `otherwise` is a retry (see `Edge.limit`
    * in the IR). Setting it on an edge with no retry is therefore rejected rather
    * than accepted as a loop ceiling it cannot be.
    *
@@ -144,6 +164,29 @@ export interface EdgeOptions {
    * another, and the evaluator never learns the difference (SPEC §6.3).
    */
   from?: PayloadSource;
+}
+
+/**
+ * What {@link askFrom} returns: questions computed by the step rather than
+ * written into the graph.
+ */
+export interface AskFromOutput {
+  kind: "output";
+  path: string;
+}
+
+/** Options for {@link WorkflowBuilder.ask}. */
+export interface AskOptions {
+  /**
+   * The questions, either written here or read out of the step's own payload
+   * with {@link askFrom}.
+   */
+  questions: AskQuestion[] | AskFromOutput;
+  /**
+   * The id the answers are recorded under, readable later as
+   * `{{ctx.<as>.<key>}}`. Defaults to the asking node's id with `-answers`.
+   */
+  as?: NodeId;
 }
 
 /** Options for {@link WorkflowBuilder.gate}. */
@@ -208,6 +251,15 @@ export interface WorkflowBuilder {
   readonly name: string;
   /** Declares a node. Throws on a duplicate id. */
   step(id: NodeId, options: StepOptions): WorkflowBuilder;
+  /**
+   * Declares a node that runs a shell command instead of a model.
+   *
+   * Its payload is `{ exitCode, stdout, stderr }`, so the guards leaving it are
+   * ordinary field guards: `when.field("exitCode").equals(0)`. It costs no model
+   * call, which is the whole reason to reach for it, and it has to finish inside
+   * the host's hook budget, which is the reason not to.
+   */
+  run(id: NodeId, options: RunOptions): WorkflowBuilder;
   /** Names the starting node. Throws unless it is already declared. */
   entry(id: NodeId): WorkflowBuilder;
   /** Adds a transition. Both ends must already be declared. */
@@ -221,10 +273,20 @@ export interface WorkflowBuilder {
    * the rejection happens at the call, with the reason.
    */
   gate(from: NodeId, to: NodeId, options: GateOptions): WorkflowBuilder;
+  /**
+   * Adds a transition that puts questions to the user and then continues by
+   * itself, with nothing typed.
+   *
+   * The distinction from {@link WorkflowBuilder.gate} is what happens after the
+   * human acts. A gate ends the run segment and waits for a resume command. An
+   * ask hands the questions to whatever can reach the user, takes the answers,
+   * records them as an output a later step can interpolate, and carries on.
+   */
+  ask(from: NodeId, to: NodeId, options: AskOptions): WorkflowBuilder;
   /** Adds one judged transition per route, all sharing one question. */
   branch(from: NodeId, spec: JudgeSpec, routes: Routes): WorkflowBuilder;
   /** Runs the whole-graph checks and returns the IR. Throws if anything fails. */
-  compile(): WorkflowIr;
+  compile(): Graph;
   /** Human-readable rendering. Never throws, so it can be used to debug a broken graph. */
   print(): string;
 }
@@ -361,6 +423,64 @@ export function judge(question: string, options: LaneOptions = {}): JudgeSpec {
   };
   if (lane !== undefined) spec.from = lane;
   return spec;
+}
+
+/**
+ * Read an ask's questions out of the asking step's own payload, at a dot path.
+ *
+ * The alternative is writing them into the graph, which is right when they are
+ * fixed and wrong as soon as they are not: a step that has just scanned a
+ * directory, read a config, or found three unresolved references knows things
+ * the author did not, and this is how it gets to ask about them.
+ */
+export function askFrom(path: string): AskFromOutput {
+  return { kind: "output", path: requireText(path, 'askFrom("...")', "path") };
+}
+
+/**
+ * Validate what an author passed as `questions`, into the IR's shape.
+ *
+ * Every field is checked here rather than at run time because a malformed
+ * question reaches the user as a dialog with no options in it, and by then the
+ * run is already parked waiting for an answer to a question nobody can read.
+ */
+function askQuestionsSpec(questions: AskQuestion[] | AskFromOutput, context: string): AskQuestions {
+  if (questions !== null && typeof questions === "object" && !Array.isArray(questions)) {
+    if (questions.kind !== "output") {
+      throw new Error(
+        `minflow: ${context} got a { questions } it does not recognise. Pass a list, or ` +
+          'askFrom("path").',
+      );
+    }
+    return { kind: "output", path: questions.path };
+  }
+  if (!Array.isArray(questions) || questions.length === 0) {
+    throw new Error(
+      `minflow: ${context} needs at least one question, or askFrom("path") to read them out ` +
+        "of the step's own output.",
+    );
+  }
+  for (const [index, entry] of questions.entries()) {
+    const at = `${context} question ${index + 1}`;
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new Error(`minflow: ${at} is not an object.`);
+    }
+    requireText(entry.question, at, "question");
+    requireText(entry.header, at, "header");
+    if (!Array.isArray(entry.options) || entry.options.length === 0) {
+      throw new Error(
+        `minflow: ${at} offers no options. A question with nothing to pick from cannot be ` +
+          "answered.",
+      );
+    }
+    for (const [position, option] of entry.options.entries()) {
+      if (option === null || typeof option !== "object" || Array.isArray(option)) {
+        throw new Error(`minflow: ${at} option ${position + 1} is not an object.`);
+      }
+      requireText(option.label, `${at} option ${position + 1}`, "label");
+    }
+  }
+  return { kind: "static", items: clone(questions) };
 }
 
 /**
@@ -519,9 +639,9 @@ function unreadablePrompt(subject: string, placeholder: { text: string; reason: 
 function unknownParam(subject: string, text: string, params: Record<string, JsonValue>): string {
   const keys = Object.keys(params);
   return (
-    `${subject} prompt reads ${text}, which names no param it declares. Declared params: ` +
+    `${subject} reads ${text}, which names no param it declares. Declared params: ` +
     `${keys.length === 0 ? "(none)" : keys.join(", ")}. A params placeholder is filled from the ` +
-    "step's own params when the graph is emitted, so nothing else can supply it."
+    "node's own params when the graph is emitted, so nothing else can supply it."
   );
 }
 
@@ -612,8 +732,8 @@ export function workflow(options: { name: string }): WorkflowBuilder {
 
 class Builder implements WorkflowBuilder {
   readonly name: string;
-  readonly #nodes = new Map<NodeId, IrNode>();
-  readonly #edges: IrEdge[] = [];
+  readonly #nodes = new Map<NodeId, Node>();
+  readonly #edges: Edge[] = [];
   readonly #counts = new Map<NodeId, number>();
   #entry: NodeId | undefined;
 
@@ -681,7 +801,7 @@ class Builder implements WorkflowBuilder {
       }
     }
 
-    const node: IrNode = { id: at, skill };
+    const node: Node = { id: at, skill };
     if (options.prompt !== undefined) node.prompt = options.prompt;
     if (options.params !== undefined) node.params = options.params;
     if (options.model !== undefined) node.model = options.model;
@@ -690,6 +810,70 @@ class Builder implements WorkflowBuilder {
     if (options.phase !== undefined) node.phase = options.phase;
     if (options.output !== undefined) node.schema = outputToSchema(at, options.output);
     else if (options.schema !== undefined) node.schema = options.schema;
+
+    this.#nodes.set(at, node);
+    return this;
+  }
+
+  run(id: NodeId, options: RunOptions): WorkflowBuilder {
+    const at = requireText(id, "run(id, ...)", "id");
+    if (isEnd(at)) {
+      throw new Error(`minflow: run("${at}") uses a reserved id; END marks a terminal transition.`);
+    }
+    if (this.#nodes.has(at)) {
+      throw new Error(
+        `minflow: duplicate node id "${at}". Already declared: ${this.#knownNodes()}.`,
+      );
+    }
+    if (options === null || typeof options !== "object" || typeof options.command !== "string") {
+      throw new Error(
+        `minflow: run("${at}") needs a { command } naming what to execute, ` +
+          `e.g. run("${at}", { command: "npm test" }).`,
+      );
+    }
+
+    const command = requireText(
+      options.command,
+      `run("${at}")`,
+      'command, e.g. { command: "npm test" }',
+    );
+    // Whitespace is the worst spelling of an empty command rather than a
+    // smaller one: a shell handed it runs nothing and exits 0, so the node
+    // reports success and the run routes on as though the check had passed.
+    if (command.trim() === "") {
+      throw new Error(
+        `minflow: run("${at}") has a command of only whitespace. A shell handed it exits 0 ` +
+          "without doing anything, so the node would report success it never earned.",
+      );
+    }
+
+    // A ceiling that admits no time is an edge that reads as bounded and is
+    // not: the host kills the command before it can report, and every run
+    // fails on the timeout rather than on anything the command found.
+    if (options.timeoutMs !== undefined && !isPositiveMilliseconds(options.timeoutMs)) {
+      throw new Error(
+        `minflow: run("${at}") needs a positive whole number of milliseconds for timeoutMs, ` +
+          `got ${String(options.timeoutMs)}.`,
+      );
+    }
+
+    const params = options.params ?? {};
+    const [smuggled] = paramProblems(`run("${at}")`, params);
+    if (smuggled !== undefined) throw new Error(`minflow: ${smuggled}`);
+
+    for (const placeholder of parsePrompt(command)) {
+      if (placeholder.kind === "invalid") {
+        throw new Error(`minflow: ${unreadablePrompt(`run("${at}")`, placeholder)}`);
+      }
+      if (placeholder.kind === "params" && !Object.hasOwn(params, placeholder.key)) {
+        throw new Error(`minflow: ${unknownParam(`run("${at}")`, placeholder.text, params)}`);
+      }
+    }
+
+    const node: Node = { kind: "command", id: at, command };
+    if (options.params !== undefined) node.params = options.params;
+    if (options.timeoutMs !== undefined) node.timeoutMs = options.timeoutMs;
+    if (options.phase !== undefined) node.phase = options.phase;
 
     this.#nodes.set(at, node);
     return this;
@@ -819,6 +1003,38 @@ class Builder implements WorkflowBuilder {
     return this;
   }
 
+  ask(from: NodeId, to: NodeId, options: AskOptions): WorkflowBuilder {
+    const context = `ask("${from}", "${to}")`;
+    this.#requireNode(from, context);
+    if (isEnd(to)) {
+      throw new Error(
+        `minflow: ${context} asks on the transition into END. The answers are recorded as a ` +
+          "node's output for a later step to read, and there is no later step, so this asks " +
+          "the user questions nothing will ever use. Put the ask before the step that needs " +
+          "the answers.",
+      );
+    }
+    this.#requireTarget(to, context);
+    if (options === null || typeof options !== "object") {
+      throw new Error(
+        `minflow: ${context} needs a { questions }, either a list written here or ` +
+          'askFrom("path") to read them out of the step\'s own output.',
+      );
+    }
+
+    const as = options.as ?? `${from}-answers`;
+    if (this.#nodes.has(as)) {
+      throw new Error(
+        `minflow: ${context} would record its answers as "${as}", which is already a node in ` +
+          "this graph. Its output would be overwritten. Pass a different { as }.",
+      );
+    }
+
+    const questions = askQuestionsSpec(options.questions, context);
+    this.#emit(from, "pass", when.always(), to, { ask: { questions, as } });
+    return this;
+  }
+
   branch(from: NodeId, spec: JudgeSpec, routes: Routes): WorkflowBuilder {
     const context = `branch("${from}", ...)`;
     this.#requireNode(from, context);
@@ -858,7 +1074,7 @@ class Builder implements WorkflowBuilder {
     return this;
   }
 
-  compile(): WorkflowIr {
+  compile(): Graph {
     const entry = this.#entry;
     if (entry === undefined) {
       throw new Error(
@@ -883,7 +1099,8 @@ class Builder implements WorkflowBuilder {
   print(): string {
     const lines = [`workflow "${this.name}"`, `entry: ${this.#entry ?? "(unset)"}`];
     for (const node of this.#nodes.values()) {
-      lines.push("", `${node.id}  [${node.skill}]${describeNodeAttrs(node)}`);
+      const label = isCommandNode(node) ? `$ ${node.command}` : node.skill;
+      lines.push("", `${node.id}  [${label}]${describeNodeAttrs(node)}`);
       const outgoing = this.#edges.filter((edge) => edge.from === node.id);
       if (outgoing.length === 0) {
         lines.push("  (no outgoing edges)");
@@ -902,7 +1119,7 @@ class Builder implements WorkflowBuilder {
     event: string,
     guard: Guard,
     goto: NodeId | End,
-    extras: { otherwise?: Otherwise; limit?: number; gate?: string },
+    extras: { otherwise?: Otherwise; limit?: number; gate?: string; ask?: AskSpec },
   ): void {
     // The ordinal is per source node, so adding a step or an edge somewhere else
     // in the graph cannot renumber this one. Retry counters are keyed by edge id
@@ -910,10 +1127,11 @@ class Builder implements WorkflowBuilder {
     const ordinal = (this.#counts.get(from) ?? 0) + 1;
     this.#counts.set(from, ordinal);
 
-    const edge: IrEdge = { id: `${from}:${ordinal}`, from, event, guard, goto };
+    const edge: Edge = { id: `${from}:${ordinal}`, from, event, guard, goto };
     if (extras.otherwise !== undefined) edge.otherwise = extras.otherwise;
     if (extras.limit !== undefined) edge.limit = extras.limit;
     if (extras.gate !== undefined) edge.gate = extras.gate;
+    if (extras.ask !== undefined) edge.ask = extras.ask;
     this.#edges.push(edge);
   }
 
@@ -950,8 +1168,8 @@ class Builder implements WorkflowBuilder {
 /** The shape the graph lint needs: a compiled IR, or a draft that has no hash yet. */
 export interface LintableGraph {
   entry: NodeId;
-  nodes: IrNode[];
-  edges: IrEdge[];
+  nodes: Node[];
+  edges: Edge[];
 }
 
 /**
@@ -984,7 +1202,85 @@ export function lintGraph(graph: LintableGraph): string[] {
     ...deadEndProblems(graph.nodes, graph.edges, reachable),
     ...unguardedCycleProblems(graph.edges, reachable),
     ...promptProblems(graph),
+    ...commandNodeProblems(graph),
+    ...askProblems(graph),
   ];
+}
+
+/**
+ * A command node runs with no model in the loop, so nothing leaving it may ask
+ * one a question.
+ *
+ * The host executes a command node inside its own dispatch, between two of the
+ * runner's stops, and decides the transition out of it on the spot. A judge
+ * guard needs a round trip through a model to get its verdict, and there is no
+ * model to route the question to at that moment. Refused here rather than at run
+ * time, where it would present as a run that simply stops.
+ */
+function askProblems(graph: LintableGraph): string[] {
+  const problems: string[] = [];
+  const declared = new Set(graph.nodes.map((node) => node.id));
+  for (const edge of graph.edges) {
+    const ask = edge.ask;
+    if (ask === undefined) continue;
+    // The builder cannot author both, so this is here for an IR that came from
+    // somewhere else. They mean opposite things about what happens after the
+    // human acts, and there is no sensible order to apply them in.
+    if (edge.gate !== undefined) {
+      problems.push(
+        `the edge from "${edge.from}" to "${edge.goto}" both gates and asks. A gate ends the ` +
+          "run segment and waits for a typed command; an ask resumes on its own. Pick one.",
+      );
+    }
+    if (declared.has(ask.as)) {
+      problems.push(
+        `the edge from "${edge.from}" to "${edge.goto}" records its answers as "${ask.as}", ` +
+          "which is also a node in this graph, so the answers would overwrite that node's " +
+          "output. Give the ask its own id.",
+      );
+    }
+    if (isEnd(edge.goto)) {
+      problems.push(
+        `the edge from "${edge.from}" asks on the way to END. The answers are recorded for a ` +
+          "later step to read and there is no later step, so nothing can ever use them.",
+      );
+    }
+  }
+  return problems;
+}
+
+function commandNodeProblems(graph: LintableGraph): string[] {
+  const commandNodes = new Set(
+    graph.nodes.filter((node) => isCommandNode(node)).map((node) => node.id),
+  );
+  if (commandNodes.size === 0) return [];
+
+  const problems: string[] = [];
+  for (const edge of graph.edges) {
+    if (!commandNodes.has(edge.from)) continue;
+    const question = firstJudgeQuestion(edge.guard);
+    if (question === undefined) continue;
+    problems.push(
+      `the edge from "${edge.from}" to "${edge.goto}" guards on judge("${question}"), but ` +
+        `"${edge.from}" is a command node. A command node runs inside the host with no model ` +
+        "in the loop, so the verdict can never be obtained. Read the command's own result " +
+        'instead, with when.field("exitCode") or when.field("stdout"), or make it a step.',
+    );
+  }
+  return problems;
+}
+
+/** The first judge question anywhere in a guard tree, or undefined when there is none. */
+function firstJudgeQuestion(guard: Guard): string | undefined {
+  if (guard.kind === "judge") return guard.question;
+  if (guard.kind === "not") return firstJudgeQuestion(guard.guard);
+  if (guard.kind === "all" || guard.kind === "any") {
+    for (const inner of guard.guards) {
+      const found = firstJudgeQuestion(inner);
+      if (found !== undefined) return found;
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -994,7 +1290,7 @@ export function lintGraph(graph: LintableGraph): string[] {
  * here can catch a typo in it: every other check reads it as the seed of the
  * walk and reports the consequences instead.
  */
-function entryProblems(nodes: IrNode[], entry: NodeId): string[] {
+function entryProblems(nodes: Node[], entry: NodeId): string[] {
   if (nodes.some((node) => node.id === entry)) return [];
   const known = nodes.length === 0 ? "(none declared)" : nodes.map((node) => node.id).join(", ");
   return [
@@ -1004,8 +1300,8 @@ function entryProblems(nodes: IrNode[], entry: NodeId): string[] {
 }
 
 /** Edges indexed by the node they leave, for any walk that follows the graph forwards. */
-function outgoingByNode(edges: IrEdge[]): Map<NodeId, IrEdge[]> {
-  const outgoing = new Map<NodeId, IrEdge[]>();
+function outgoingByNode(edges: Edge[]): Map<NodeId, Edge[]> {
+  const outgoing = new Map<NodeId, Edge[]>();
   for (const edge of edges) {
     const list = outgoing.get(edge.from);
     if (list === undefined) outgoing.set(edge.from, [edge]);
@@ -1015,7 +1311,7 @@ function outgoingByNode(edges: IrEdge[]): Map<NodeId, IrEdge[]> {
 }
 
 /** Nodes the run can actually arrive at, following both `goto` and `otherwise`. */
-function reachableFrom(entry: NodeId, edges: IrEdge[]): Set<NodeId> {
+function reachableFrom(entry: NodeId, edges: Edge[]): Set<NodeId> {
   const outgoing = outgoingByNode(edges);
   const seen = new Set<NodeId>([entry]);
   const queue: NodeId[] = [entry];
@@ -1034,7 +1330,7 @@ function reachableFrom(entry: NodeId, edges: IrEdge[]): Set<NodeId> {
 }
 
 /** Every node an edge can land the run on. A retry stays put, so it adds none. */
-function edgeTargets(edge: IrEdge): (NodeId | End)[] {
+function edgeTargets(edge: Edge): (NodeId | End)[] {
   const targets: (NodeId | End)[] = [edge.goto];
   if (edge.otherwise !== undefined && edge.otherwise.kind === "goto") {
     targets.push(edge.otherwise.node);
@@ -1042,7 +1338,7 @@ function edgeTargets(edge: IrEdge): (NodeId | End)[] {
   return targets;
 }
 
-function unreachableProblems(nodes: IrNode[], reachable: Set<NodeId>, entry: NodeId): string[] {
+function unreachableProblems(nodes: Node[], reachable: Set<NodeId>, entry: NodeId): string[] {
   const stranded = nodes.filter((node) => !reachable.has(node.id)).map((node) => node.id);
   if (stranded.length === 0) return [];
   return [
@@ -1060,7 +1356,7 @@ function unreachableProblems(nodes: IrNode[], reachable: Set<NodeId>, entry: Nod
  * does *not* flag a node whose successors all fail to reach END; the provable
  * non-termination case is the unguarded-cycle check below.
  */
-function deadEndProblems(nodes: IrNode[], edges: IrEdge[], reachable: Set<NodeId>): string[] {
+function deadEndProblems(nodes: Node[], edges: Edge[], reachable: Set<NodeId>): string[] {
   const hasOutgoing = new Set(edges.map((edge) => edge.from));
   const stuck = nodes
     .filter((node) => reachable.has(node.id) && !hasOutgoing.has(node.id))
@@ -1110,7 +1406,7 @@ function isUnconditional(guard: Guard): boolean {
  * So an ungated unconditional edge is unbounded, full stop. There is no `limit`
  * term here because there is no shape in which one would be sound.
  */
-function isUnbounded(edge: IrEdge): boolean {
+function isUnbounded(edge: Edge): boolean {
   return edge.gate === undefined && isUnconditional(edge.guard);
 }
 
@@ -1127,7 +1423,7 @@ function isUnbounded(edge: IrEdge): boolean {
  * and edges are visited in declaration order, so the reported cycle is the same
  * on every run.
  */
-function unguardedCycleProblems(edges: IrEdge[], reachable: Set<NodeId>): string[] {
+function unguardedCycleProblems(edges: Edge[], reachable: Set<NodeId>): string[] {
   const outgoing = new Map<NodeId, NodeId[]>();
   const order: NodeId[] = [];
   for (const edge of edges) {
@@ -1205,9 +1501,12 @@ function promptProblems(graph: LintableGraph): string[] {
     // carrying a template is the one route by which a reference reaches a run
     // without appearing in `node.prompt` at all.
     problems.push(...paramProblems(subject, params));
-    const prompt = node.prompt;
-    if (prompt === undefined) continue;
-    for (const placeholder of parsePrompt(prompt)) {
+    // A command node interpolates its command exactly as a step interpolates its
+    // prompt, so both go through one check and a command node gets the same
+    // dominance guarantee rather than a weaker one.
+    const template = templateOf(node);
+    if (template === undefined) continue;
+    for (const placeholder of parsePrompt(template)) {
       if (placeholder.kind === "invalid") {
         problems.push(unreadablePrompt(subject, placeholder));
       } else if (placeholder.kind === "params") {
@@ -1228,7 +1527,7 @@ function promptProblems(graph: LintableGraph): string[] {
 /** Why a `ctx` reference cannot be honoured, or undefined when it can be. */
 function ctxProblem(
   graph: LintableGraph,
-  byId: Map<NodeId, IrNode>,
+  byId: Map<NodeId, Node>,
   reader: NodeId,
   placeholder: { node: NodeId; path: string; text: string },
 ): string | undefined {
@@ -1237,16 +1536,34 @@ function ctxProblem(
 
   if (producer === reader) {
     return (
-      `${subject} prompt reads ${placeholder.text}, which is its own output. A step's payload ` +
+      `${subject} reads ${placeholder.text}, which is its own output. A step's payload ` +
       "exists only once that step has finished, so a ctx reference has to name an earlier step."
     );
   }
+  const asked = asksById(graph).get(producer);
+  if (asked !== undefined) return askCtxProblem(graph, asked, reader, placeholder);
+
   const declared = byId.get(producer);
   if (declared === undefined) {
+    const asks = [...asksById(graph).keys()];
+    const alsoAsks = asks.length === 0 ? "" : `. Answers recorded by asks: ${asks.join(", ")}`;
     return (
-      `${subject} prompt reads ${placeholder.text}, but "${producer}" is not a node in this ` +
-      `graph. Declared nodes: ${[...byId.keys()].join(", ")}.`
+      `${subject} reads ${placeholder.text}, but "${producer}" is not a node in this ` +
+      `graph. Declared nodes: ${[...byId.keys()].join(", ")}${alsoAsks}.`
     );
+  }
+
+  // A command node's payload shape is fixed by the runtime rather than declared
+  // by the author, so the reference is checkable exactly and needs no schema.
+  if (isCommandNode(declared)) {
+    const [head] = placeholder.path.split(".");
+    if (head !== undefined && !COMMAND_OUTPUT_KEYS.includes(head)) {
+      return (
+        `${subject} template reads ${placeholder.text}, but "${producer}" is a command node, ` +
+        `whose output is exactly: ${COMMAND_OUTPUT_KEYS.join(", ")}.`
+      );
+    }
+    return undefined;
   }
 
   // Dominance answers whether the producer ran, which is a weaker thing than
@@ -1256,7 +1573,7 @@ function ctxProblem(
   // compiled clean.
   if (declared.schema === undefined) {
     return (
-      `${subject} prompt reads ${placeholder.text}, but "${producer}" declares no output. ` +
+      `${subject} reads ${placeholder.text}, but "${producer}" declares no output. ` +
       "Running is not producing: a step with no schema promises no payload, so nothing obliges " +
       "it to record one and the reference has nothing to read. Declare what " +
       `"${producer}" produces, with output or with schema.`
@@ -1271,7 +1588,7 @@ function ctxProblem(
   const [head] = placeholder.path.split(".");
   if (properties !== undefined && head !== undefined && !properties.includes(head)) {
     return (
-      `${subject} prompt reads ${placeholder.text}, but "${producer}" declares no "${head}" in ` +
+      `${subject} reads ${placeholder.text}, but "${producer}" declares no "${head}" in ` +
       `its output. It declares: ${properties.join(", ")}. A ctx reference reads a path out of ` +
       "the producer's payload, and only what its schema names is promised to be there."
     );
@@ -1280,7 +1597,7 @@ function ctxProblem(
   const detour = routeAvoiding(graph, reader, producer);
   if (detour === undefined) return undefined;
   return (
-    `${subject} prompt reads ${placeholder.text}, but "${producer}" does not run on every route ` +
+    `${subject} reads ${placeholder.text}, but "${producer}" does not run on every route ` +
     `to "${reader}": ${detour.join(" -> ")} reaches "${reader}" without passing through ` +
     `"${producer}", so on that route there is nothing to interpolate. Read the value from a step ` +
     `every route passes through, or make "${producer}" one of them.`
@@ -1351,6 +1668,89 @@ function routeAvoiding(graph: LintableGraph, target: NodeId, avoid: NodeId): Nod
         queue.push(next);
       }
     }
+  }
+  return undefined;
+}
+
+/**
+ * A route from entry to `target` that never traverses the edge `avoid`, or
+ * undefined when every route uses it.
+ *
+ * The edge-shaped twin of {@link routeAvoiding}, and it exists because an ask's
+ * answers are produced by an *edge* rather than by a node. Deleting the asking
+ * node would be too strong: other edges may leave it and reach the reader
+ * perfectly well without ever raising the ask.
+ */
+function routeAvoidingEdge(
+  graph: LintableGraph,
+  target: NodeId,
+  avoid: string,
+): NodeId[] | undefined {
+  const outgoing = outgoingByNode(graph.edges);
+  const cameFrom = new Map<NodeId, NodeId>();
+  const queue: NodeId[] = [graph.entry];
+  const seen = new Set<NodeId>(queue);
+  for (let head = 0; head < queue.length; head += 1) {
+    const node = queue[head];
+    if (node === undefined) break;
+    if (node === target) return routeTo(cameFrom, node);
+    for (const edge of outgoing.get(node) ?? []) {
+      if (edge.id === avoid) continue;
+      for (const next of edgeTargets(edge)) {
+        if (isEnd(next) || seen.has(next)) continue;
+        seen.add(next);
+        cameFrom.set(next, node);
+        queue.push(next);
+      }
+    }
+  }
+  return undefined;
+}
+
+/** Every ask in the graph, indexed by the id its answers are recorded under. */
+function asksById(graph: LintableGraph): Map<NodeId, Edge> {
+  const asks = new Map<NodeId, Edge>();
+  for (const edge of graph.edges) {
+    if (edge.ask !== undefined) asks.set(edge.ask.as, edge);
+  }
+  return asks;
+}
+
+/**
+ * Why a `ctx` reference into an ask's answers cannot be honoured.
+ *
+ * Two checks, mirroring the two a reference into a step gets. The answers exist
+ * only if the ask certainly happened, which is edge dominance rather than node
+ * dominance. And when the questions are written into the graph their headers are
+ * known, so a reference to a header nobody asked about is a compile error in
+ * exactly the way a reference to an undeclared schema property is.
+ */
+function askCtxProblem(
+  graph: LintableGraph,
+  edge: Edge,
+  reader: NodeId,
+  placeholder: { node: NodeId; path: string; text: string },
+): string | undefined {
+  const subject = `node "${reader}"`;
+  const detour = routeAvoidingEdge(graph, reader, edge.id);
+  if (detour !== undefined) {
+    return (
+      `${subject} reads ${placeholder.text}, but the ask that records "${placeholder.node}" ` +
+      `does not happen on every route to "${reader}". This route reaches it without asking: ` +
+      `${detour.join(" -> ")}. The answers would be missing there.`
+    );
+  }
+
+  const questions = edge.ask?.questions;
+  if (questions === undefined || questions.kind !== "static") return undefined;
+  const headers = questions.items.map((item) => item.header);
+  const [head] = placeholder.path.split(".");
+  if (head !== undefined && !headers.includes(head)) {
+    return (
+      `${subject} reads ${placeholder.text}, but that ask puts no question with the header ` +
+      `"${head}". It asks: ${headers.join(", ")}. Answers are recorded under each question's ` +
+      "header."
+    );
   }
   return undefined;
 }
@@ -1499,8 +1899,13 @@ function clone<T>(value: T): T {
 // print()
 // ---------------------------------------------------------------------------
 
-function describeNodeAttrs(node: IrNode): string {
+function describeNodeAttrs(node: Node): string {
   const parts: string[] = [];
+  if (isCommandNode(node)) {
+    if (node.phase !== undefined) parts.push(`phase=${node.phase}`);
+    if (node.timeoutMs !== undefined) parts.push(`timeoutMs=${node.timeoutMs}`);
+    return parts.length === 0 ? "" : `  ${parts.join(" ")}`;
+  }
   if (node.model !== undefined) parts.push(`model=${node.model}`);
   if (node.maxTurns !== undefined) parts.push(`maxTurns=${node.maxTurns}`);
   if (node.phase !== undefined) parts.push(`phase=${node.phase}`);
@@ -1509,7 +1914,7 @@ function describeNodeAttrs(node: IrNode): string {
   return parts.length === 0 ? "" : `  ${parts.join(" ")}`;
 }
 
-function describeEdgeAttrs(edge: IrEdge): string {
+function describeEdgeAttrs(edge: Edge): string {
   const parts: string[] = [];
   if (edge.otherwise !== undefined) {
     parts.push(
@@ -1566,4 +1971,15 @@ function describeFieldOp(op: FieldOp, value: JsonValue | undefined): string {
 function describeLane(from: PayloadSource | undefined): string {
   if (from === undefined) return "";
   return from.lane === "file" ? ` from file(${from.path})` : " from inline";
+}
+
+/**
+ * A timeout counts elapsed milliseconds, so it has to admit at least one.
+ *
+ * Zero, a negative, or a fraction below one produces a command the host kills
+ * before it can report anything, so every run fails on the ceiling rather than
+ * on what the command actually found.
+ */
+function isPositiveMilliseconds(value: number): boolean {
+  return Number.isInteger(value) && value >= 1;
 }

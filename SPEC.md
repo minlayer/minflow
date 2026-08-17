@@ -2,7 +2,7 @@
 
 minflow is a workflow compiler for coding agents. The input is a declarative workflow graph. The output is a plugin for a coding agent, which the user installs and runs with one command.
 
-This document specifies the system: the authoring surface, the intermediate representation, the guard model, the portability thesis and platform roadmap, the contract every backend satisfies, the Claude Code backend in full, and the known limitations. Platform behaviour recorded here was measured against Claude Code `2.1.229`; see the verification document for how each claim was established.
+This document specifies the system: the authoring surface, the intermediate representation, the guard model, the portability thesis and platform roadmap, the contract every backend satisfies, the Claude Code backend in full, and the known limitations. Platform behaviour recorded here was measured against Claude Code `2.1.229` and re-confirmed on `2.1.232`; see the verification document for how each claim was established.
 
 Three companion documents carry the rest:
 
@@ -103,6 +103,8 @@ The IR is the asset, so its contents are stated rather than implied. This is wha
 | `tools` | Optional tool allowlist for the step |
 | `phase` | Display grouping |
 
+A node may instead be a **command node**, carrying `kind: "command"` and a `command` template in place of `skill` and `prompt`, optionally with `timeoutMs`. The host runs it rather than spawning a model, and its payload is exactly `{ exitCode, stdout, stderr }` (§3.11).
+
 **Edge**
 | Field | Purpose |
 |---|---|
@@ -113,6 +115,7 @@ The IR is the asset, so its contents are stated rather than implied. This is wha
 | `otherwise` | `retry(reason)` or a different node |
 | `limit` | Loop ceiling for retry edges |
 | `gate` | Optional. Names the resume command for a human sign-off (§3.9). A gated edge ends a run segment rather than continuing |
+| `ask` | Optional. Questions to put to the user before continuing, plus the id their answers are recorded under. Unlike a gate, the run resumes by itself (§3.10). Mutually exclusive with `gate` |
 
 **Graph**
 | Field | Purpose |
@@ -134,6 +137,68 @@ Natural-language guards are a first-class escape hatch, quarantined in a single 
 Nothing else crosses the boundary. A verdict that is not a string, or one outside a declared verdict set, is a violated contract: it stops the run with an error rather than routing quietly down `otherwise`. Routing therefore switches on a value from a closed set, so control flow stays deterministic even though the value was produced by a model.
 
 ---
+
+### 1.6 Testing a workflow
+
+§1.2 claims a compiled graph is testable with no model in the loop. This is how, and it is a capability the compiler ships rather than something each author builds.
+
+**The generated suite is an artifact.** `minflow test` derives a suite of cases from the graph, writes it under `.minflow/`, and runs it, the way a test runner collects a suite before executing it. The written suite names every case, the decision it targets, and the exact inputs that force it, so nothing implicit decides what gets tested and a reader who wants to know opens the file. `--collect-only` stops after writing, for when you want to look first.
+
+#### 1.6.1 What is derivable, and why it is derivable here
+
+A compiled graph is a control-flow graph, so the standard structural coverage hierarchy applies: node coverage, then edge coverage, then edge-pair, then prime path, then full path coverage, which is infinite once a graph has a cycle.
+
+**Node coverage is already static.** `lintGraph` reports unreachable nodes, dead ends, and cycles that cannot terminate, at compile time and for free. Generated tests are therefore aimed at **edge coverage**, the criterion normally called branch coverage, which is the first one that requires execution.
+
+Automatic test generation over a control-flow graph normally hits a wall: deriving the paths is mechanical, deriving the inputs that force a path is not, because forcing a branch means solving an arbitrary predicate. That is why coverage tools report uncovered branches rather than generating inputs for them.
+
+**minflow does not hit that wall, because guards are data rather than code** (§1.5). Every guard kind is invertible by inspection:
+
+| Guard | Forced true by | Forced false by |
+|---|---|---|
+| `always` | nothing to force | not falsifiable, and no edge needs it to be |
+| `exitZero`, `fileExists` | the synthetic observation | its negation |
+| `field(p).equals(v)`, `notEquals` | setting `p` to `v` | any other JSON value |
+| `field(p).gt(n)`, `lt(n)` | `n + 1`, `n - 1` | the converse |
+| `field(p).truthy()` | any truthy JSON value | `false` |
+| `field(p).matches(re)` | a generated string matching `re` | any string that does not |
+| `judge(q).is(v)` | the verdict `v` | any other verdict in the declared set |
+| `all`, `any`, `not` | a finite boolean assignment over the leaves |
+
+The `matches` row is the only one needing more than arithmetic, and it is a solved problem with an existing library rather than something to write. Generation is seeded so two runs agree, and repetition is capped so a `\d+` does not become sixty digits.
+
+The consequence worth stating: **there is no guard kind minflow cannot force**, so an uncoverable edge means a graph problem rather than a generator limitation, and is reported as such.
+
+#### 1.6.2 The suite
+
+The suite is JSON, written to a scratch directory rather than into the source tree, on the precedent of `target/`, `.pytest_cache` and every other build cache.
+
+It carries the graph hash it was generated against, so a suite run against a changed graph is refused rather than silently testing something else; the seed, so generation is reproducible; and one entry per case. A case names the outcomes it covers, the walk it expects, and, per step, the observations and any answers that force the next transition.
+
+One case is generated per outcome not already covered on the way to another, which keeps cases short and independent. A single long tour would cover the same ground in fewer runs and be a worse test: the first failure would mask everything after it, and nobody could read it. A cycle is entered at most as many times as its retry ceiling allows, which bounds the walk without special-casing loops.
+
+#### 1.6.3 Execution
+
+Running the suite drives the **real emitted dispatcher**, not a simulation of it. Each case replays as hook payloads on stdin with the case's synthetic step outputs, and the run's own trace is then checked against the walk the suite predicted. The trace records `via`, the edge id, on every decision, so a completed run is literally a walk over the transition table and validating it is a graph check rather than string matching.
+
+Two things the harness cannot force, which is why one seam exists. It cannot make an arbitrary shell command exit as it likes, so observations are answered from a file named by `MINFLOW_TEST_OBSERVATIONS`, keyed by node because a fire that drains a command node resolves observations for two nodes at once. And an ask parks the run, so the harness plays the session's part: it relays the marker, writes the answers, and respawns the runner. That drives the real ask rather than putting the workflow into auto mode, which would test a path real users are not on.
+
+This is what makes execution worth its cost over the static lint: it exercises the artifact rather than the graph. Template resolution on a branch nobody took, a delivery obligation the wrong lane satisfies, an ask whose questions the step never produced, a command node whose interpolated path is wrong. Every one is well-formed in the graph and broken in the plugin.
+
+Generation is portable, since it reads only the IR. Execution is per backend, because driving a dispatcher is a backend's business. Claude Code is the only one today.
+
+#### 1.6.4 What it does not test
+
+The harness supplies judge verdicts, so it tests **routing on a verdict** and never **whether a model would return that verdict**. That is the same line every unit test draws around a mock, and it is deliberate: the alternative costs a model call per branch and stops being deterministic.
+
+It also does not test the work. A generated case proves the graph routed, not that any step did anything useful.
+
+#### 1.6.5 Tiers
+
+Two, on the convention every test runner uses for an expensive tier: `go test -short`, `cargo test -- --ignored`, `pytest -m slow`.
+
+- **Free.** No model, no network, deterministic, fast enough for every commit. Everything above.
+- **Live**, a separate thing rather than a bigger version of the above. A real run with a real model and no human, which requires the workflow's **auto mode** (§3.13) and turns it on itself: `--auto` is how a smoke run goes unattended, never something the operator types. It costs money, so it warns before it starts, and it runs in a temporary directory so a smoke test cannot leave counterfeit output where real output lives. `minflow test` never does any of this.
 
 ## §2 The portability thesis
 
@@ -182,6 +247,19 @@ A backend is a platform. One IR, one linter, one diagram generator, N emitters.
 Each backend is expected to need its own investigation of the kind §3 and the decision ledger record for Claude Code. That investigation *is* the work; the IR does not change.
 
 ---
+
+### 2.5 Compliance is the goal, not yet the constraint
+
+minflow would rather be Agent Skills and Agent Plugins compliant than not. Both specifications are young enough that complying strictly today would cost capability the design needs, so minflow keeps its own translation layer and negotiates incompatibilities as they surface (D26).
+
+Two concrete examples of what strict compliance would cost:
+
+- **`user-invocable` is not a standard Agent Skills field.** The standard requires `name` and `description`, and permits `license`, `compatibility`, `metadata` and an experimental `allowed-tools`. Its sibling `disable-model-invocation` is documented as a Claude Code extension, so this one very likely is too. Encapsulation is not niche: without it, every internal step of a compiled workflow is a separate public surface, which is the opposite of what a compiled workflow is (§3.12).
+- **Most component types are unstandardised.** Agent Plugins 1.0.0 permits exactly two, `skills/` and `mcp.json`. Every component that makes a workflow *run* is outside v1 on every client.
+
+**The test this position is held to.** The acceptable world is one where something is missing from minflow because it is out of spec *and genuinely niche*. The world we have is one where a fundamental encapsulation primitive is out of spec and most of the component surface is unstandardised. Until that inverts, compliance is a direction rather than a constraint.
+
+**What it does not license.** Emitting a violation where the schema is closed. The manifest is ten fields and the graph hash goes under `extensions`, because an unknown top-level key is a violation whether or not a client tolerates it (D21). The translation layer is for what the standard has not reached, never for what it has ruled on.
 
 ## §3 The Claude Code backend
 
@@ -362,13 +440,85 @@ Subagents cannot use `AskUserQuestion`, so there is no reliable mid-task approva
 
 Each segment is internally deterministic. Gates are where determinism is supposed to stop. A segmented run holds nothing but a JSON file and survives the user closing their laptop.
 
-### 3.10 Secondary output mode
+### 3.10 Interactive asks
+
+An approval gate ends a run segment and waits for a typed command (§3.9). An
+**ask** does not: it puts questions to the user and the run resumes on its own.
+
+The constraint that shapes it is measured, not assumed. A subagent has no
+`AskUserQuestion` tool and no channel to the terminal, confirmed by execution on
+`2.1.232` (`docs/VERIFICATION.md`, check E). The questions therefore have to
+leave the subagent and reach the main session, and the only channel to the
+session is the runner's final message.
+
+Three beats:
+
+1. The dispatcher writes `{ runId, workflow, questions, answersPath }` under
+   `$CLAUDE_PLUGIN_DATA/asks/`, records `status: "asking"` with the pending ask,
+   and **blocks** the runner with an instruction to reply with exactly
+   `MINFLOW-ASK <path>`.
+2. The runner says that and stops. The dispatcher marks the ask `relayed` and
+   renders **no decision**, which is what lets the runner actually stop and puts
+   the marker in front of the session.
+3. The session, following the protocol emitted into the run command's body,
+   reads the file, calls `AskUserQuestion` with the questions verbatim, writes
+   the answers to `answersPath`, and spawns the runner again to stand by. That
+   stop resumes the run.
+
+`relayed` is load-bearing: beats two and three end at the same event with the
+same state, so without it the second stop is indistinguishable from the first
+and the ask is raised forever.
+
+Answers are recorded in `outputs` under the ask's own id, defaulting to
+`<node>-answers`, so a later step reads them as `{{ctx.<as>.<header>}}`. Because
+an ask is an edge rather than a node, that reference is checked with **edge
+dominance**: delete the asking edge, walk from the entry, and any surviving route
+to the reader is a route where the answers would be missing.
+
+A missing answers file leaves the run parked and reports what to do. An
+unparseable one stops the run, because routing on answers nobody can read would
+hand the next step a blank where the user's decision belongs.
+
+### 3.11 Command nodes
+
+A node may run a shell command instead of a model. The dispatcher executes it
+between two of the runner's stops, records `{ exitCode, stdout, stderr }` as the
+node's payload, and evaluates the outgoing edges against that. A chain of them
+drains in a single hook fire, so a mechanical check costs no model call and no
+round trip.
+
+A non-zero exit is an answer, not a failure: `when.field("exitCode").equals(0)`
+is the ordinary guard and an `otherwise` takes the other branch. A command that
+could not be spawned or that outlived its `timeoutMs` produced no answer at all,
+and that is an error which stops the run.
+
+Two consequences of running inside a hook. Everything in a chain shares the
+hook's timeout budget (L2), so long work belongs in a step that shells out. And
+a judge guard on an edge leaving a command node is a **compile error**: the
+transition is decided with no model in the loop, so the verdict could never be
+obtained.
+
+### 3.12 Secondary output mode
 
 Claude Code also ships a native Workflow runtime, which can serve as an alternative output for this backend. It is opt-in behind an explicit flag, degrades several IR features, and refuses to compile graphs whose semantics it cannot preserve.
 
 It is not part of the v1 build. See [`docs/DYNAMIC-WORKFLOWS.md`](./docs/DYNAMIC-WORKFLOWS.md) for the rationale, the full authoring reference, and the conformance rules.
 
 ---
+
+### 3.13 Auto mode
+
+A compiled workflow runs unattended when started with `--auto` on its entry command. Every workflow gets this; it is not something an author builds.
+
+**What changes.** An ask (§3.10) is not relayed to the session. Instead the dispatcher blocks the runner with the questions and their options and takes the answers from its reply, which is the judge round trip of §3.3 step 8 carrying a JSON object rather than one word. No `AskUserQuestion` dialog is raised and nothing waits for a human.
+
+An answer naming an option that was never offered is replaced with the first option and the substitution is recorded. A smoke run that stalls on its own invented answer has defeated its purpose.
+
+**What does not change: a gate is a wall.** An ask exists because the workflow needs a fact it cannot derive, and inventing one is a reasonable thing to do unattended. A gate exists because a human has to look at something, and a mode that removes the human from the one mechanism whose entire purpose is human judgment would make gates meaningless. Auto mode reaching a gate ends the run there and says so. A workflow that cannot be smoke tested without passing a gate has told you the gate is in the wrong place.
+
+**Why an argument rather than an environment variable.** It appears in the command's `argument-hint` and in the session transcript, so a run that was auto is visible in its own scrollback. An environment variable is invisible in exactly the situation where you most need to know which answers were real.
+
+**It is loud on purpose.** Every synthesized answer goes into the trace with its question, and the run's final report leads with the fact that the answers were invented. An auto run produces real artifacts from fabricated inputs, and the only thing standing between that and a counterfeit is that it says so everywhere.
 
 ## §4 Remaining backends
 
@@ -438,8 +588,9 @@ Scope column: **CC** = Claude Code backend, **All** = every backend, **DW** = th
 | **L21** | Preloading a skill via the `skills:` field converts its body from on-invoke to always-on cost for that step, every invocation. | CC | Compiler surfaces the estimate; for large skills, prefer normal activation over preloading |
 | **L20** | Generated plugins ship enabled by default. `defaultEnabled: false` is available to ship one that installs disabled, requiring `claude plugin enable`. | CC | Consider defaulting compiled workflows to disabled, since D9's inertness argument extends to installation |
 | **L17** | Claude Code scans every subagent's final report and may prepend a `[harness: ...]` marker line or insert backslashes into instruction-shaped text. | CC | Guards reading `last_assistant_message` must tolerate a prepended marker line; prefer structured output or files |
-| **L18** | The `Workflow` tool is stripped from every subagent, alongside `AskUserQuestion` and `EnterPlanMode`. | CC | A step cannot launch a dynamic workflow. Affects any future composition of §3 with the Dynamic Workflows output mode |
+| **L18** | The `Workflow` tool is stripped from every subagent, alongside `AskUserQuestion` and `EnterPlanMode`. Measured for `AskUserQuestion` on `2.1.232`. | CC | A step cannot launch a dynamic workflow. It also cannot ask the user anything directly, which is what §3.10's three-beat relay exists to work around |
 | **L19** | Concurrent subagent limit of 20 per session; resumes take a fresh slot without checking it. | CC | Sequential runner stays well under. Relevant only if fan-out is added |
+| **L22** | Run state carries exactly one current node, so a graph is sequential: no fan-out, no join, no concurrent branches. Independent work that could run at once runs one node after another. | All | None today. Generalizing the IR to broader graph shapes, parallel branches and their joins, is a desirable next step: the transition table already expresses selection, iteration and termination, and concurrency is the one shape missing. It touches run state, the evaluator's single-node assumption, `lintGraph`'s reachability and termination proofs, and every backend's runner. L19's subagent cap becomes live the moment it lands |
 | **L13** | No cross-session resume; exiting mid-run starts fresh. | DW | None. See [`docs/DYNAMIC-WORKFLOWS.md`](./docs/DYNAMIC-WORKFLOWS.md) |
 | **L14** | No filesystem or shell access from a workflow script, so mechanical guards cost a model call each. | DW | Route guard agents to a cheap model |
 | **L15** | Workflow authoring API largely undocumented and already renamed once. | DW | Keep it a preview. There is no authoritative published surface to read instead (A.9) |

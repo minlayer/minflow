@@ -1,7 +1,9 @@
+import { readFileSync, writeFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { askFrom, END, judge, lintGraph, retry, when, workflow } from "../src/builder.js";
 
-import { END, judge, retry, when, workflow } from "../src/builder.js";
 import {
+  ASK_MARKER,
   agentNames,
   COMMANDS_DIR,
   COMPILED_GRAPH_PATH,
@@ -17,6 +19,7 @@ import {
 } from "../src/emit/claude-code.js";
 import { evaluate, observationsFor } from "../src/evaluate.js";
 import type {
+  Graph,
   JsonValue,
   NodeId,
   ObservationRequest,
@@ -24,8 +27,10 @@ import type {
   PayloadSource,
   RunState,
   Transition,
-  WorkflowIr,
 } from "../src/ir.js";
+import { toMermaid } from "../src/mermaid.js";
+import { Skill } from "../src/skill.js";
+import { checkSkills } from "../src/skills.js";
 
 /** The three node modules the I/O tests need. */
 async function nodeModules() {
@@ -50,7 +55,7 @@ const PLUGIN_ROOT = ["$", "{CLAUDE_PLUGIN_ROOT}"].join("");
  * is not a legal plugin name, a node id that is not a legal agent name, a guard
  * tree nested two deep over a file payload lane, a gate, a retry, and a judge.
  */
-function exampleIr(): WorkflowIr {
+function exampleIr(): Graph {
   const wf = workflow({ name: "Research & Ship!" });
 
   wf.step("research", {
@@ -84,7 +89,7 @@ function exampleIr(): WorkflowIr {
 }
 
 /** Two steps, one of each lane. Small enough to read as a golden file. */
-function tinyIr(): WorkflowIr {
+function tinyIr(): Graph {
   const wf = workflow({ name: "tiny-flow" });
   wf.step("draft", { skill: "write-draft", output: { done: "boolean" } });
   wf.step("check", { skill: "check-draft" });
@@ -95,7 +100,7 @@ function tinyIr(): WorkflowIr {
 }
 
 /** Three node ids that all fold badly: two collide, one vanishes entirely. */
-function collidingIr(): WorkflowIr {
+function collidingIr(): Graph {
   const wf = workflow({ name: "collisions" });
   wf.step("Review: Security", { skill: "a" });
   wf.step("review/security", { skill: "b" });
@@ -111,7 +116,7 @@ function collidingIr(): WorkflowIr {
  * One graph, built twice, with `params` and `schema` typed in opposite key
  * orders and the nested objects flipped too. Everything else is identical.
  */
-function keyOrderIr(order: "forward" | "reverse"): WorkflowIr {
+function keyOrderIr(order: "forward" | "reverse"): Graph {
   const forward = order === "forward";
   const alpha: JsonValue = forward
     ? { type: "number", description: "a" }
@@ -136,7 +141,7 @@ function keyOrderIr(order: "forward" | "reverse"): WorkflowIr {
 }
 
 /** A chain of steps, every transition gated with the command at that position. */
-function gatedIr(commands: string[]): WorkflowIr {
+function gatedIr(commands: string[]): Graph {
   const wf = workflow({ name: "gated" });
   wf.step("s0", { skill: "s" });
   for (let index = 0; index < commands.length; index += 1) {
@@ -159,7 +164,7 @@ function gatedIr(commands: string[]): WorkflowIr {
  * asymmetric: without it the list reads the same forwards and backwards, and an
  * assertion on "first-encountered order" would hold for any traversal at all.
  */
-function repeatedLaneIr(): WorkflowIr {
+function repeatedLaneIr(): Graph {
   const first: PayloadSource = { lane: "file", path: "out/first.json" };
   const second: PayloadSource = { lane: "file", path: "out/second.json" };
   const third: PayloadSource = { lane: "file", path: "out/third.json" };
@@ -188,7 +193,7 @@ function repeatedLaneIr(): WorkflowIr {
  * Three steps whose guards a test can decide from outside: a field on the step's
  * own payload, a shell predicate over a file, and a file-existence check.
  */
-function drivableIr(): WorkflowIr {
+function drivableIr(): Graph {
   const wf = workflow({ name: "drivable" });
   wf.step("draft", { skill: "s", output: { done: "boolean" } });
   wf.step("build", { skill: "s" });
@@ -211,7 +216,7 @@ function drivableIr(): WorkflowIr {
  * trip has to preserve the step's payload across the two hook fires it takes,
  * and losing it shows up as a run that stops instead of advancing.
  */
-function judgedIr(): WorkflowIr {
+function judgedIr(): Graph {
   const wf = workflow({ name: "judged" });
   wf.step("review", { skill: "s", output: { findings: "number" } });
   wf.step("fix", { skill: "s" });
@@ -229,7 +234,7 @@ function judgedIr(): WorkflowIr {
  * unless the host remembers what it already found out. `printf` appends a byte
  * per run, so the file is the count.
  */
-function tickAndJudgeIr(): WorkflowIr {
+function tickAndJudgeIr(): Graph {
   const wf = workflow({ name: "tick-and-judge" });
   wf.step("review", { skill: "s" });
   wf.step("fix", { skill: "s" });
@@ -250,7 +255,7 @@ function tickAndJudgeIr(): WorkflowIr {
  * This is the shape a per-command timeout cannot bound: each command is well
  * inside any sane per-command limit, and together they outlive the hook.
  */
-function slowGuardsIr(): WorkflowIr {
+function slowGuardsIr(): Graph {
   const wf = workflow({ name: "slow-guards" });
   wf.step("build", { skill: "s" });
   wf.step("ship", { skill: "s" });
@@ -270,7 +275,7 @@ function slowGuardsIr(): WorkflowIr {
  * only path where a verdict has to be folded onto a spelling recovered from the
  * graph rather than onto a declared one.
  */
-function openJudgeIr(): WorkflowIr {
+function openJudgeIr(): Graph {
   const wf = workflow({ name: "open-judge" });
   wf.step("draft", { skill: "s" });
   wf.step("build", { skill: "s" });
@@ -282,7 +287,7 @@ function openJudgeIr(): WorkflowIr {
 }
 
 /** A judged branch over a payload the judge reads from a file. */
-function judgedFileIr(): WorkflowIr {
+function judgedFileIr(): Graph {
   const wf = workflow({ name: "judged-file" });
   wf.step("review", { skill: "s" });
   wf.step("fix", { skill: "s" });
@@ -307,7 +312,7 @@ function judgedFileIr(): WorkflowIr {
  * request for any node declaring a schema, so both are asked for two lanes while
  * their guards name one, which is the disagreement a wrapper can be wrong about.
  */
-function schemaOverFileIr(): WorkflowIr {
+function schemaOverFileIr(): Graph {
   const wf = workflow({ name: "schema-over-file" });
   wf.step("scan", { skill: "s", output: { clean: "boolean" } });
   wf.step("review", { skill: "s", output: { findings: "number" } });
@@ -331,7 +336,7 @@ function schemaOverFileIr(): WorkflowIr {
  * research has run, and `research` is on every path to `plan`, so the reference
  * is one a compiled graph may legally carry.
  */
-function interpolatingIr(): WorkflowIr {
+function interpolatingIr(): Graph {
   const wf = workflow({ name: "interpolating" });
   wf.step("research", {
     skill: "research-topic",
@@ -357,7 +362,7 @@ function interpolatingIr(): WorkflowIr {
  * into the graph file from this one object, so the two still agree and a run
  * reaches the node under test rather than stopping on a hash mismatch.
  */
-function withPrompt(ir: WorkflowIr, nodeId: NodeId, prompt: string): WorkflowIr {
+function withPrompt(ir: Graph, nodeId: NodeId, prompt: string): Graph {
   return {
     ...ir,
     nodes: ir.nodes.map((node) => (node.id === nodeId ? { ...node, prompt } : node)),
@@ -374,11 +379,11 @@ function withPrompt(ir: WorkflowIr, nodeId: NodeId, prompt: string): WorkflowIr 
  * does not check, which is the case the emitter has to survive.
  */
 function withPromptAndParams(
-  ir: WorkflowIr,
+  ir: Graph,
   nodeId: NodeId,
   prompt: string,
   params: Record<string, JsonValue>,
-): WorkflowIr {
+): Graph {
   return {
     ...ir,
     nodes: ir.nodes.map((node) => (node.id === nodeId ? { ...node, prompt, params } : node)),
@@ -386,7 +391,7 @@ function withPromptAndParams(
 }
 
 /** A step whose payload is read from a file rather than from its final message. */
-function fileLaneIr(): WorkflowIr {
+function fileLaneIr(): Graph {
   const wf = workflow({ name: "file-lane" });
   wf.step("scan", { skill: "s" });
   wf.step("act", { skill: "s" });
@@ -399,7 +404,7 @@ function fileLaneIr(): WorkflowIr {
 }
 
 /** A chain of steps with the given ids, so agent-name derivation can be exercised. */
-function idIr(ids: string[]): WorkflowIr {
+function idIr(ids: string[]): Graph {
   const wf = workflow({ name: "ids" });
   for (const id of ids) wf.step(id, { skill: "s" });
   const first = ids[0];
@@ -514,12 +519,8 @@ function expectLegalPluginName(name: string): void {
 
 /** The half of the package's public seam the dispatcher actually calls. */
 interface VendoredRuntime {
-  observationsFor(ir: WorkflowIr, state: RunState): ObservationRequest[];
-  evaluate(
-    ir: WorkflowIr,
-    state: RunState,
-    resolved: Record<string, ObservationResult>,
-  ): Transition;
+  observationsFor(ir: Graph, state: RunState): ObservationRequest[];
+  evaluate(ir: Graph, state: RunState, resolved: Record<string, ObservationResult>): Transition;
 }
 
 /**
@@ -543,7 +544,7 @@ async function vendoredRuntime(): Promise<VendoredRuntime> {
 }
 
 /** A run sitting at `node`, otherwise fresh. */
-function stateAt(ir: WorkflowIr, node: string): RunState {
+function stateAt(ir: Graph, node: string): RunState {
   return {
     runId: "run-fixture",
     graphHash: ir.hash,
@@ -599,7 +600,7 @@ function resolvedFrom(
  * The payload lanes `observationsFor` will have the host resolve at a node, as
  * `inline` and `file:<path>` labels. Sorted, because order is another test's.
  */
-function demandedLanes(ir: WorkflowIr, node: NodeId): string[] {
+function demandedLanes(ir: Graph, node: NodeId): string[] {
   const lanes: string[] = [];
   for (const request of observationsFor(ir, stateAt(ir, node))) {
     if (request.kind !== "payload" && request.kind !== "judge") continue;
@@ -1362,7 +1363,7 @@ interface Harness {
    * then stands by and stops, and it is that stop, a `SubagentStop`, which gets
    * redirected into the first step. Returns the redirect.
    */
-  begin(session?: string): Fired;
+  begin(session?: string, args?: string): Fired;
 }
 
 /** A `SubagentStop` payload: the runner has stopped, and this is what it said. */
@@ -1403,7 +1404,7 @@ function reported(value: JsonValue, prefix = ""): string {
  * default would cost the suite three quarters of a minute per assertion.
  */
 async function withPlugin(
-  ir: WorkflowIr,
+  ir: Graph,
   body: (harness: Harness) => void,
   env: Record<string, string> = {},
 ): Promise<void> {
@@ -1449,9 +1450,9 @@ async function withPlugin(
           stderr: finished.stderr,
         };
       },
-      begin(session = "session-1") {
+      begin(session = "session-1", args = "") {
         const name = pluginNameFor(ir);
-        const started = harness.fire(typed(`${name}:run-${name}`, session));
+        const started = harness.fire(typed(`${name}:run-${name}`, session, args));
         // Seeding only. A decision here would cancel the command.
         expect(started.decision).toBeNull();
         return harness.fire(stopped("Standing by.", session));
@@ -1520,6 +1521,9 @@ describe("a run, driven through the emitted dispatcher", () => {
         status: "running",
         attempts: {},
         steps: 0,
+        // Read once from the command's arguments and carried for the life of the
+        // run, so a run cannot become unattended halfway through.
+        auto: false,
         outputs: {},
         // Marked as not started, so the runner's first stop hands over the entry
         // step instead of evaluating guards on a node that has not run.
@@ -2665,6 +2669,91 @@ describe("emit", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Assets
+// ---------------------------------------------------------------------------
+
+describe("shipped assets", () => {
+  it("lands them in the map beside the generated files", () => {
+    const files = emit(exampleIr(), {
+      assets: {
+        "scripts/check.cjs": "process.exit(0);\n",
+        "templates/note.md": "# {{TITLE}}\n",
+      },
+    });
+    expect(fileOf(files, "scripts/check.cjs")).toBe("process.exit(0);\n");
+    expect(fileOf(files, "templates/note.md")).toBe("# {{TITLE}}\n");
+    // The generated half is untouched by their presence.
+    expect(files[DISPATCHER_PATH]).toBe(emit(exampleIr())[DISPATCHER_PATH]);
+  });
+
+  it("stays deterministic and pure with assets present", () => {
+    const assets = { "a/one.txt": "1", "b/two.txt": "2" };
+    expect(emit(exampleIr(), { assets })).toEqual(emit(exampleIr(), { assets }));
+    const ir = deepFreeze(exampleIr());
+    expect(() => emit(ir, { assets })).not.toThrow();
+  });
+
+  it("refuses to overwrite a generated file", () => {
+    // The case that motivates the check: this one installs and validates, and
+    // then routes nothing, because the dispatcher is gone.
+    expect(() => emit(exampleIr(), { assets: { [DISPATCHER_PATH]: "// oops" } })).toThrow(
+      /collides with a file the compiler generates/,
+    );
+    expect(() => emit(exampleIr(), { assets: { [MANIFEST_PATH]: "{}" } })).toThrow(
+      /collides with a file the compiler generates/,
+    );
+  });
+
+  it("refuses a path that escapes the plugin root", () => {
+    expect(() => emit(exampleIr(), { assets: { "../outside.txt": "x" } })).toThrow(
+      /escapes the plugin root/,
+    );
+    expect(() => emit(exampleIr(), { assets: { "scripts/../../outside.txt": "x" } })).toThrow(
+      /escapes the plugin root/,
+    );
+  });
+
+  it("refuses an absolute path, on either platform's spelling", () => {
+    expect(() => emit(exampleIr(), { assets: { "/etc/passwd": "x" } })).toThrow(
+      /must be relative to the plugin root/,
+    );
+    expect(() => emit(exampleIr(), { assets: { "C:/windows/x.txt": "x" } })).toThrow(
+      /must be relative to the plugin root/,
+    );
+  });
+
+  it("refuses backslash separators and degenerate segments", () => {
+    expect(() => emit(exampleIr(), { assets: { "scripts\\check.cjs": "x" } })).toThrow(
+      /must use POSIX separators/,
+    );
+    expect(() => emit(exampleIr(), { assets: { "scripts//check.cjs": "x" } })).toThrow(
+      /empty or "\." path segment/,
+    );
+    expect(() => emit(exampleIr(), { assets: { "./check.cjs": "x" } })).toThrow(
+      /empty or "\." path segment/,
+    );
+    expect(() => emit(exampleIr(), { assets: { "   ": "x" } })).toThrow(
+      /asset path cannot be empty/,
+    );
+  });
+
+  it("writes them to disk through writeFiles like anything else", async () => {
+    const { fs, os, path } = await nodeModules();
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "minflow-assets-"));
+    try {
+      const files = emit(exampleIr(), { assets: { "scripts/check.cjs": "process.exit(0);\n" } });
+      const written = await writeFiles(files, dir);
+      expect(written).toContain(path.join(dir, "scripts/check.cjs"));
+      expect(await fs.readFile(path.join(dir, "scripts/check.cjs"), "utf8")).toBe(
+        "process.exit(0);\n",
+      );
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // writeFiles: the emitter's only I/O
 // ---------------------------------------------------------------------------
 
@@ -2961,5 +3050,613 @@ describe("a small compiled workflow", () => {
     // Namespaced: this is compared against the payload's command_name.
     expect(source).toContain(`"runCommand": "tiny-flow:run-tiny-flow"`);
     expect(source).toContain(`"agents": {\n    "draft": "step-draft",\n    "check": "step-check"`);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Command nodes
+// ---------------------------------------------------------------------------
+
+/** A step, then a command node that routes on its own exit code. */
+function commandIr(): Graph {
+  const wf = workflow({ name: "checked" });
+  wf.step("draft", { skill: "s", output: { path: "string" } });
+  wf.run("verify", { command: "test -f {{ctx.draft.path}}" });
+  wf.step("publish", { skill: "s" });
+  wf.step("fix", { skill: "s" });
+  wf.entry("draft");
+  wf.edge("draft", "verify", when.field("path").truthy());
+  wf.edge("verify", "publish", when.field("exitCode").equals(0), { otherwise: "fix" });
+  wf.edge("publish", END);
+  wf.edge("fix", END);
+  return wf.compile();
+}
+
+describe("a command node", () => {
+  it("gets no agent wrapper, because it is never spawned", () => {
+    const files = emit(commandIr());
+    const names = agentNames(commandIr());
+    expect(names.verify).toBeUndefined();
+    expect(
+      Object.keys(files)
+        .filter((path) => path.startsWith("agents/"))
+        .sort(),
+    ).toEqual([
+      "agents/runner.md",
+      "agents/step-draft.md",
+      "agents/step-fix.md",
+      "agents/step-publish.md",
+    ]);
+  });
+
+  it("runs inside the dispatcher and routes on its exit code, spawning nothing", async () => {
+    await withPlugin(commandIr(), (plugin) => {
+      plugin.begin();
+      plugin.write("note.md", "# done\n");
+
+      // One stop. The step reports, the command node runs here, and the run
+      // lands two nodes further on without a round trip in between.
+      const fired = plugin.fire(stopped(reported({ path: "note.md" })));
+      expect(fired.decision?.decision).toBe("block");
+      expect(fired.reason).toContain("checked:step-publish");
+      expect(fired.reason).not.toContain("checked:step-fix");
+
+      const ran = plugin.trace().filter((entry) => entry.decision === "command");
+      expect(ran).toHaveLength(1);
+      expect(ran[0]?.node).toBe("verify");
+      // The template resolved against the earlier step's payload.
+      expect(ran[0]?.command).toBe("test -f note.md");
+      expect(ran[0]?.exitCode).toBe(0);
+    });
+  });
+
+  it("takes the otherwise branch on a non-zero exit, which is an answer and not a failure", async () => {
+    await withPlugin(commandIr(), (plugin) => {
+      plugin.begin();
+      // note.md is deliberately absent, so `test -f` exits 1.
+      const fired = plugin.fire(stopped(reported({ path: "note.md" })));
+      expect(fired.decision?.decision).toBe("block");
+      expect(fired.reason).toContain("checked:step-fix");
+
+      const ran = plugin.trace().filter((entry) => entry.decision === "command");
+      expect(ran[0]?.exitCode).toBe(1);
+      // A non-zero exit routes; it does not stop the run.
+      expect(plugin.trace().some((entry) => entry.decision === "stopped")).toBe(false);
+    });
+  });
+
+  it("records the command's result as the node's output, for a later step to read", async () => {
+    await withPlugin(commandIr(), (plugin) => {
+      plugin.begin();
+      plugin.write("note.md", "# done\n");
+      plugin.fire(stopped(reported({ path: "note.md" })));
+      expect(plugin.onlyRun().outputs.verify).toEqual({
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+      });
+    });
+  });
+
+  it("stops the run when the command cannot be run at all", async () => {
+    const wf = workflow({ name: "broken" });
+    wf.run("nope", { command: "exec /definitely/not/a/binary" });
+    wf.step("after", { skill: "s" });
+    wf.entry("nope");
+    wf.edge("nope", "after", when.field("exitCode").equals(0));
+    wf.edge("after", END);
+
+    await withPlugin(wf.compile(), (plugin) => {
+      // A shell reports a missing binary as a non-zero exit rather than a spawn
+      // failure, so this routes rather than erroring, and the run stops because
+      // no edge matches: which is the honest outcome, and it is reported.
+      const fired = plugin.begin();
+      expect(fired.decision).toBeNull();
+      const stopped = plugin.trace().filter((entry) => entry.decision === "stopped");
+      expect(stopped).toHaveLength(1);
+      expect(String(stopped[0]?.code)).toBe("no-matching-edge");
+    });
+  });
+
+  it("draws as a subroutine box, so a reader sees which nodes cost no model call", () => {
+    const diagram = toMermaid(commandIr());
+    expect(diagram).toContain('verify[["verify ($ test -f {{ctx.draft.path}})"]]');
+    expect(diagram).toContain('draft["draft (s)"]');
+  });
+});
+
+describe("run(), the command-node authoring surface", () => {
+  it("refuses a missing or empty command", () => {
+    const wf = workflow({ name: "w" });
+    // @ts-expect-error deliberately wrong at the call site
+    expect(() => wf.run("a", {})).toThrow(/needs a \{ command \} naming what to execute/);
+    expect(() => wf.run("b", { command: "" })).toThrow(/needs a non-empty command/);
+    expect(() => wf.run("c", { command: "   " })).toThrow(/command of only whitespace/);
+  });
+
+  it("refuses a timeout that admits no time", () => {
+    const wf = workflow({ name: "w" });
+    expect(() => wf.run("a", { command: "true", timeoutMs: 0 })).toThrow(
+      /positive whole number of milliseconds/,
+    );
+    expect(() => wf.run("b", { command: "true", timeoutMs: -1 })).toThrow(
+      /positive whole number of milliseconds/,
+    );
+    expect(() => wf.run("c", { command: "true", timeoutMs: 1.5 })).toThrow(
+      /positive whole number of milliseconds/,
+    );
+  });
+
+  it("refuses an id already taken by a step", () => {
+    const wf = workflow({ name: "w" });
+    wf.step("a", { skill: "s" });
+    expect(() => wf.run("a", { command: "true" })).toThrow(/duplicate node id "a"/);
+  });
+
+  it("checks its command template exactly as a prompt is checked", () => {
+    const wf = workflow({ name: "w" });
+    expect(() => wf.run("a", { command: "echo {{params.missing}}" })).toThrow(
+      /names no param it declares/,
+    );
+  });
+
+  it("refuses a judge guard on an edge leaving it, since no model is in the loop", () => {
+    const wf = workflow({ name: "w" });
+    wf.run("check", { command: "true" });
+    wf.step("after", { skill: "s" });
+    wf.entry("check");
+    wf.edge("check", "after", judge("Did it work?").is("yes"));
+    expect(() => wf.compile()).toThrow(/is a command node.*verdict can never be obtained/s);
+  });
+
+  it("refuses a judge buried inside a composite guard too", () => {
+    const wf = workflow({ name: "w" });
+    wf.run("check", { command: "true" });
+    wf.step("after", { skill: "s" });
+    wf.entry("check");
+    wf.edge(
+      "check",
+      "after",
+      when.all(when.field("exitCode").equals(0), when.not(judge("Really?").is("no"))),
+    );
+    expect(() => wf.compile()).toThrow(/is a command node.*verdict can never be obtained/s);
+  });
+
+  it("checks a ctx reference into a command node against its fixed output shape", () => {
+    const wf = workflow({ name: "w" });
+    wf.run("check", { command: "true" });
+    wf.step("after", { skill: "s", prompt: "Exit was {{ctx.check.nonsense}}." });
+    wf.entry("check");
+    wf.edge("check", "after", when.field("exitCode").equals(0));
+    wf.edge("after", END);
+    expect(() => wf.compile()).toThrow(/whose output is exactly: exitCode, stdout, stderr/);
+  });
+
+  it("accepts a ctx reference to a key a command node really has", () => {
+    const wf = workflow({ name: "w" });
+    wf.run("check", { command: "true" });
+    wf.step("after", { skill: "s", prompt: "Exit was {{ctx.check.exitCode}}." });
+    wf.entry("check");
+    wf.edge("check", "after", when.field("exitCode").equals(0));
+    wf.edge("after", END);
+    expect(() => wf.compile()).not.toThrow();
+  });
+
+  it("names no skill, so skill validation passes it over rather than reporting one missing", () => {
+    const problems = checkSkills(commandIr(), [
+      {
+        directory: "s",
+        source: "skills/s/SKILL.md",
+        frontmatter: { name: "s", description: "d" },
+        bodyChars: 10,
+      },
+    ]);
+    expect(problems).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Ask gates
+// ---------------------------------------------------------------------------
+
+/** A step that computes its own questions, an ask, then a step that reads the answers. */
+function askIr(): Graph {
+  const wf = workflow({ name: "asker" });
+  wf.step("scan", { skill: "s", output: { questions: "string" } });
+  wf.step("write", { skill: "s", prompt: "Researcher is {{ctx.scan-answers.Researcher}}." });
+  wf.entry("scan");
+  wf.ask("scan", "write", { questions: askFrom("questions") });
+  wf.edge("write", END);
+  return wf.compile();
+}
+
+/** The shape a step emits when it wants a question put. */
+const SCAN_QUESTIONS = [
+  {
+    question: "Who is the researcher?",
+    header: "Researcher",
+    options: [{ label: "Ariel" }, { label: "Somebody else" }],
+  },
+];
+
+describe("an ask, driven through the emitted dispatcher", () => {
+  it("relays the questions out to the session, then resumes with nobody typing", async () => {
+    await withPlugin(askIr(), (plugin) => {
+      plugin.begin();
+
+      // Beat one: the step reports, and the runner is told to say one line.
+      const raised = plugin.fire(stopped(reported({ questions: SCAN_QUESTIONS })));
+      expect(raised.decision?.decision).toBe("block");
+      expect(raised.reason).toContain(ASK_MARKER);
+      const match = /MINFLOW-ASK (\S+)/.exec(raised.reason);
+      const questionsPath = match?.[1] ?? "";
+      expect(questionsPath).not.toBe("");
+
+      const parked = plugin.onlyRun();
+      expect(parked.status).toBe("asking");
+      // Parked at the destination, exactly as a gate parks, with the status
+      // being what says it has not arrived yet.
+      expect(parked.node).toBe("write");
+      expect(parked.ask?.relayed).toBe(false);
+
+      // The file the session reads is self-describing.
+      const asked = JSON.parse(readFileSync(questionsPath, "utf8")) as {
+        questions: unknown;
+        answersPath: string;
+      };
+      expect(asked.questions).toEqual(SCAN_QUESTIONS);
+      expect(asked.answersPath).toContain("-answers.json");
+
+      // Beat two: the runner says the marker and stops. No decision, which is
+      // what lets that message reach the session.
+      const relayed = plugin.fire(stopped(`${ASK_MARKER} ${questionsPath}`));
+      expect(relayed.decision).toBeNull();
+      expect(plugin.onlyRun().ask?.relayed).toBe(true);
+
+      // Beat three happens in the session: it asks, and writes the answers.
+      writeFileSync(asked.answersPath, JSON.stringify({ Researcher: "Ariel" }), "utf8");
+
+      // Beat four: the runner is spawned again and stops. The run continues.
+      const resumed = plugin.fire(stopped("Standing by."));
+      expect(resumed.decision?.decision).toBe("block");
+      expect(resumed.reason).toContain("asker:step-write");
+      // And the answers reached the next step's prompt.
+      expect(resumed.reason).toContain("Researcher is Ariel.");
+
+      const running = plugin.onlyRun();
+      expect(running.status).toBe("running");
+      expect(running.outputs["scan-answers"]).toEqual({ Researcher: "Ariel" });
+    });
+  });
+
+  it("says what to do rather than stalling when the answers were never written", async () => {
+    await withPlugin(askIr(), (plugin) => {
+      plugin.begin();
+      const raised = plugin.fire(stopped(reported({ questions: SCAN_QUESTIONS })));
+      const questionsPath = /MINFLOW-ASK (\S+)/.exec(raised.reason)?.[1] ?? "";
+      plugin.fire(stopped(`${ASK_MARKER} ${questionsPath}`));
+
+      // The runner comes back with no answers on disk.
+      const resumed = plugin.fire(stopped("Standing by."));
+      expect(resumed.decision).toBeNull();
+      expect(resumed.stderr).toContain("waiting on answers");
+      expect(resumed.stderr).toContain("-answers.json");
+      // The run is still recoverable rather than deleted.
+      expect(plugin.onlyRun().status).toBe("asking");
+    });
+  });
+
+  it("refuses to route on answers that are not usable", async () => {
+    await withPlugin(askIr(), (plugin) => {
+      plugin.begin();
+      const raised = plugin.fire(stopped(reported({ questions: SCAN_QUESTIONS })));
+      const questionsPath = /MINFLOW-ASK (\S+)/.exec(raised.reason)?.[1] ?? "";
+      const asked = JSON.parse(readFileSync(questionsPath, "utf8")) as { answersPath: string };
+      plugin.fire(stopped(`${ASK_MARKER} ${questionsPath}`));
+
+      writeFileSync(asked.answersPath, "not json at all", "utf8");
+      const resumed = plugin.fire(stopped("Standing by."));
+      expect(resumed.decision).toBeNull();
+      expect(resumed.stderr).toContain("not valid JSON");
+      expect(plugin.runs()).toHaveLength(0);
+    });
+  });
+
+  it("stops the run when the step produced no questions to ask", async () => {
+    await withPlugin(askIr(), (plugin) => {
+      plugin.begin();
+      const raised = plugin.fire(stopped(reported({ questions: [] })));
+      expect(raised.decision).toBeNull();
+      expect(raised.stderr).toContain("the list is empty");
+    });
+  });
+
+  it("stops the run on a question the user could not answer", async () => {
+    await withPlugin(askIr(), (plugin) => {
+      plugin.begin();
+      const raised = plugin.fire(
+        stopped(reported({ questions: [{ question: "Well?", header: "H", options: [] }] })),
+      );
+      expect(raised.decision).toBeNull();
+      expect(raised.stderr).toContain("offers no options");
+    });
+  });
+
+  it("ships the session-side protocol in the run command, and only when the graph asks", () => {
+    const asking = fileOf(emit(askIr()), `${COMMANDS_DIR}/run-asker.md`);
+    expect(asking).toContain(ASK_MARKER);
+    expect(asking).toContain("AskUserQuestion");
+    expect(asking).toContain("answersPath");
+    // The instruction to restart the runner is the step that makes it automatic.
+    expect(asking).toContain("asker:runner");
+
+    const plain = fileOf(emit(drivableIr()), `${COMMANDS_DIR}/run-drivable.md`);
+    expect(plain).not.toContain(ASK_MARKER);
+  });
+
+  it("uses one spelling of the marker in the dispatcher and the command body", () => {
+    const files = emit(askIr());
+    expect(fileOf(files, DISPATCHER_PATH)).toContain(`"${ASK_MARKER}"`);
+    expect(fileOf(files, `${COMMANDS_DIR}/run-asker.md`)).toContain(ASK_MARKER);
+  });
+
+  it("draws an ask as a thick arrow, since the run does not end there", () => {
+    const diagram = toMermaid(askIr());
+    expect(diagram).toContain("==>");
+    expect(diagram).toContain("scan-answers");
+  });
+});
+
+describe("ask(), the authoring surface", () => {
+  it("refuses to ask on the way to END, where nothing could read the answers", () => {
+    const wf = workflow({ name: "w" });
+    wf.step("a", { skill: "s" });
+    expect(() => wf.ask("a", END as unknown as string, { questions: askFrom("q") })).toThrow(
+      /asks on the transition into END/,
+    );
+  });
+
+  it("refuses to record answers over an existing node's output", () => {
+    const wf = workflow({ name: "w" });
+    wf.step("a", { skill: "s" });
+    wf.step("b", { skill: "s" });
+    expect(() => wf.ask("a", "b", { questions: askFrom("q"), as: "b" })).toThrow(
+      /already a node in this graph/,
+    );
+  });
+
+  it("refuses a question with nothing to pick from", () => {
+    const wf = workflow({ name: "w" });
+    wf.step("a", { skill: "s" });
+    wf.step("b", { skill: "s" });
+    expect(() =>
+      wf.ask("a", "b", { questions: [{ question: "Well?", header: "H", options: [] }] }),
+    ).toThrow(/offers no options/);
+  });
+
+  it("refuses an empty question list", () => {
+    const wf = workflow({ name: "w" });
+    wf.step("a", { skill: "s" });
+    wf.step("b", { skill: "s" });
+    expect(() => wf.ask("a", "b", { questions: [] })).toThrow(/needs at least one question/);
+  });
+
+  it("defaults the answers id to the asking node, and later steps can read it", () => {
+    const ir = askIr();
+    const edge = ir.edges.find((candidate) => candidate.ask !== undefined);
+    expect(edge?.ask?.as).toBe("scan-answers");
+    expect(lintGraph(ir)).toEqual([]);
+  });
+
+  it("refuses a ctx reference to an ask that does not dominate the reader", () => {
+    const wf = workflow({ name: "w" });
+    wf.step("a", { skill: "s", output: { q: "string" } });
+    wf.step("b", { skill: "s" });
+    wf.step("c", { skill: "s", prompt: "Answer was {{ctx.b-answers.H}}." });
+    wf.entry("a");
+    wf.edge("a", "b", when.field("q").truthy(), { otherwise: "c" });
+    wf.ask("b", "c", { questions: askFrom("q") });
+    wf.edge("c", END);
+    // Reaching c through the otherwise skips the ask entirely, so the answers
+    // would be missing on that route.
+    expect(() => wf.compile()).toThrow(/does not happen on every route/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Shipped skills
+// ---------------------------------------------------------------------------
+
+/** The skills `commandIr()` names, as an author would supply them. */
+function suppliedSkills(): Skill[] {
+  return [
+    Skill.from({
+      name: "s",
+      description: "Does the step's work.",
+      body: "# s\n\nInstructions.\n",
+      fields: { "allowed-tools": "Read, Edit" },
+      files: { "references/rules.md": "# Rules\n" },
+    }),
+  ];
+}
+
+describe("skills shipped inside the plugin", () => {
+  it("emits every skill a step names, and nothing else", () => {
+    const files = emit(commandIr(), { skills: suppliedSkills() });
+    expect(
+      Object.keys(files)
+        .filter((path) => path.startsWith("skills/"))
+        .sort(),
+    ).toEqual(["skills/s/SKILL.md", "skills/s/references/rules.md"]);
+  });
+
+  it("forces every emitted copy private, whatever the source said", () => {
+    // The reason this feature exists. A compiled workflow has one public
+    // surface, its entry command; a plugin exposing each internal step as an
+    // invocable skill has as many surfaces as it has steps.
+    const files = emit(commandIr(), { skills: suppliedSkills() });
+    expect(fileOf(files, "skills/s/SKILL.md")).toContain("user-invocable: false");
+  });
+
+  it("does not mutate the skills it was given", () => {
+    const skills = suppliedSkills();
+    emit(commandIr(), { skills });
+    expect(skills[0]?.userInvocable).toBe(true);
+    expect(skills[0]?.toMarkdown()).not.toContain("user-invocable");
+  });
+
+  it("carries bundled resources, since a skill is a directory", () => {
+    const files = emit(commandIr(), { skills: suppliedSkills() });
+    expect(fileOf(files, "skills/s/references/rules.md")).toBe("# Rules\n");
+  });
+
+  it("keeps passthrough frontmatter the compiler does not own", () => {
+    const files = emit(commandIr(), { skills: suppliedSkills() });
+    expect(fileOf(files, "skills/s/SKILL.md")).toContain("allowed-tools: Read, Edit");
+  });
+
+  it("refuses a partial set rather than shipping a half-resolved plugin", () => {
+    expect(() => emit(exampleIr(), { skills: suppliedSkills() })).toThrow(
+      /but not these, which steps name/,
+    );
+  });
+
+  it("refuses a skill that would load with its frontmatter silently dropped", () => {
+    const broken = [Skill.parse("no frontmatter here\n", "s")];
+    expect(() => emit(commandIr(), { skills: broken })).toThrow(/cannot be shipped/);
+  });
+
+  it("ships nothing when no skills are supplied, which is the older shape", () => {
+    const files = emit(commandIr());
+    expect(Object.keys(files).some((path) => path.startsWith("skills/"))).toBe(false);
+  });
+
+  it("names a command node's absent skill as no problem at all", () => {
+    // `commandIr()` has a command node, which names no skill. Supplying only the
+    // step skill has to be a complete set.
+    expect(() => emit(commandIr(), { skills: suppliedSkills() })).not.toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Auto mode
+// ---------------------------------------------------------------------------
+
+/** A graph that asks, then gates, so both auto behaviours are reachable. */
+function autoIr(): Graph {
+  const wf = workflow({ name: "unattended" });
+  wf.step("scan", { skill: "s", output: { ready: "boolean" } });
+  wf.step("write", { skill: "s" });
+  wf.step("ship", { skill: "s" });
+  wf.entry("scan");
+  wf.ask("scan", "write", {
+    questions: [
+      {
+        question: "Which lane?",
+        header: "Lane",
+        options: [{ label: "Fast" }, { label: "Thorough" }],
+      },
+      {
+        question: "Who is running this?",
+        header: "Owner",
+        options: [{ label: "Nobody" }, { label: "Somebody" }],
+      },
+    ],
+  });
+  wf.gate("write", "ship", { command: "approve" });
+  wf.edge("ship", END);
+  return wf.compile();
+}
+
+describe("a run started with --auto", () => {
+  it("answers its own questions without ever reaching the session", async () => {
+    await withPlugin(autoIr(), (plugin) => {
+      plugin.begin("session-1", "--auto");
+      expect(plugin.onlyRun().auto).toBe(true);
+
+      // The step reports, and the runner is asked for the answers directly.
+      // Nothing is written for a session to read, and no marker is emitted.
+      const asked = plugin.fire(stopped(reported({ ready: true })));
+      expect(asked.decision?.decision).toBe("block");
+      expect(asked.reason).not.toContain(ASK_MARKER);
+      expect(asked.reason).toContain("Which lane?");
+      expect(asked.reason).toContain("Thorough");
+      expect(asked.reason).toContain("--auto");
+
+      // It answers, and the run continues with no human anywhere.
+      const resumed = plugin.fire(stopped(reported({ Lane: "Thorough", Owner: "Nobody" })));
+      expect(resumed.decision?.decision).toBe("block");
+      expect(resumed.reason).toContain("unattended:step-write");
+      expect(plugin.onlyRun().outputs["scan-answers"]).toEqual({
+        Lane: "Thorough",
+        Owner: "Nobody",
+      });
+    });
+  });
+
+  it("corrects an answer nobody offered rather than stalling on it", async () => {
+    await withPlugin(autoIr(), (plugin) => {
+      plugin.begin("session-1", "--auto");
+      plugin.fire(stopped(reported({ ready: true })));
+
+      // "Medium" was never an option, and Owner is missing entirely.
+      const resumed = plugin.fire(stopped(reported({ Lane: "Medium" })));
+      expect(resumed.decision?.decision).toBe("block");
+      expect(plugin.onlyRun().outputs["scan-answers"]).toEqual({
+        Lane: "Fast",
+        Owner: "Nobody",
+      });
+
+      // And the correction is in the trace, because "it chose this" and "it was
+      // corrected to this" are different facts about the run.
+      const answered = plugin.trace().find((entry) => entry.decision === "ask-auto-answered");
+      expect(answered?.corrections).toEqual([
+        { header: "Lane", answered: "Medium", used: "Fast" },
+        { header: "Owner", answered: null, used: "Nobody" },
+      ]);
+    });
+  });
+
+  it("records an unparseable reply rather than pretending it answered", async () => {
+    await withPlugin(autoIr(), (plugin) => {
+      plugin.begin("session-1", "--auto");
+      plugin.fire(stopped(reported({ ready: true })));
+      plugin.fire(stopped("I have thought about it at length but produced no JSON."));
+
+      const answered = plugin.trace().find((entry) => entry.decision === "ask-auto-answered");
+      expect(answered?.unparseable).not.toBeNull();
+      // It still proceeds, on the first option of each question.
+      expect(plugin.onlyRun().outputs["scan-answers"]).toEqual({
+        Lane: "Fast",
+        Owner: "Nobody",
+      });
+    });
+  });
+
+  it("stops at a gate, because a gate is a wall", async () => {
+    await withPlugin(autoIr(), (plugin) => {
+      plugin.begin("session-1", "--auto");
+      plugin.fire(stopped(reported({ ready: true })));
+      plugin.fire(stopped(reported({ Lane: "Fast", Owner: "Nobody" })));
+
+      // `write` finishes and the next transition is the gate.
+      const gated = plugin.fire(stopped("wrote it"));
+      expect(gated.decision).toBeNull();
+      expect(gated.stderr).toContain('reached the "approve" gate and stopped');
+      expect(gated.stderr).toContain("--auto");
+      // The run is over rather than parked: nothing is coming to release it.
+      expect(plugin.runs()).toHaveLength(0);
+      expect(plugin.trace().some((entry) => entry.decision === "gate-blocked-auto")).toBe(true);
+    });
+  });
+
+  it("leaves an ordinary run entirely alone", async () => {
+    await withPlugin(autoIr(), (plugin) => {
+      plugin.begin();
+      expect(plugin.onlyRun().auto).toBe(false);
+      const asked = plugin.fire(stopped(reported({ ready: true })));
+      // The marker path, unchanged.
+      expect(asked.reason).toContain(ASK_MARKER);
+    });
   });
 });

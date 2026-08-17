@@ -57,6 +57,8 @@
 // and some of them describe shapes the builder refuses to author at all.
 
 export type {
+  AskFromOutput,
+  AskOptions,
   EdgeOptions,
   EdgeOtherwise,
   FieldGuard,
@@ -68,10 +70,11 @@ export type {
   OutputType,
   RetrySpec,
   Routes,
+  RunOptions,
   StepOptions,
   WorkflowBuilder,
 } from "./builder.js";
-export { END, judge, lintGraph, retry, when, workflow } from "./builder.js";
+export { askFrom, END, judge, lintGraph, retry, when, workflow } from "./builder.js";
 
 // --- Backends --------------------------------------------------------------
 //
@@ -126,6 +129,8 @@ export { toMermaid } from "./mermaid.js";
 // filesystem. preloadCost is reported separately because an expensive skill is
 // information a caller may act on, not a fault.
 
+export type { SkillData, SkillProblem } from "./skill.js";
+export { MAX_DESCRIPTION_LENGTH, MAX_NAME_LENGTH, Skill } from "./skill.js";
 export type { DiscoveredSkill, SkillCost, SkillReferencingGraph } from "./skills.js";
 export { checkSkills, discoverSkills, parseSkill, preloadCost, SKILL_FILE } from "./skills.js";
 
@@ -137,22 +142,26 @@ export { checkSkills, discoverSkills, parseSkill, preloadCost, SKILL_FILE } from
 // that caused it rather than as a key lookup against a blob.
 
 export type {
+  CommandNode,
+  Edge,
   End,
   FieldOp,
+  Graph,
   Guard,
-  IrEdge,
-  IrNode,
   JsonValue,
+  Node,
   NodeId,
   ObservationRequest,
   ObservationResult,
   Otherwise,
   PayloadSource,
+  PendingAsk,
   RunState,
+  StepNode,
   Transition,
   TransitionErrorCode,
-  WorkflowIr,
 } from "./ir.js";
+export { isCommandNode } from "./ir.js";
 
 /** The current package version. */
-export const VERSION = "0.0.1";
+export const VERSION = "0.1.0";

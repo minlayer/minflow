@@ -52,13 +52,26 @@ export function isEnd(target: NodeId | End): target is End {
 // Nodes
 // ---------------------------------------------------------------------------
 
+/** What every node carries, whatever kind it is. */
+interface NodeBase {
+  /** Node name, used as the state value. */
+  id: NodeId;
+  /** Display grouping. */
+  phase?: string;
+}
+
 /**
  * One step of the graph. `skill` names a skill the user already wrote; nothing
  * here is injected into their file, and the compiler only ever reads it.
+ *
+ * The discriminant is optional on this variant and required on
+ * {@link CommandNode}, which still narrows a union correctly and means a graph
+ * written before command nodes existed is unchanged rather than needing a field
+ * that says "the usual kind".
  */
-export interface IrNode {
-  /** Node name, used as the state value. */
-  id: NodeId;
+export interface StepNode extends NodeBase {
+  /** Discriminant. Absent means a step, which is what most nodes are. */
+  kind?: "step";
   /** The user's skill this node invokes. */
   skill: string;
   /**
@@ -66,7 +79,7 @@ export interface IrNode {
    *
    * Two placeholder forms, and the difference is when each is resolved:
    *
-   * - `{{params.key}}` names one of this node's own {@link IrNode.params}. It is
+   * - `{{params.key}}` names one of this node's own {@link Node.params}. It is
    *   fixed when the graph compiles, so a backend substitutes it at emit time.
    * - `{{ctx.node.dot.path}}` reads a path out of an earlier step's payload,
    *   which only exists once that step has run, so a host substitutes it from
@@ -90,8 +103,71 @@ export interface IrNode {
   maxTurns?: number;
   /** Tool allowlist for the step. */
   tools?: string[];
-  /** Display grouping. */
-  phase?: string;
+}
+
+/**
+ * A node that runs a shell command instead of a model.
+ *
+ * Mechanical work in a workflow was previously expressible only as a guard, so
+ * anything that had to *happen* rather than be *decided* had to masquerade as a
+ * predicate and do its work as a side effect. That reads as a lie in the graph
+ * and hides real steps from the diagram and the trace.
+ *
+ * The host runs it, records `{ exitCode, stdout, stderr }` as the node's output,
+ * and evaluates the outgoing edges against that. Guards read it like any other
+ * payload, so `when.field("exitCode").equals(0)` is the ordinary spelling.
+ *
+ * **It costs no model call and no runner round trip**, which is the point: on
+ * Claude Code the host runs it inside the dispatcher, between two hook fires.
+ * That is also its limit, since a hook has a timeout and a command node that
+ * outlives it strands the run. Long work belongs in a step that shells out.
+ */
+export interface CommandNode extends NodeBase {
+  /** Discriminant. Required, so the union narrows on it. */
+  kind: "command";
+  /**
+   * The command, as a template over the run context.
+   *
+   * Takes the same two placeholder forms as {@link StepNode.prompt}, resolved
+   * the same way and subject to the same dominance rule.
+   */
+  command: string;
+  /** Scalars this node's own command may interpolate as `{{params.key}}`. */
+  params?: Record<string, JsonValue>;
+  /**
+   * Ceiling in milliseconds. The host kills the command past it and treats the
+   * node as having failed its contract, which is an error rather than a
+   * non-zero exit: a command that never finished did not report anything.
+   */
+  timeoutMs?: number;
+}
+
+/** One node of the graph. */
+export type Node = StepNode | CommandNode;
+
+/** Narrowing helper, so callers do not compare against the discriminant by hand. */
+export function isCommandNode(node: Node): node is CommandNode {
+  return node.kind === "command";
+}
+
+/**
+ * Exactly what a command node's payload holds.
+ *
+ * Fixed by the runtime rather than declared by the author, which is what lets a
+ * `{{ctx.check.exitCode}}` reference be checked precisely at compile time while
+ * the same reference into a step can only be checked against a declared schema.
+ */
+export const COMMAND_OUTPUT_KEYS: readonly string[] = ["exitCode", "stdout", "stderr"];
+
+/**
+ * The template a node interpolates: a step's prompt, a command node's command.
+ *
+ * One accessor so that every check over interpolation, the placeholder grammar,
+ * unknown params, and dominance, applies to both kinds without being written
+ * twice and drifting.
+ */
+export function templateOf(node: Node): string | undefined {
+  return isCommandNode(node) ? node.command : node.prompt;
 }
 
 // ---------------------------------------------------------------------------
@@ -176,10 +252,67 @@ export type Otherwise =
   | { kind: "goto"; node: NodeId | End };
 
 /**
+ * One question put to the user as a run passes through an ask.
+ *
+ * Shaped after the host's own question tool rather than after something neutral,
+ * because every field here has to survive to a real dialog and inventing a
+ * middle format would only mean translating twice.
+ */
+export interface AskQuestion {
+  /** The question itself, as the user reads it. */
+  question: string;
+  /** Short label for the question, for a host that groups or tags them. */
+  header: string;
+  /** The choices offered. A host may also accept free text. */
+  options: { label: string; description?: string }[];
+  /** Whether more than one option may be chosen. */
+  multiSelect?: boolean;
+}
+
+/**
+ * Where an ask's questions come from.
+ *
+ * `static` fixes them at compile time. `output` reads them out of the payload of
+ * the step the ask leaves, which is what lets a step compute its own questions:
+ * propose the next number it found on disk, offer the branches it discovered,
+ * ask only about what it could not resolve.
+ */
+export type AskQuestions =
+  | { kind: "static"; items: AskQuestion[] }
+  | { kind: "output"; path: string };
+
+/**
+ * A transition that stops to ask the user something and then carries on by
+ * itself.
+ *
+ * Distinct from {@link Edge.gate}, and the difference is the whole point. A
+ * gate ends the run segment and waits for a human to type a resume command. An
+ * ask hands the questions back to whatever *can* reach the user, takes the
+ * answers, and resumes with nobody typing anything.
+ *
+ * On Claude Code that difference is forced by the platform: a subagent has no
+ * `AskUserQuestion` tool and no channel to the terminal, measured on 2.1.232,
+ * so the questions have to travel out to the main session and the answers back.
+ */
+export interface AskSpec {
+  /** The questions, fixed or computed. */
+  questions: AskQuestions;
+  /**
+   * The id the answers are recorded under in {@link RunState.outputs}, so a
+   * later node reads them as `{{ctx.<as>.<key>}}` like any other output.
+   *
+   * Its own id rather than the asking node's: a step's payload and the answers
+   * to questions it raised are two different things, and overwriting one with
+   * the other would lose whichever the next node did not want.
+   */
+  as: NodeId;
+}
+
+/**
  * One row of the Mealy transition table. The key is (`from`, `event`); the
  * output is the destination plus whatever the host is told to do about it.
  */
-export interface IrEdge {
+export interface Edge {
   /**
    * Stable identity, assigned at compile time. Retry counters are keyed by it,
    * so it has to survive recompilation of an unchanged graph.
@@ -203,6 +336,14 @@ export interface IrEdge {
    * segment rather than continuing into `goto`.
    */
   gate?: string;
+  /**
+   * Questions to put to the user before continuing into `goto`.
+   *
+   * Unlike `gate`, the run resumes on its own once they are answered. Mutually
+   * exclusive with `gate`: one edge cannot both wait for a typed command and
+   * carry on by itself.
+   */
+  ask?: AskSpec;
 }
 
 // ---------------------------------------------------------------------------
@@ -216,13 +357,13 @@ export interface IrEdge {
  * semantically load-bearing: when several edges out of a node could fire, the
  * first one wins, and that has to be stable across a JSON round trip.
  */
-export interface WorkflowIr {
+export interface Graph {
   /** Bumped only on a breaking change to these types. */
   irVersion: 1;
   name: string;
   entry: NodeId;
-  nodes: IrNode[];
-  edges: IrEdge[];
+  nodes: Node[];
+  edges: Edge[];
   /**
    * Hash over the canonical form of everything above. Stamped into run state so
    * a graph edited mid-run is detected rather than silently resumed against
@@ -252,11 +393,23 @@ export interface RunState {
   node: NodeId;
   /**
    * `running` advances normally. `awaiting` is parked at a gate and must survive
-   * garbage collection until it is resumed or explicitly expired.
+   * garbage collection until it is resumed or explicitly expired. `asking` is
+   * mid-ask: the questions are out with whatever can reach the user, and the run
+   * resumes by itself when the answers come back, with nothing typed.
    */
-  status: "running" | "awaiting";
+  status: "running" | "awaiting" | "asking";
   /** The gate being awaited, when status is `awaiting`. */
   gate?: string;
+  /** The ask in flight, when status is `asking`. */
+  ask?: PendingAsk;
+  /**
+   * Whether this run answers its own questions instead of putting them to a user.
+   *
+   * Set once at the start and carried for the life of the run, so a run cannot
+   * become unattended halfway through, and so every later decision can see that
+   * the answers behind it were invented.
+   */
+  auto?: boolean;
   /** Retry counts, keyed by edge id. */
   attempts: Record<string, number>;
   /** Total steps taken, against the run-wide ceiling. */
@@ -307,6 +460,36 @@ export type ObservationRequest =
  */
 export type ObservationResult = { ok: true; value: JsonValue } | { ok: false; error: string };
 
+/**
+ * An ask that has been raised and not yet answered.
+ *
+ * `relayed` is the beat counter, and it exists because getting questions from a
+ * subagent to the user takes two stops rather than one: the host first has to
+ * make the runner say a thing, and only then may it let the runner stop so that
+ * thing reaches whatever can ask. Without it the second stop looks exactly like
+ * the first and the ask is raised forever.
+ */
+export interface PendingAsk {
+  /** The edge that raised it, so a resume knows where it was going. */
+  edge: string;
+  /** Where the run continues once the answers are in. */
+  to: NodeId | End;
+  /** The id the answers are recorded under. */
+  as: NodeId;
+  /** The questions, already resolved to values. */
+  questions: AskQuestion[];
+  /** Whether the questions have been handed off to whatever can ask them. */
+  relayed: boolean;
+  /**
+   * Whether the answers come from the runner rather than from a user.
+   *
+   * Recorded on the ask rather than read from the run, because it decides where
+   * the *answers* are looked for, and looking in the wrong place is the one way
+   * this can hang.
+   */
+  auto?: boolean;
+}
+
 // ---------------------------------------------------------------------------
 // Transitions
 // ---------------------------------------------------------------------------
@@ -340,6 +523,18 @@ export type Transition =
   | { kind: "retry"; node: NodeId; via: string; reason: string; attempt: number; state: RunState }
   /** Park for human sign-off. The run segment ends here. */
   | { kind: "gate"; gate: string; to: NodeId | End; via: string; state: RunState }
+  /**
+   * Put questions to the user and resume automatically once they are answered.
+   * The host is responsible for the delivery; the run is not over.
+   */
+  | {
+      kind: "ask";
+      questions: AskQuestion[];
+      as: NodeId;
+      to: NodeId | End;
+      via: string;
+      state: RunState;
+    }
   /** Terminal. */
   | { kind: "end"; via: string; state: RunState }
   /** Stop and report. */

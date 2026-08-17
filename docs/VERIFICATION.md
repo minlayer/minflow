@@ -21,13 +21,14 @@ Conventions: **§ references** are sections of [`../SPEC.md`](../SPEC.md); **D-n
 ## Baseline
 
 ```
-claude --version   2.1.229 (Claude Code)
+claude --version   2.1.229 (Claude Code), re-confirmed on 2.1.232
 platform           macOS 24.5.0
 node               26.3.0
-dates              12 August 2026 (nesting spike), 13 August 2026 (entrypoint probe)
+dates              12 August 2026 (nesting spike), 13 August 2026 (entrypoint probe),
+                   14 August 2026 (spike re-run on 2.1.232, main-session actuation)
 ```
 
-All six spike checks pass with `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH` **unset**, on the v2.1.219+ default of three layers below main, so the flat runner's depth of 2 has one layer of headroom.
+All six spike checks pass with `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH` **unset**, on the v2.1.219+ default of three layers below main, so the flat runner's depth of 2 has one layer of headroom. The full set was re-run unchanged on 2.1.232 and still passes six of six.
 
 The version is part of the claim. L1 records that the subagent spawn depth default changed three times across patch releases, five layers on v2.1.172 through v2.1.216, one on v2.1.217 and v2.1.218, three from v2.1.219, so "it worked" means nothing without a version attached.
 
@@ -62,6 +63,28 @@ Four load-bearing assumptions, asserted as six individual checks:
 - The data path cannot be hard-coded to `~/.claude`: the config directory is `$CLAUDE_CONFIG_DIR` when set (§3.4).
 - `{name}` versus `{name}-inline` plugin id: a `--plugin-dir` load gets the `-inline` suffix, so `$CLAUDE_PLUGIN_DATA` must be read from the hook environment rather than reconstructed (§3.4).
 - `--debug` swallows the trailing positional prompt, because it takes an optional filter argument (D18).
+
+## The main-session actuation probe
+
+The spike proved that a hook can steer a subagent. It did not prove that a hook can steer the **main session**, which is the only context that can reach the user, since §3.9's approval gates otherwise require the user to type a resume command.
+
+| | Assumption | Relates to |
+|---|---|---|
+| **E** | `AskUserQuestion` is genuinely absent from a subagent, not merely undocumented there | §3.9, L18 |
+| **F** | A `{"decision":"block","reason":...}` on the main session's `Stop` event instructs the main agent rather than merely halting it | §3.9 |
+| **G** | `AskUserQuestion` is reachable when a hook is what asked for it | §3.9 |
+
+**How it ran.** A plugin registering one `Stop` hook, loaded with `--plugin-dir` into an **interactive** session. Headless `-p` cannot answer any of these, because it disables `AskUserQuestion` globally and so returns a false negative for E, F and G alike. The hook blocked once per session, guarded by both the payload's `stop_hook_active` flag and a marker file, then stood down. E was measured separately by spawning a subagent from that same interactive session and capturing its verbatim error.
+
+**Result: measured 14 August 2026 on `2.1.232`.**
+
+- **E holds, and is now measured rather than documentation-read.** A subagent attempting the call receives `Error: No such tool available: AskUserQuestion. AskUserQuestion is not available inside subagents.` The strip is structural: subagents run in the background with no channel to the terminal, so no `tools` allowlist restores it.
+- **F holds.** The main agent consumed the reason, performed the instructed work, and emitted the exact output format the reason dictated.
+- **G holds.** The question dialog was raised with nothing typed by the user.
+
+**`Stop` remains unusable under D9, and the probe is why.** In a 53 second session, four `Stop` fires were logged and only two belonged to the probe; the other two landed on unrelated turns. `Stop` has no matcher, so a plugin registering one runs a process at the end of every main-agent turn for the life of the install. The zero-idle-footprint rule forbids it, and this measurement makes the cost concrete rather than theoretical.
+
+**`stop_hook_active` is a per-turn guard, not a per-session one.** It read true only on the turn immediately following the block and reset to false on the next user turn. A hook that must fire at most once per session needs its own marker.
 
 ## The entrypoint probe
 
@@ -101,7 +124,7 @@ The version-sensitive claims, and what confirming each one requires:
 - `last_assistant_message` is the correct source for final assistant text
 - Skills have no programmatic registration API
 - Subagent frontmatter fields including `skills` (preloads full skill content), `model`, `maxTurns`, `tools`, `disallowedTools`, `isolation`, `background`, `effort`
-- `AskUserQuestion`, `EnterPlanMode`, `Workflow`, `EndConversation`, `ScheduleWakeup`, `TaskOutput`, `WaitForMcpServers` are stripped from every subagent
+- `AskUserQuestion`, `EnterPlanMode`, `Workflow`, `EndConversation`, `ScheduleWakeup`, `TaskOutput`, `WaitForMcpServers` are stripped from every subagent. The `AskUserQuestion` half of this has since been measured, check E above, and is no longer documentation-read
 - Plugin subagents ignore `hooks`, `mcpServers`, and `permissionMode`
 - Subagent `name` cannot contain `:`; plugin subfolders become part of the scoped identifier
 - `SubagentStop` matcher is the frontmatter `name`, or the plugin-scoped identifier, evaluated unanchored, so anchor with `^...$`

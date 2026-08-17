@@ -4,16 +4,18 @@ import { END, judge, lintGraph, parsePrompt, retry, when, workflow } from "../sr
 import { evaluate, observationsFor } from "../src/evaluate.js";
 import { canonicalize, graphHash } from "../src/hash.js";
 import type {
+  Edge,
+  Graph,
   Guard,
-  IrEdge,
-  IrNode,
   JsonValue,
+  Node,
   ObservationRequest,
   ObservationResult,
   RunState,
+  StepNode,
   Transition,
-  WorkflowIr,
 } from "../src/ir.js";
+import { isCommandNode } from "../src/ir.js";
 
 // ---------------------------------------------------------------------------
 // Fixtures and helpers
@@ -47,7 +49,7 @@ function exampleWorkflow() {
   return wf;
 }
 
-function edgeById(ir: WorkflowIr, id: string): IrEdge {
+function edgeById(ir: Graph, id: string): Edge {
   const edge = ir.edges.find((candidate) => candidate.id === id);
   if (edge === undefined) {
     throw new Error(`fixture error: no edge "${id}" in [${ir.edges.map((e) => e.id).join(", ")}]`);
@@ -65,10 +67,22 @@ function messageOf(act: () => unknown): string {
   throw new Error("expected the call to throw, but it did not");
 }
 
-function nodeById(ir: WorkflowIr, id: string): IrNode {
+function nodeById(ir: Graph, id: string): Node {
   const node = ir.nodes.find((candidate) => candidate.id === id);
   if (node === undefined) {
     throw new Error(`fixture error: no node "${id}"`);
+  }
+  return node;
+}
+
+/**
+ * `nodeById`, narrowed to a step. Throws rather than casting, so a fixture that
+ * quietly became a command node fails the test that assumed otherwise.
+ */
+function stepById(ir: Graph, id: string): StepNode {
+  const node = nodeById(ir, id);
+  if (isCommandNode(node)) {
+    throw new Error(`fixture error: node "${id}" is a command node, not a step`);
   }
   return node;
 }
@@ -80,7 +94,7 @@ function nodeById(ir: WorkflowIr, id: string): IrNode {
  */
 type Oracle = (request: ObservationRequest, visit: number) => ObservationResult;
 
-function initialState(ir: WorkflowIr): RunState {
+function initialState(ir: Graph): RunState {
   return {
     runId: "run-1",
     graphHash: ir.hash,
@@ -104,7 +118,7 @@ function initialState(ir: WorkflowIr): RunState {
  * for the one case where an edge carries no bound of its own and the ceiling is
  * the only thing left to stop it.
  */
-function drive(ir: WorkflowIr, oracle: Oracle, budget = 12, stepCeiling?: number): Transition[] {
+function drive(ir: Graph, oracle: Oracle, budget = 12, stepCeiling?: number): Transition[] {
   const taken: Transition[] = [];
   let state = initialState(ir);
   for (let visit = 0; visit < budget; visit += 1) {
@@ -206,7 +220,7 @@ describe("graphHash", () => {
   });
 
   it("changes when any meaningful value changes", () => {
-    const rerouted: IrEdge = {
+    const rerouted: Edge = {
       id: "a:1",
       from: "a",
       event: "pass",
@@ -225,8 +239,8 @@ describe("graphHash", () => {
   });
 
   it("distinguishes edge order, because first match wins at runtime", () => {
-    const a: IrEdge = { id: "a:1", from: "a", event: "pass", guard: { kind: "always" }, goto: END };
-    const b: IrEdge = { id: "a:2", from: "a", event: "fail", guard: { kind: "always" }, goto: "a" };
+    const a: Edge = { id: "a:1", from: "a", event: "pass", guard: { kind: "always" }, goto: END };
+    const b: Edge = { id: "a:2", from: "a", event: "fail", guard: { kind: "always" }, goto: "a" };
     expect(graphHash({ ...graph, edges: [a, b] })).not.toBe(graphHash({ ...graph, edges: [b, a] }));
   });
 });
@@ -333,7 +347,7 @@ describe("the §1.3 example graph", () => {
     // would return something the author never wrote, with a matching hash.
     const wf = exampleWorkflow();
     const first = wf.compile();
-    nodeById(first, "plan").skill = "hacked";
+    stepById(first, "plan").skill = "hacked";
     edgeById(first, "research:1").goto = END;
     expect(wf.compile()).toEqual(exampleWorkflow().compile());
   });
@@ -446,7 +460,7 @@ describe("output shorthand", () => {
     wf.step("a", { skill: "s", output: output as any });
     wf.entry("a");
     wf.edge("a", END);
-    return nodeById(wf.compile(), "a").schema;
+    return stepById(wf.compile(), "a").schema;
   }
 
   it("compiles scalars and array forms into JSON Schema", () => {
@@ -497,7 +511,7 @@ describe("output shorthand", () => {
     wf.step("a", { skill: "review-changes" });
     wf.entry("a");
     wf.edge("a", END);
-    expect(nodeById(wf.compile(), "a").skill).toBe("review-changes");
+    expect(stepById(wf.compile(), "a").skill).toBe("review-changes");
   });
 
   it("carries every declared option onto the node, and nothing it was not given", () => {
@@ -543,7 +557,7 @@ describe("output shorthand", () => {
     wf.step("a", { skill: "s", schema: { type: "object", properties: { x: { type: "null" } } } });
     wf.entry("a");
     wf.edge("a", END);
-    expect(nodeById(wf.compile(), "a").schema).toEqual({
+    expect(stepById(wf.compile(), "a").schema).toEqual({
       type: "object",
       properties: { x: { type: "null" } },
     });
@@ -1191,7 +1205,7 @@ const throwCases: ThrowCase[] = [
         params: { topic: "graphs" },
       }),
     expected: [
-      /step\("a"\) prompt reads \{\{params\.depth\}\}, which names no param it declares/,
+      /step\("a"\) reads \{\{params\.depth\}\}, which names no param it declares/,
       /Declared params: topic/,
     ],
   },
@@ -1820,11 +1834,11 @@ describe("unguarded cycle detection", () => {
     // is a retry. An `always` guard never fails, so the retry never fires, the
     // limit is never read, and the run advances around the loop forever with a
     // ceiling written on it that nothing enforces.
-    const nodes: IrNode[] = [
+    const nodes: Node[] = [
       { id: "a", skill: "s" },
       { id: "b", skill: "s" },
     ];
-    const edges: IrEdge[] = [
+    const edges: Edge[] = [
       { id: "a:1", from: "a", event: "pass", guard: { kind: "always" }, goto: "b" },
       {
         id: "b:1",
@@ -1843,8 +1857,8 @@ describe("unguarded cycle detection", () => {
   });
 
   it("passes a sound graph through the lint with nothing to say", () => {
-    const nodes: IrNode[] = [{ id: "a", skill: "s" }];
-    const edges: IrEdge[] = [
+    const nodes: Node[] = [{ id: "a", skill: "s" }];
+    const edges: Edge[] = [
       { id: "a:1", from: "a", event: "pass", guard: { kind: "always" }, goto: END },
     ];
     expect(lintGraph({ entry: "a", nodes, edges })).toEqual([]);
@@ -1916,14 +1930,14 @@ describe("params placeholders, at the authoring line", () => {
     });
     wf.entry("a");
     wf.edge("a", END);
-    expect(nodeById(wf.compile(), "a").prompt).toBe(
+    expect(stepById(wf.compile(), "a").prompt).toBe(
       "Search {{params.topic}} to depth {{params.depth}}.",
     );
   });
 
   it("refuses a key the step does not declare, naming what was written and what exists", () => {
     const message = messageOf(stepWith("Search {{params.topic}}.", { subject: "graphs" }));
-    expect(message).toMatch(/step\("a"\) prompt reads \{\{params\.topic\}\}/);
+    expect(message).toMatch(/step\("a"\) reads \{\{params\.topic\}\}/);
     expect(message).toMatch(/names no param it declares/);
     expect(message).toMatch(/Declared params: subject/);
   });
@@ -1998,7 +2012,7 @@ describe("ctx placeholders, against the whole graph", () => {
 
   it("accepts a reference to the step immediately before it", () => {
     const ir = chain("Plan from {{ctx.research.notes}}.").compile();
-    expect(nodeById(ir, "plan").prompt).toBe("Plan from {{ctx.research.notes}}.");
+    expect(stepById(ir, "plan").prompt).toBe("Plan from {{ctx.research.notes}}.");
   });
 
   it("refuses a reference to a step that declares no output, since running is not producing", () => {
@@ -2008,7 +2022,7 @@ describe("ctx placeholders, against the whole graph", () => {
     // produced none, so this reference is a run-time failure on a graph that
     // compiled clean.
     const message = messageOf(() => chain("Plan from {{ctx.research.notes}}.", false).compile());
-    expect(message).toMatch(/node "plan" prompt reads \{\{ctx\.research\.notes\}\}/);
+    expect(message).toMatch(/node "plan" reads \{\{ctx\.research\.notes\}\}/);
     expect(message).toMatch(/"research" declares no output/);
     expect(message).toMatch(/Running is not producing/);
     expect(message).toMatch(/Declare what "research" produces, with output or with schema/);
@@ -2034,7 +2048,7 @@ describe("ctx placeholders, against the whole graph", () => {
       wf.entry("research");
       wf.edge("research", "plan");
       wf.edge("plan", END);
-      expect(nodeById(wf.compile(), "plan").prompt).toBe("Plan from {{ctx.research.notes}}.");
+      expect(stepById(wf.compile(), "plan").prompt).toBe("Plan from {{ctx.research.notes}}.");
     });
   }
 
@@ -2043,7 +2057,7 @@ describe("ctx placeholders, against the whole graph", () => {
     // the payload can carry however the step behaves. Provably wrong at compile
     // time, which is the only kind of path fault worth refusing.
     const message = messageOf(() => chain("Plan from {{ctx.research.summary}}.").compile());
-    expect(message).toMatch(/node "plan" prompt reads \{\{ctx\.research\.summary\}\}/);
+    expect(message).toMatch(/node "plan" reads \{\{ctx\.research\.summary\}\}/);
     expect(message).toMatch(/"research" declares no "summary" in its output/);
     expect(message).toMatch(/It declares: notes/);
   });
@@ -2054,7 +2068,7 @@ describe("ctx placeholders, against the whole graph", () => {
     // constrains what a step is asked for, and this check exists to refuse what
     // cannot be there rather than to guess at what is merely unusual.
     const ir = chain("Plan from {{ctx.research.notes.0.text}}.").compile();
-    expect(nodeById(ir, "plan").prompt).toBe("Plan from {{ctx.research.notes.0.text}}.");
+    expect(stepById(ir, "plan").prompt).toBe("Plan from {{ctx.research.notes.0.text}}.");
   });
 
   it("accepts a reference reached through both arms of a branch", () => {
@@ -2074,7 +2088,7 @@ describe("ctx placeholders, against the whole graph", () => {
     wf.branch("triage", judge("Is the diff small?"), { yes: "ship", no: "polish" });
     wf.edge("polish", "ship");
     wf.edge("ship", END);
-    expect(nodeById(wf.compile(), "ship").prompt).toBe("Ship using {{ctx.research.notes}}.");
+    expect(stepById(wf.compile(), "ship").prompt).toBe("Ship using {{ctx.research.notes}}.");
   });
 
   it("refuses a reference a branch can skip, and names the route that skips it", () => {
@@ -2089,7 +2103,7 @@ describe("ctx placeholders, against the whole graph", () => {
     wf.edge("research", "plan");
     wf.edge("plan", END);
     const message = messageOf(() => wf.compile());
-    expect(message).toMatch(/node "plan" prompt reads \{\{ctx\.research\.notes\}\}/);
+    expect(message).toMatch(/node "plan" reads \{\{ctx\.research\.notes\}\}/);
     expect(message).toMatch(/"research" does not run on every route to "plan"/);
     expect(message).toMatch(/triage -> plan reaches "plan" without passing through "research"/);
   });
@@ -2150,19 +2164,19 @@ describe("ctx placeholders, against the whole graph", () => {
     wf.branch("review", judge("Any unresolved findings?"), { yes: "implement", no: "bundle" });
     wf.edge("bundle", "ship");
     wf.edge("ship", END);
-    expect(nodeById(wf.compile(), "ship").prompt).toBe("Ship {{ctx.bundle.artifact}}.");
+    expect(stepById(wf.compile(), "ship").prompt).toBe("Ship {{ctx.bundle.artifact}}.");
   });
 
   it("refuses a reference to a node that does not exist, naming the typo", () => {
     const message = messageOf(() => chain("Plan from {{ctx.reserch.notes}}.").compile());
-    expect(message).toMatch(/node "plan" prompt reads \{\{ctx\.reserch\.notes\}\}/);
+    expect(message).toMatch(/node "plan" reads \{\{ctx\.reserch\.notes\}\}/);
     expect(message).toMatch(/"reserch" is not a node in this graph/);
     expect(message).toMatch(/Declared nodes: research, plan/);
   });
 
   it("refuses a step reading its own output, which does not exist while it runs", () => {
     const message = messageOf(() => chain("Plan from {{ctx.plan.notes}}.").compile());
-    expect(message).toMatch(/node "plan" prompt reads \{\{ctx\.plan\.notes\}\}, which is its own/);
+    expect(message).toMatch(/node "plan" reads \{\{ctx\.plan\.notes\}\}, which is its own/);
     expect(message).toMatch(/has to name an earlier step/);
     // Not the dominance line: a node trivially lies on every route to itself, so
     // the general check would either say nothing or offer a route as a witness
@@ -2304,7 +2318,7 @@ describe("templates hidden in param values", () => {
   });
 
   it("reports it from lintGraph too, for an IR that never passed through step()", () => {
-    const nodes: IrNode[] = [
+    const nodes: Node[] = [
       {
         id: "a",
         skill: "s",
@@ -2312,7 +2326,7 @@ describe("templates hidden in param values", () => {
       },
       { id: "b", skill: "s", prompt: "Use {{params.hint}}.", params: { hint: "{{ctx.a.notes}}" } },
     ];
-    const edges: IrEdge[] = [
+    const edges: Edge[] = [
       { id: "a:1", from: "a", event: "pass", guard: { kind: "always" }, goto: "b" },
       { id: "b:1", from: "b", event: "pass", guard: { kind: "always" }, goto: END },
     ];
@@ -2338,8 +2352,8 @@ describe("templates hidden in param values", () => {
  * faults the builder throws on have to be reported here as well.
  */
 describe("lintGraph on prompts in an IR the builder never built", () => {
-  function lintPrompt(node: IrNode): string[] {
-    const edges: IrEdge[] = [
+  function lintPrompt(node: Node): string[] {
+    const edges: Edge[] = [
       { id: `${node.id}:1`, from: node.id, event: "pass", guard: { kind: "always" }, goto: END },
     ];
     return lintGraph({ entry: node.id, nodes: [node], edges });
@@ -2359,7 +2373,7 @@ describe("lintGraph on prompts in an IR the builder never built", () => {
         prompt: "Depth {{params.depth}}.",
         params: { topic: "g" },
       }),
-    ).toEqual([expect.stringMatching(/node "a" prompt reads .+Declared params: topic/s)]);
+    ).toEqual([expect.stringMatching(/node "a" reads .+Declared params: topic/s)]);
   });
 
   it("says a bad reference once, however many times the prompt writes it", () => {
@@ -2373,7 +2387,7 @@ describe("lintGraph on prompts in an IR the builder never built", () => {
   });
 
   it("has nothing to say about a prompt whose references all resolve", () => {
-    const nodes: IrNode[] = [
+    const nodes: Node[] = [
       {
         id: "a",
         skill: "s",
@@ -2386,7 +2400,7 @@ describe("lintGraph on prompts in an IR the builder never built", () => {
         params: { depth: 2 },
       },
     ];
-    const edges: IrEdge[] = [
+    const edges: Edge[] = [
       { id: "a:1", from: "a", event: "pass", guard: { kind: "always" }, goto: "b" },
       { id: "b:1", from: "b", event: "pass", guard: { kind: "always" }, goto: END },
     ];
@@ -2405,11 +2419,11 @@ describe("lintGraph on prompts in an IR the builder never built", () => {
  * for every IR that arrives from a front-end which is not the builder.
  */
 describe("lintGraph on an entry that names nothing", () => {
-  const nodes: IrNode[] = [
+  const nodes: Node[] = [
     { id: "research", skill: "s" },
     { id: "plan", skill: "s" },
   ];
-  const edges: IrEdge[] = [
+  const edges: Edge[] = [
     { id: "research:1", from: "research", event: "pass", guard: { kind: "always" }, goto: "plan" },
     { id: "plan:1", from: "plan", event: "pass", guard: { kind: "always" }, goto: END },
   ];
@@ -2428,8 +2442,8 @@ describe("lintGraph on an entry that names nothing", () => {
   it("keeps reporting unreachable nodes when the entry itself is sound", () => {
     // The suppression is conditional on the entry being missing. Made
     // unconditional, it would silently retire the unreachable check.
-    const orphaned: IrNode[] = [...nodes, { id: "orphan", skill: "s" }];
-    const withOrphan: IrEdge[] = [
+    const orphaned: Node[] = [...nodes, { id: "orphan", skill: "s" }];
+    const withOrphan: Edge[] = [
       ...edges,
       { id: "orphan:1", from: "orphan", event: "pass", guard: { kind: "always" }, goto: END },
     ];
@@ -2460,7 +2474,7 @@ describe("lintGraph on an entry that names nothing", () => {
  */
 describe("limit, at runtime", () => {
   /** One node, one guarded exit, retrying while the guard fails. */
-  function retryLoop(bound: boolean): WorkflowIr {
+  function retryLoop(bound: boolean): Graph {
     const wf = workflow({ name: bound ? "bounded-retry" : "raw-retry" });
     wf.step("implement", { skill: "s" });
     wf.entry("implement");
@@ -2501,11 +2515,11 @@ describe("limit, at runtime", () => {
 
   it("refuses the inert-limit cycle, because nothing on that path ever reads the limit", () => {
     // Hand-built, because the builder refuses to author this shape.
-    const nodes: IrNode[] = [
+    const nodes: Node[] = [
       { id: "a", skill: "s" },
       { id: "b", skill: "s" },
     ];
-    const edges: IrEdge[] = [
+    const edges: Edge[] = [
       { id: "a:1", from: "a", event: "pass", guard: { kind: "always" }, goto: "b" },
       { id: "b:1", from: "b", event: "pass", guard: { kind: "always" }, goto: "a", limit: 3 },
     ];
@@ -2522,7 +2536,7 @@ describe("limit, at runtime", () => {
     // `always` guard cannot fail, so the transition out of "b" advances and counts
     // no attempt against the ceiling written on it. There is nothing to exceed.
     const draft = { irVersion: 1 as const, name: "inert-limit", entry: "a", nodes, edges };
-    const ir: WorkflowIr = { ...draft, hash: graphHash(draft) };
+    const ir: Graph = { ...draft, hash: graphHash(draft) };
     const transition = evaluate(ir, { ...initialState(ir), node: "b" }, {});
     expect(transition).toMatchObject({ kind: "advance", to: "a", via: "b:1" });
     expect(transition.state.attempts).toEqual({});

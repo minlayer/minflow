@@ -21,7 +21,8 @@
  * @packageDocumentation
  */
 
-import type { IrNode, NodeId } from "./ir.js";
+import type { Node, NodeId } from "./ir.js";
+import { isCommandNode } from "./ir.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -31,11 +32,11 @@ import type { IrNode, NodeId } from "./ir.js";
  * The part of a graph these checks read.
  *
  * Only the nodes, because only a node names a skill. Stated as its own shape
- * rather than as {@link WorkflowIr} so that a draft graph, or one a second
+ * rather than as {@link Graph} so that a draft graph, or one a second
  * front-end produced, can be checked before it has a hash.
  */
 export interface SkillReferencingGraph {
-  nodes: IrNode[];
+  nodes: Node[];
 }
 
 /**
@@ -142,6 +143,9 @@ export function checkSkills(graph: SkillReferencingGraph, available: DiscoveredS
   const examined = new Set<string>();
 
   for (const node of graph.nodes) {
+    // A command node runs a shell command and names no skill, so there is
+    // nothing here to resolve and its absence is not a problem to report.
+    if (isCommandNode(node)) continue;
     const found = byDirectory.get(node.skill);
     if (found === undefined) {
       problems.push(missingSkillProblem(node.id, node.skill, available));
@@ -174,6 +178,8 @@ export function preloadCost(
   const costs = new Map<string, SkillCost>();
 
   for (const node of graph.nodes) {
+    // Command nodes preload nothing: no skill, no body, no per-invocation cost.
+    if (isCommandNode(node)) continue;
     const found = byDirectory.get(node.skill);
     if (found === undefined) continue;
     const existing = costs.get(node.skill);

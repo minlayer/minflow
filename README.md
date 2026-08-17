@@ -5,7 +5,7 @@
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 
 > **Early development.** The API is unstable and will change without notice
-> throughout the `0.0.x` line.
+> throughout the `0.x` line.
 
 A workflow compiler for coding agents. You describe a graph of steps in
 TypeScript, and minflow compiles it into a plugin the agent installs and runs
@@ -28,12 +28,17 @@ wf.step("plan",      { skill: "write-plan" });
 wf.step("implement", { skill: "implement-plan", maxTurns: 25 });
 wf.step("review",    { skill: "review-changes" });
 
+wf.run("typecheck", { command: "npm run typecheck" });          // no model call
+
 wf.entry("research");
 
-wf.edge("research", "plan",    when.fileExists("notes.md"));
-wf.gate("plan", "implement",   { command: "approve-plan" });   // human sign-off
-wf.edge("implement", "review", when.exitZero("npm test"),
-                               { otherwise: retry(3, "tests failing") });
+wf.ask("research", "plan", {                                    // asks, then resumes
+  questions: [{ question: "Ship behind a flag?", header: "Flag",
+                options: [{ label: "Yes" }, { label: "No" }] }],
+});
+wf.edge("plan", "typecheck");
+wf.edge("typecheck", "implement", when.field("exitCode").equals(0));
+wf.gate("implement", "review",  { command: "approve-diff" });   // human sign-off
 wf.branch("review", judge("Are there unresolved findings?"), {
   no:  END,
   yes: "implement",
@@ -42,38 +47,122 @@ wf.branch("review", judge("Are there unresolved findings?"), {
 await claudeCode.writeFiles(claudeCode.emit(wf.compile()), "./research-ship");
 ```
 
+## What you get
+
+### Routing nothing can talk its way out of
+
+Every transition is decided by evaluating a table in code. A model never chooses
+what happens next, it only produces the value a guard reads.
+
 `when.*` is a library of mechanical predicates that cost no tokens: an exit code,
 a file on disk, a field of a step's output. `judge()` is the one conspicuous way
 to ask a model for a verdict, so reaching for judgment is a visible decision
-rather than an accident.
+rather than something that happens by default.
 
-A step reads an earlier step's output by interpolating it:
+### Steps that are not model calls
+
+`wf.run("check", { command: "npm test" })` runs a shell command instead of a
+model. Its output is `{ exitCode, stdout, stderr }`, which guards read like any
+other payload, and a chain of them resolves between two of the runner's stops.
+Anything a script can decide costs no model call, no round trip, and cannot be
+graded generously by the thing it is checking.
+
+### Questions that answer themselves back into the run
+
+`wf.ask()` puts questions to the user and the run **resumes on its own**. Nobody
+types a command to continue.
+
+That is harder than it sounds and is why it is a feature rather than a line of
+prose in a skill: a subagent has no way to reach the user at all. The questions
+travel out through the runner's final message, the answers come back through a
+file, and the run picks up where it left off.
+
+Every compiled workflow also accepts `--auto` on its entry command, which answers
+its own questions and runs unattended. It is the same mechanism either way, so an
+unattended run exercises the real ask path rather than a mode that skips it.
+
+### Sign-off that actually blocks
+
+`wf.gate()` parks the run and waits for a human to release it, across sessions if
+need be.
+
+An ask and a gate look similar and are not. **An ask needs a fact. A gate needs a
+person to look.** That distinction is enforced rather than documented: an
+unattended run answers asks and refuses to pass a gate, because a mode that
+removes the human from the one mechanism whose purpose is human judgment would
+make gates meaningless.
+
+### Reading an earlier step's output, with a proof
 
 ```ts
 wf.step("plan", { skill: "write-plan", prompt: "Write a plan from:\n\n{{ctx.research.notes}}" });
 ```
 
-That reference is legal only when `research` **dominates** `plan`, meaning every
-route through the graph reaches `plan` through `research`, so the value cannot be
-present on one branch and missing on another. When it is not, compiling fails and
-names a route that reaches `plan` while skipping `research`, rather than leaving
+Legal only when `research` **dominates** `plan`, meaning every route through the
+graph reaches `plan` through `research`. When it does not, compiling fails and
+names the route that reaches `plan` while skipping `research`, instead of leaving
 you to find out on the branch nobody tested.
 
-Two things worth running before you ship a workflow:
+### Skills that ship, and stay private
+
+`emit` writes every skill the graph names into the plugin, each copy
+`user-invocable: false`. A compiled workflow has exactly one public surface, its
+entry command. Its steps are implementation, and a plugin exposing each internal
+step as a separately invocable skill has as many public surfaces as it has steps.
+
+Your own files are untouched. These are copies, which is what a compiler does
+with source. `Skill` reads one from its directory, brings the bundled
+`references/` and `scripts/` along, types the fields minflow reasons about, and
+carries every other frontmatter field through unchanged.
+
+### Mistakes caught before anything runs
+
+Unreachable nodes, dead ends, cycles that provably cannot terminate, a `ctx`
+reference to a step that might not have run, a judge guard on an edge leaving a
+command node: all compile errors, all reported at the line that caused them.
 
 ```ts
-import { checkSkills, discoverSkills, toMermaid } from "minflow";
-
 const problems = checkSkills(ir, await discoverSkills([".claude/skills"]));
-console.log(toMermaid(ir));
 ```
 
 `checkSkills` matters more than it sounds. Claude Code skips a skill it cannot
 resolve with only a debug-log warning, so a step whose skill is missing runs
-without its instructions and the run reports nothing wrong. `toMermaid` is the
-reading path: the builder gives up the transition table's one-glance legibility
-in exchange for errors at the offending line, and the diagram buys it back,
-including where a run parks for a human and what a retry's ceiling is.
+without its instructions and the run reports nothing wrong.
+
+### A graph you can actually read
+
+```ts
+console.log(toMermaid(ir));
+```
+
+The builder trades the transition table's one-glance legibility for errors at the
+offending line. The diagram buys it back: where a run parks for a human, what a
+retry's ceiling is, which boxes cost a model call and which are mechanical.
+
+### Tests generated from the graph
+
+```bash
+minflow test                  # derive a suite from the graph, write it, run it
+minflow test --collect-only   # write it and stop, to read first
+```
+
+The suite it generates is an artifact under `.minflow/`, meant to be read: every
+case, the decision it targets, and the exact inputs that force it.
+
+It aims at **branch coverage**, since unreachable nodes and dead ends are already
+compile errors. Automatic generation over a control-flow graph normally stalls on
+forcing a branch, because that means solving an arbitrary predicate. Guards here
+are data, so every kind inverts by inspection and there is no branch minflow
+cannot force. An outcome it reports as uncoverable is a fact about your graph,
+with the reason attached.
+
+`minflow test` never runs a model and never touches the network.
+
+### Zero idle footprint
+
+An installed workflow runs nothing when no workflow is running. Both hook
+registrations are matcher-scoped, so nothing fires during unrelated work. This is
+a hard requirement of the design rather than an optimisation.
 
 ## Why a compiler
 
@@ -102,6 +191,7 @@ research-ship/
   commands/approve-plan.md       one resume command per gate, plus its reject
   agents/runner.md               spawns one step at a time, makes no routing decisions
   agents/step-*.md               one wrapper per node, preloading that node's skill
+  skills/*/SKILL.md              every skill the graph names, shipped user-invocable: false
   hooks/hooks.json               two registrations, both matcher-scoped
   hooks/dispatch.cjs             evaluates the transition table after each step
   workflow.compiled.json         the compiled graph
@@ -115,21 +205,34 @@ registrations are scoped so that nothing fires during unrelated work.
 ## Status
 
 Working: the builder, the IR, the graph lint, the transition evaluator, run
-context interpolation, skill validation, Mermaid output, and the Claude Code
-backend. 557 tests, none of which need a model.
+context interpolation, command nodes, interactive asks, auto mode, skills shipped
+inside the plugin, skill validation, Mermaid output, generated tests, and the
+Claude Code backend. 636 tests, none of which need a model.
 
 A compiled workflow runs: the transition cycle, a judge verdict, a gate parked in
-one session and released in another, and a retry to its limit have each been
-driven end to end on a real install.
+one session and released in another, a retry to its limit, a command node routing
+on its exit code, and an ask that resumes its own run have each been driven end
+to end on a real install.
 
 Platform behaviour is verified by execution rather than assumed. The claims the
-design rests on were measured against Claude Code `2.1.229`, and
+design rests on were measured against Claude Code `2.1.229` and re-confirmed on
+`2.1.232`, and
 [`docs/VERIFICATION.md`](./docs/VERIFICATION.md) records what was checked, how,
 and what to re-check against a future release.
 
 Not done: backends for the other Agent Plugins clients (Codex CLI, Cursor,
 GitHub Copilot, VS Code, Kiro). Their packaging is settled by the Agent Plugins
 1.0.0 standard; their orchestration seam is not yet investigated.
+
+Specified and not yet built: `minflow test --live`, a real run against a real
+model in a temporary directory. Compiled workflows already carry the half it
+needs, which is auto mode; the command currently says so and exits rather than
+pretending.
+
+Also not done, and wanted: broader graph shapes. A run has one current node, so
+graphs are sequential today. Parallel branches and their joins are the one shape
+the transition table cannot express, and adding them is the next capability
+worth having (L22).
 
 ## Documentation
 
