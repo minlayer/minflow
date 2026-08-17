@@ -136,6 +136,30 @@ describe("forcing a decision", () => {
     if (!solved.ok) expect(solved.reason).toMatch(/want them to be different things/);
   });
 
+  it("reports a pattern nothing can fail as unreachable, rather than guessing", () => {
+    // A generated string that fails the guard is what makes an otherwise
+    // coverable. /.*/ matches every string there is, so no such string exists.
+    // Returning one that matches anyway produced a case whose walk the run could
+    // never take, and it failed as though the graph were wrong.
+    const wf = workflow({ name: "anything" });
+    wf.step("draft", { skill: "s", output: { tag: "string" } });
+    wf.step("ship", { skill: "s" });
+    wf.step("fix", { skill: "s" });
+    wf.entry("draft");
+    wf.edge("draft", "ship", when.field("tag").matches(".*"), { otherwise: "fix" });
+    wf.edge("fix", "draft");
+    wf.edge("ship", END);
+    const graph = wf.compile();
+
+    const plan = generateSuite(graph);
+    const blocked = plan.coverage.uncovered.find((entry) => entry.outcome === "draft:1/otherwise");
+    expect(blocked?.reason).toMatch(/matches every string/);
+    expect(plan.cases.every((entry) => !entry.walk.includes("fix"))).toBe(true);
+
+    const result = runSuite(graph, plan, { skills: skills() });
+    expect(result.passed).toBe(true);
+  });
+
   it("generates a string for a pattern guard, deterministically", () => {
     const wf = workflow({ name: "patterned" });
     wf.step("a", { skill: "s", output: { tag: "string" } });

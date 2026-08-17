@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-08-17
+
+### Fixed
+
+- **A pattern nothing can fail is reported as unreachable instead of guessed
+  at.** Making an `otherwise` coverable needs a string that fails the guard, and
+  for a pattern like `/.*/` no such string exists. The generator returned one
+  that matched anyway, so it emitted a case whose walk the run could never take,
+  and that case then failed as though the graph were wrong. It now refuses, and
+  the outcome is reported unreachable with the pattern named.
+
 ## [0.1.3] - 2026-08-17
 
 ### Fixed
@@ -157,7 +168,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Vitest test suite, and GitHub Actions for CI and publishing.
 - Placeholder release reserving the `minflow` package name on npm.
 
-[Unreleased]: https://github.com/minlayer/minflow/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/minlayer/minflow/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/minlayer/minflow/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/minlayer/minflow/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/minlayer/minflow/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/minlayer/minflow/compare/v0.1.0...v0.1.1
