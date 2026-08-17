@@ -1355,6 +1355,14 @@ interface Harness {
   /** Rewrites the compiled graph, as an editor recompiling mid-run would. */
   editGraph(change: (graph: Record<string, JsonValue>) => void): void;
   /**
+   * Edit a saved run's state in place.
+   *
+   * For the one thing no sequence of hook fires can produce: a run whose own
+   * recorded graph hash is stale while the plugin and the graph file agree,
+   * which is what regenerating a plugin under a stopped run leaves behind.
+   */
+  patchRun(runId: string, change: (state: Record<string, JsonValue>) => void): void;
+  /**
    * Starts a run the way the platform actually starts one, in two beats.
    *
    * The command renders NO decision: on `UserPromptExpansion` a `block` cancels
@@ -1497,6 +1505,12 @@ async function withPlugin(
         const graph = JSON.parse(sync.readFileSync(graphFile, "utf8")) as Record<string, JsonValue>;
         change(graph);
         sync.writeFileSync(graphFile, JSON.stringify(graph, null, 2), "utf8");
+      },
+      patchRun(runId, change) {
+        const file = path.join(dataDir, "runs", `${runId}.json`);
+        const state = JSON.parse(sync.readFileSync(file, "utf8")) as Record<string, JsonValue>;
+        change(state);
+        sync.writeFileSync(file, JSON.stringify(state, null, 2), "utf8");
       },
     };
 
@@ -2042,6 +2056,128 @@ describe("a run, driven through the emitted dispatcher", () => {
 // Run context, interpolated at spawn time
 // ---------------------------------------------------------------------------
 
+describe("a run whose session went away, resumed from the entry command", () => {
+  it("picks the run up where it stopped instead of starting a second one", async () => {
+    await withPlugin(drivableIr(), (plugin) => {
+      plugin.begin();
+      // One real step, then the session simply stops existing. Nothing marks the
+      // run as finished or parked: its status stays "running", which is exactly
+      // the state a session limit or a closed laptop leaves behind.
+      plugin.fire(stopped(reported({ done: true })));
+      const stalled = plugin.onlyRun();
+      expect(stalled.status).toBe("running");
+      expect(stalled.node).toBe("build");
+      expect(stalled.steps).toBe(1);
+
+      // The entry command again, in a session that never started the run. SPEC
+      // section 3.5 always said one static command serves a fresh run and a
+      // resumed one; gate resume used that and this did not, so the work was
+      // simply lost.
+      const again = plugin.fire(typed("drivable:run-drivable", "session-2"));
+      expect(again.decision).toBeNull();
+      expect(again.stderr).toContain("resuming run");
+      expect(again.stderr).toContain('"build"');
+
+      // The same run, not a second one, and no work was rewound.
+      const resumed = plugin.onlyRun();
+      expect(resumed.runId).toBe(stalled.runId);
+      expect(resumed.node).toBe("build");
+      expect(resumed.steps).toBe(1);
+      expect(resumed.outputs).toEqual(stalled.outputs);
+
+      // And it continues, rather than re-running the entry step.
+      const fired = plugin.fire(stopped("Standing by.", "session-2"));
+      expect(fired.reason).toContain("drivable:step-build");
+      expect(plugin.trace().some((entry) => entry.decision === "resume")).toBe(true);
+    });
+  });
+
+  it("carries the auto flag rather than re-reading it, so a run cannot change mode", async () => {
+    await withPlugin(drivableIr(), (plugin) => {
+      plugin.begin("session-1", "--auto");
+      plugin.fire(stopped(reported({ done: true })));
+      expect(plugin.onlyRun().auto).toBe(true);
+
+      // Resumed without the flag. The answers already recorded were given under
+      // auto, so quietly promoting the run to attended would misdescribe them.
+      plugin.fire(typed("drivable:run-drivable", "session-2"));
+      expect(plugin.onlyRun().auto).toBe(true);
+    });
+  });
+
+  it("starts a fresh run when told to, leaving the stalled one alone", async () => {
+    await withPlugin(drivableIr(), (plugin) => {
+      plugin.begin();
+      plugin.fire(stopped(reported({ done: true })));
+      const stalled = plugin.onlyRun();
+
+      plugin.fire(typed("drivable:run-drivable", "session-2", "--new"));
+      const runs = plugin.runs();
+      expect(runs).toHaveLength(2);
+      const fresh = runs.find((run) => run.runId !== stalled.runId);
+      expect(fresh?.node).toBe("draft");
+      expect(fresh?.steps).toBe(0);
+      // The old one is untouched, so nothing was destroyed by asking for a new run.
+      expect(runs.find((run) => run.runId === stalled.runId)?.node).toBe("build");
+    });
+  });
+
+  it("refuses to guess which of several stalled runs was meant, and names them", async () => {
+    await withPlugin(drivableIr(), (plugin) => {
+      plugin.begin("session-1");
+      plugin.fire(stopped(reported({ done: true })));
+      plugin.fire(typed("drivable:run-drivable", "session-2", "--new"));
+      plugin.fire(stopped("Standing by.", "session-2"));
+      plugin.fire(stopped(reported({ done: true }), "session-2"));
+      expect(plugin.runs()).toHaveLength(2);
+
+      // A third session knows about neither, so there is no link to fall back on.
+      const asked = plugin.fire(typed("drivable:run-drivable", "session-3"));
+      expect(asked.stderr).toContain("2 runs stopped part way through");
+      expect(asked.stderr).toContain("--new");
+      // Nothing was resumed and nothing was started.
+      expect(plugin.runs()).toHaveLength(2);
+    });
+  });
+
+  it("resumes the run this session started, when several are stalled", async () => {
+    await withPlugin(drivableIr(), (plugin) => {
+      plugin.begin("session-1");
+      plugin.fire(stopped(reported({ done: true })));
+      const mine = plugin.onlyRun().runId;
+      plugin.fire(typed("drivable:run-drivable", "session-2", "--new"));
+      plugin.fire(stopped("Standing by.", "session-2"));
+      plugin.fire(stopped(reported({ done: true }), "session-2"));
+
+      const again = plugin.fire(typed("drivable:run-drivable", "session-1"));
+      expect(again.stderr).toContain(mine);
+    });
+  });
+
+  it("refuses to resume a run whose graph moved underneath it", async () => {
+    await withPlugin(drivableIr(), (plugin) => {
+      plugin.begin();
+      plugin.fire(stopped(reported({ done: true })));
+      const stalled = plugin.onlyRun();
+
+      // The plugin and the graph file still agree, so the dispatcher's own hash
+      // check passes and the resume path is actually reached. Only the stopped
+      // run remembers the older graph, which is what regenerating a plugin under
+      // a stopped run leaves behind.
+      plugin.patchRun(stalled.runId, (state) => {
+        state.graphHash = "0000000000000000";
+      });
+
+      const again = plugin.fire(typed("drivable:run-drivable", "session-2"));
+      expect(again.stderr).toContain("Refusing to resume");
+      expect(again.stderr).toContain("its nodes may have moved");
+      // Not resumed, and not quietly replaced by a fresh run either.
+      expect(plugin.runs()).toHaveLength(1);
+      expect(plugin.onlyRun().node).toBe("build");
+    });
+  });
+});
+
 describe("a prompt's run context, resolved by the emitted dispatcher", () => {
   it("puts an earlier step's value into the next step's instruction", async () => {
     await withPlugin(interpolatingIr(), (plugin) => {
@@ -2345,13 +2481,16 @@ describe("the step wrappers", () => {
     const described: [where: string, markdown: string, fields: number][] = [
       ["the runner", fileOf(files, RUNNER_PATH), 3],
       ["the step wrapper", fileOf(files, "agents/step-first-second.md"), 3],
-      ["the run command", fileOf(files, `${COMMANDS_DIR}/run-multi-line.md`), 1],
+      // Two: a description, and the argument hint the run command always carries
+      // now that every workflow can be resumed.
+      ["the run command", fileOf(files, `${COMMANDS_DIR}/run-multi-line.md`), 2],
     ];
     for (const [where, markdown, fields] of described) {
       // One physical line per field: nothing spilled into a line of its own.
       const lines = frontmatterLinesOf(markdown);
       expect(`${where}: ${lines.length}`).toBe(`${where}: ${fields}`);
-      for (const line of lines) expect(line).toMatch(/^[A-Za-z]+: \S/);
+      // Hyphens are legal in a key, and `argument-hint` is one of them.
+      for (const line of lines) expect(line).toMatch(/^[A-Za-z][A-Za-z-]*: \S/);
 
       // And the value the resolver hands back is a single line too. It arrives
       // double-quoted because the interpolated names carry quotes, and a
@@ -2940,10 +3079,13 @@ describe("a small compiled workflow", () => {
       - End your final message with your JSON payload as a single fenced \`json\` block, with nothing after it. It is read from the message itself, so anything following it is noise the parser has to survive.
       ",
         "commands/run-tiny-flow.md": "---
-      description: "Start the \\"tiny-flow\\" workflow."
+      description: "Start or resume the \\"tiny-flow\\" workflow."
+      argument-hint: "[--new to start over instead of resuming]"
       ---
 
       Start the **tiny-flow** workflow, which begins at \`draft\`.
+
+      If a previous run stopped part way through, this picks it up where it left off instead of starting again, and says so. Everything already finished is kept.
 
       Spawn the subagent \`tiny-flow:runner\` with the Agent tool, and give
       it exactly this instruction, verbatim:
