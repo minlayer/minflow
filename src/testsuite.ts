@@ -366,7 +366,7 @@ function keyOf(guard: Requirement["guard"]): string {
 function applyRequirement(
   assignment: Assignment,
   requirement: Requirement,
-  strings: (pattern: string, match: boolean) => string,
+  strings: (pattern: string, match: boolean) => string | undefined,
 ): boolean {
   const { guard, holds } = requirement;
   const key = keyOf(guard);
@@ -416,7 +416,7 @@ function applyRequirement(
 function fieldValue(
   guard: Extract<Guard, { kind: "field" }>,
   holds: boolean,
-  strings: (pattern: string, match: boolean) => string,
+  strings: (pattern: string, match: boolean) => string | undefined,
 ): JsonValue | undefined {
   switch (guard.op) {
     case "truthy":
@@ -505,7 +505,10 @@ export function solveOutcome(graph: Graph, outcome: Outcome, seed: number): Solu
   const leaves: Requirement["guard"][] = [];
   for (const demand of demands) leavesOf(demand.guard, leaves);
 
-  const strings = stringGenerator(seed);
+  // Patterns nothing can fail, collected while solving so that a failed solve
+  // can say which one blocked it rather than blaming the sibling edges.
+  const unfalsifiable = new Set<string>();
+  const strings = stringGenerator(seed, unfalsifiable);
   const truth = new Map<Requirement["guard"], boolean>();
 
   const search = (index: number, assignment: Assignment): Assignment | undefined => {
@@ -530,13 +533,18 @@ export function solveOutcome(graph: Graph, outcome: Outcome, seed: number): Solu
 
   const solved = search(0, emptyAssignment());
   if (solved === undefined) {
+    const patterns = [...unfalsifiable].map((pattern) => `/${pattern}/`).join(", ");
     return {
       ok: false,
       // Exhaustive over the leaves, so this is a proof rather than a give-up.
       impossible: true,
       reason:
-        `no single set of observations makes "${outcome.from}" produce ${outcome.id}. The edges ` +
-        "at this node read the same observations and want them to be different things",
+        unfalsifiable.size > 0
+          ? `no single set of observations makes "${outcome.from}" produce ${outcome.id}. ` +
+            `${patterns} matches every string there is, so no value can fail it`
+          : `no single set of observations makes "${outcome.from}" produce ${outcome.id}. ` +
+            "The edges at this node read the same observations and want them to be different " +
+            "things",
     };
   }
 
@@ -705,21 +713,29 @@ function buildPayload(paths: Map<string, JsonValue>): Record<string, JsonValue> 
  * guard kind that needs more than arithmetic to invert, and generating a string
  * from a regular expression is somebody else's solved problem.
  */
-function stringGenerator(seed: number): (pattern: string, match: boolean) => string {
+function stringGenerator(
+  seed: number,
+  unfalsifiable: Set<string>,
+): (pattern: string, match: boolean) => string | undefined {
   let state = seed >>> 0;
   const next = (): number => {
     state = (state * 1664525 + 1013904223) >>> 0;
     return state / 4294967296;
   };
 
-  return (pattern: string, match: boolean): string => {
+  return (pattern: string, match: boolean): string | undefined => {
     if (!match) {
       // Almost anything fails a pattern; check rather than assume, since a
       // pattern like /.*/ matches everything and cannot be falsified.
       for (const candidate of ["minflow-no-match", "", " "]) {
         if (!new RegExp(pattern).test(candidate)) return candidate;
       }
-      return "minflow-no-match";
+      // Nothing fails it. Refuse, rather than returning a string that matches
+      // and letting a case be generated whose walk the run can never take. The
+      // caller reports the outcome unreachable, which is the truth about the
+      // graph rather than a failure to find something.
+      unfalsifiable.add(pattern);
+      return undefined;
     }
     const generator = new RandExp(pattern);
     // Unbounded repeats default to a hundred characters, which turns \\d+ into a
