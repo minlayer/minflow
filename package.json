@@ -1,10 +1,16 @@
 {
   "name": "minflow",
-  "version": "0.0.1",
-  "description": "Early development. Name reserved for the minflow project.",
+  "version": "0.1.0",
+  "description": "A workflow compiler for coding agents. Describe a graph of steps in TypeScript; get a plugin the agent installs and runs.",
   "keywords": [
     "minflow",
-    "minlayer"
+    "minlayer",
+    "workflow",
+    "compiler",
+    "agent",
+    "claude-code",
+    "plugin",
+    "state-machine"
   ],
   "license": "MIT",
   "author": "Ariel Arevalo <ariel@enki.cr>",

@@ -5,7 +5,7 @@
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
 
 > **Early development.** The API is unstable and will change without notice
-> throughout the `0.0.x` line.
+> throughout the `0.x` line.
 
 A workflow compiler for coding agents. You describe a graph of steps in
 TypeScript, and minflow compiles it into a plugin the agent installs and runs
@@ -76,6 +76,10 @@ That is harder than it sounds and is why it is a feature rather than a line of
 prose in a skill: a subagent has no way to reach the user at all. The questions
 travel out through the runner's final message, the answers come back through a
 file, and the run picks up where it left off.
+
+Every compiled workflow also accepts `--auto` on its entry command, which answers
+its own questions and runs unattended. It is the same mechanism either way, so an
+unattended run exercises the real ask path rather than a mode that skips it.
 
 ### Sign-off that actually blocks
 
@@ -201,13 +205,14 @@ registrations are scoped so that nothing fires during unrelated work.
 ## Status
 
 Working: the builder, the IR, the graph lint, the transition evaluator, run
-context interpolation, command nodes, interactive asks, skills shipped inside the
-plugin, skill validation, Mermaid output, and the Claude Code backend. 619 tests,
-none of which need a model.
+context interpolation, command nodes, interactive asks, auto mode, skills shipped
+inside the plugin, skill validation, Mermaid output, generated tests, and the
+Claude Code backend. 636 tests, none of which need a model.
 
 A compiled workflow runs: the transition cycle, a judge verdict, a gate parked in
-one session and released in another, and a retry to its limit have each been
-driven end to end on a real install.
+one session and released in another, a retry to its limit, a command node routing
+on its exit code, and an ask that resumes its own run have each been driven end
+to end on a real install.
 
 Platform behaviour is verified by execution rather than assumed. The claims the
 design rests on were measured against Claude Code `2.1.229` and re-confirmed on
@@ -219,11 +224,10 @@ Not done: backends for the other Agent Plugins clients (Codex CLI, Cursor,
 GitHub Copilot, VS Code, Kiro). Their packaging is settled by the Agent Plugins
 1.0.0 standard; their orchestration seam is not yet investigated.
 
-Specified and not yet built: generated tests. A compiled graph is a control-flow
-graph whose guards are data rather than code, so the inputs that force a given
-branch are derivable by inspection rather than by solving a predicate. `SPEC.md`
-§1.6 describes writing a readable test plan and executing it against the real
-emitted dispatcher, and §3.13 describes the auto mode a live run needs.
+Specified and not yet built: `minflow test --live`, a real run against a real
+model in a temporary directory. Compiled workflows already carry the half it
+needs, which is auto mode; the command currently says so and exits rather than
+pretending.
 
 Also not done, and wanted: broader graph shapes. A run has one current node, so
 graphs are sequential today. Parallel branches and their joins are the one shape

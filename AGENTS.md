@@ -14,14 +14,24 @@ src/hash.ts        canonical serialization and the graph hash
 src/evaluate.ts    the transition evaluator, pure
 src/builder.ts     the authoring surface, plus lintGraph
 src/mermaid.ts     the graph as a diagram, pure
+src/skill.ts       the Skill domain object: read, override, write
 src/skills.ts      skill validation: a pure check plus a thin filesystem shell
+src/testsuite.ts   deriving a suite of cases from the graph, pure
+src/testrun.ts     replaying a suite against an emitted dispatcher
 src/emit/          one directory per backend
+src/cli.ts         the command line
 src/index.ts       the public surface
 ```
 
 Dependencies point one way: `ir` knows about nothing, `evaluate` and `builder`
 know about `ir`, and a backend knows about all of them. A backend must never be
 imported by anything above it.
+
+Two modules sit deliberately below that line and say so. `testrun` drives a real
+emitted dispatcher, so it imports the Claude Code backend by name; driving an
+artifact is a backend's business, and pretending otherwise would mean simulating
+the dispatcher rather than testing it. `cli` sits below `testrun`. Everything
+else, `testsuite` included, reads only the IR and stays portable.
 
 ## Invariants
 
