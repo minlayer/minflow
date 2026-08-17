@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-08-17
+
+### Fixed
+
+- **A generated case can now get past a gate.** A gate parks the run for a
+  person to look at, and is released by a command that person runs, which the
+  harness never sent. The run parked and stayed parked, so every node
+  downstream of a gate was unreachable to the suite and was reported as a
+  routing failure that was not one. The harness now plays the reviewer's part,
+  exactly as it already plays the session's part for an ask.
+
+  This is not auto mode waving a gate through. Auto mode governs a live run
+  doing real work, where removing the human is the whole danger; a generated
+  case does no work at all, its observations are synthetic, and the only
+  question being asked is whether the routing is right.
+
+### Added
+
+- `claudeCode.gateCommandsFor(graph)`, which reports every gate's qualified
+  resume and reject commands as the emitted plugin registers them.
+
 ## [0.1.2] - 2026-08-17
 
 ### Fixed
@@ -136,7 +157,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Vitest test suite, and GitHub Actions for CI and publishing.
 - Placeholder release reserving the `minflow` package name on npm.
 
-[Unreleased]: https://github.com/minlayer/minflow/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/minlayer/minflow/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/minlayer/minflow/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/minlayer/minflow/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/minlayer/minflow/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/minlayer/minflow/compare/v0.0.1...v0.1.0
