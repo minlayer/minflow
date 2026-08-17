@@ -135,6 +135,25 @@ The builder trades the transition table's one-glance legibility for errors at th
 offending line. The diagram buys it back: where a run parks for a human, what a
 retry's ceiling is, which boxes cost a model call and which are mechanical.
 
+### Tests generated from the graph
+
+```bash
+minflow plan     # introspect the graph, write .minflow/plan.json
+minflow test     # run it against a real emitted dispatcher
+```
+
+Generation and execution are separate verbs on purpose. The plan is a file you
+read: every case, the decision it targets, and the exact inputs that force it.
+
+It aims at **branch coverage**, since unreachable nodes and dead ends are already
+compile errors. Automatic generation over a control-flow graph normally stalls on
+forcing a branch, because that means solving an arbitrary predicate. Guards here
+are data, so every kind inverts by inspection and there is no branch minflow
+cannot force. An outcome it reports as uncoverable is a fact about your graph,
+with the reason attached.
+
+`minflow test` never runs a model and never touches the network.
+
 ### Zero idle footprint
 
 An installed workflow runs nothing when no workflow is running. Both hook

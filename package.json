@@ -58,6 +58,10 @@
     "esbuild@0.28.2": true
   },
   "dependencies": {
+    "randexp": "^0.5.3",
     "yaml": "^2.9.0"
+  },
+  "bin": {
+    "minflow": "./dist/cli.js"
   }
 }

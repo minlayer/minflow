@@ -142,11 +142,6 @@ export interface PluginAuthor {
  */
 export const ASK_MARKER = "MINFLOW-ASK";
 
-// How a run is told to answer its own questions. An argument rather than an
-// environment variable, so a run that was unattended is visible in its own
-// transcript, which is exactly where you look when you doubt an answer.
-const AUTO_FLAG = /(^|\s)--auto(\s|$)/;
-
 /** Where a plugin's skills live, per the Agent Plugins layout. */
 export const SKILLS_DIR = "skills";
 
@@ -2108,6 +2103,41 @@ const ASK_MARKER = "MINFLOW-ASK";
 // transcript, which is exactly where you look when you doubt an answer.
 const AUTO_FLAG = /(^|\s)--auto(\s|$)/;
 
+// A test seam, and the only one in this file.
+//
+// Set to a path, it answers observations from that file instead of resolving
+// them against the world. It exists because a generated test can force a step's
+// payload by writing what the runner said, and cannot force the exit code of an
+// arbitrary shell command: no harness can make somebody's build fail on demand.
+//
+// Keyed by node, because a fire that drains a command node resolves observations
+// for two nodes at once and they share the inline payload key. One flat map would
+// have the second node's payload silently overwrite the first's.
+//
+// The tier that uses it tests ROUTING and does not test resolution, which is the
+// same line every unit test draws around a mock. A real run never sets it.
+const TEST_OBSERVATIONS = process.env.MINFLOW_TEST_OBSERVATIONS || "";
+
+// One stubbed answer, or null when there is none for this node and key.
+function stubFor(node, key) {
+  const stubs = stubbedObservations();
+  if (stubs === null || typeof node !== "string") return null;
+  const forNode = stubs[node];
+  if (forNode === null || typeof forNode !== "object" || !Object.hasOwn(forNode, key)) return null;
+  return forNode[key];
+}
+
+function stubbedObservations() {
+  if (TEST_OBSERVATIONS === "") return null;
+  try {
+    const parsed = JSON.parse(fs.readFileSync(TEST_OBSERVATIONS, "utf8"));
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    return parsed;
+  } catch (error) {
+    return null;
+  }
+}
+
 // One budget for a whole resolution pass, not one per command.
 //
 // A hook that outlives the platform's own timeout is cancelled and everything it
@@ -2810,7 +2840,9 @@ function runCommandNode(node, command) {
 
 // The one place delivery is visible. Above this the run is JSON; below it there
 // are files, exit codes and a final message.
-function resolveRequest(request, event, scratch, answered) {
+function resolveRequest(request, event, scratch, answered, node) {
+  const stubbed = stubFor(node, request.key);
+  if (stubbed !== null) return stubbed;
   if (request.kind === "exitZero" || request.kind === "fileExists") {
     // Once per visit to a node, not once per hook fire. A node carrying both a
     // mechanical guard and a judge guard is resolved again when the verdict
@@ -3301,7 +3333,7 @@ function settle(graph, state) {
         );
         return null;
       }
-      resolved[request.key] = resolveRequest(request, {}, scratch, false);
+      resolved[request.key] = resolveRequest(request, {}, scratch, false, current.node);
     }
 
     const transition = runtime.evaluate(graph, current, resolved);
@@ -3768,6 +3800,13 @@ function onSubagentStop(event, state) {
   let outstanding = null;
   let spellings = [];
   for (const request of runtime.observationsFor(graph, state)) {
+    const stubbedJudge = request.kind === "judge" ? stubFor(state.node, request.key) : null;
+    if (stubbedJudge !== null) {
+      // Answered from the stub file, so no round trip through the runner. A
+      // generated test states the verdict rather than asking a model for one.
+      resolved[request.key] = stubbedJudge;
+      continue;
+    }
     if (request.kind === "judge") {
       const answer = scratch.answers[request.key];
       // The loop is not cut short at the first unanswered question: the inline
@@ -3787,7 +3826,7 @@ function onSubagentStop(event, state) {
       resolved[request.key] = { ok: true, value: answer };
       continue;
     }
-    resolved[request.key] = resolveRequest(request, event, scratch, answered);
+    resolved[request.key] = resolveRequest(request, event, scratch, answered, state.node);
   }
 
   if (outstanding !== null) {
