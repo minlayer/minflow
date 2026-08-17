@@ -495,6 +495,53 @@ function rejectCommandFor(gate: string): string {
   return `reject-${stripped === "" ? gate : stripped}`;
 }
 
+/**
+ * Portable capability tiers, and what each one means on this platform.
+ *
+ * This is the whole of the translation the IR is missing (D28, L23). The graph
+ * says how much capability a step deserves; this says which model that is here.
+ * A tier is **relative to whatever ladder a deployment resolves**, not an
+ * absolute capability claim, because a client is not a provider: Cursor and
+ * Copilot each expose several providers' ladders at once, so "large" can only
+ * ever mean the top of the ladder in play.
+ *
+ * Provider names still pass through, because removing them would be breaking and
+ * every graph already written uses them. New graphs should use a tier: it is the
+ * only one of the accepted spellings that survives a change of platform.
+ */
+const MODEL_TIERS: Record<string, string> = {
+  small: "haiku",
+  medium: "sonnet",
+  large: "opus",
+};
+
+/** The names Claude Code documents for an agent's own model field. */
+const MODEL_ALIASES = new Set(["haiku", "sonnet", "opus", "inherit"]);
+
+/** An explicitly pinned Anthropic model, e.g. `claude-opus-5`. */
+const MODEL_PIN = /^claude-[a-z0-9][a-z0-9.-]*$/;
+
+/**
+ * The model frontmatter value for a node, or a compile error.
+ *
+ * Validation lives here rather than in the builder for the reason the leak exists
+ * at all: which model names are real is a fact about a platform, and the builder
+ * is not allowed to know one. Putting it here also closes the hole that made this
+ * worth writing down, since a misspelling used to reach the frontmatter verbatim
+ * and produce an agent naming a model that does not exist.
+ */
+function resolveModel(model: string, nodeId: string): string {
+  const tier = MODEL_TIERS[model];
+  if (tier !== undefined) return tier;
+  if (MODEL_ALIASES.has(model) || MODEL_PIN.test(model)) return model;
+  throw new Error(
+    `minflow: node "${nodeId}" asks for the model "${model}", which this backend does not ` +
+      `recognise. Use a portable tier (${Object.keys(MODEL_TIERS).join(", ")}), one of Claude ` +
+      `Code's own names (${[...MODEL_ALIASES].join(", ")}), or an explicit claude-* model id. ` +
+      "A tier is preferred: it is the only one of the three that survives a change of platform.",
+  );
+}
+
 /** A gate's two command names: the one that resumes it and the one that kills it. */
 interface GateCommands {
   gate: string;
@@ -1248,7 +1295,7 @@ function stepFor(
     // their file becomes a node without being edited or copied.
     ["skills", yamlList([node.skill])],
   ];
-  if (node.model !== undefined) fields.push(["model", yaml(node.model)]);
+  if (node.model !== undefined) fields.push(["model", yaml(resolveModel(node.model, node.id))]);
   if (node.maxTurns !== undefined) fields.push(["maxTurns", String(node.maxTurns)]);
   if (node.tools !== undefined) fields.push(["tools", yamlNameList(node.tools)]);
 

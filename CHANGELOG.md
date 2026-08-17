@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-08-17
+
+### Added
+
+- **Portable capability tiers for `model`.** A step may ask for `small`, `medium`
+  or `large`, and the backend translates it: on Claude Code, into `haiku`,
+  `sonnet` and `opus`. A tier is relative to whichever ladder a deployment
+  resolves, not an absolute capability claim, because a client is not a provider:
+  several clients expose more than one provider's ladder at once, so `large` can
+  only mean the top of the ladder in play.
+
+  This is containment for the leak recorded as D28 and L23, not the fix. `model`
+  is still typed as a free string in the IR and a provider's own name still passes
+  through, because removing it would break every graph already written. New graphs
+  should use a tier: it is the only spelling that survives a change of platform.
+
+### Fixed
+
+- **A model the backend does not recognise is now a compile error**, instead of
+  being copied into the agent's frontmatter verbatim. A misspelling used to
+  produce an agent naming a model that does not exist, in a compiler that
+  otherwise refuses an unknown node reference on the line containing it. The
+  error names the node and lists what is accepted. Validation lives in the
+  backend, because which model names are real is a fact about a platform and the
+  builder is not allowed to know one.
+
 ## [0.2.0] - 2026-08-17
 
 ### Added
@@ -192,7 +218,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Vitest test suite, and GitHub Actions for CI and publishing.
 - Placeholder release reserving the `minflow` package name on npm.
 
-[Unreleased]: https://github.com/minlayer/minflow/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/minlayer/minflow/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/minlayer/minflow/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/minlayer/minflow/compare/v0.1.4...v0.2.0
 [0.1.4]: https://github.com/minlayer/minflow/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/minlayer/minflow/compare/v0.1.2...v0.1.3

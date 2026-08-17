@@ -2336,6 +2336,52 @@ describe("a prompt's run context, resolved by the emitted dispatcher", () => {
 // Agents
 // ---------------------------------------------------------------------------
 
+describe("a step's model", () => {
+  /** One step carrying whatever model spelling is under test. */
+  function withModel(model: string): Graph {
+    const wf = workflow({ name: "modelled" });
+    wf.step("a", { skill: "s", model });
+    wf.entry("a");
+    wf.edge("a", END);
+    return wf.compile();
+  }
+
+  const modelOf = (model: string): string | undefined =>
+    frontmatterOf(fileOf(emit(withModel(model)), "agents/step-a.md")).model;
+
+  it("translates a portable tier into this platform's ladder", () => {
+    // The whole of the translation the IR is missing. The graph says how much
+    // capability the step deserves; the backend says which model that is here.
+    expect(modelOf("small")).toBe("haiku");
+    expect(modelOf("medium")).toBe("sonnet");
+    expect(modelOf("large")).toBe("opus");
+  });
+
+  it("still passes a provider's own name through, because removing it would break every graph", () => {
+    for (const name of ["haiku", "sonnet", "opus", "inherit"]) {
+      expect(modelOf(name)).toBe(name);
+    }
+    // And an explicit pin, for a deployment that needs one exact model.
+    expect(modelOf("claude-opus-5")).toBe("claude-opus-5");
+  });
+
+  it("refuses a model it does not recognise, rather than emitting it verbatim", () => {
+    // The hole that made this worth writing down: a misspelling used to reach the
+    // frontmatter untouched and produce an agent naming a model that never
+    // existed, in a compiler that otherwise refuses every other authoring slip.
+    expect(() => modelOf("sonnett")).toThrow(/does not recognise/);
+    expect(() => modelOf("sonnett")).toThrow(/small, medium, large/);
+    // A real model from the wrong provider is equally wrong here, and saying so
+    // is this backend's job rather than the IR's.
+    expect(() => modelOf("gpt-5")).toThrow(/does not recognise/);
+    expect(() => modelOf("gemini-3-pro")).toThrow(/does not recognise/);
+  });
+
+  it("names the node, so the error points at the line to fix", () => {
+    expect(() => modelOf("opuss")).toThrow(/node "a"/);
+  });
+});
+
 describe("the step wrappers", () => {
   it("never puts a colon in an agent name, because the platform refuses to load it", () => {
     const files = emit(exampleIr());
@@ -2443,17 +2489,28 @@ describe("the step wrappers", () => {
       ...["1.5", "0.0", "1e3", "3.14"],
     ];
     for (const name of resolved) {
-      const front = stepFrontmatter({ skill: name, model: name });
+      const front = stepFrontmatter({ skill: name });
       expect(front.skills).toBe(`["${name}"]`);
-      expect(front.model).toBe(`"${name}"`);
+    }
+  });
+
+  it("cannot be handed a model that resolves as a non-string, by construction", () => {
+    // This used to ride along with the skill name above, because both were
+    // arbitrary scalars. The model field is a closed set now, and nothing in it
+    // resolves as a boolean, a null or a number, so validation removed the
+    // hazard rather than the emitter having to quote its way out of it.
+    for (const accepted of ["small", "medium", "large", "haiku", "sonnet", "opus", "inherit"]) {
+      expect(stepFrontmatter({ skill: "s", model: accepted }).model).not.toMatch(/^"/);
+    }
+    for (const resolved of ["true", "null", "42", "1.5"]) {
+      expect(() => stepFrontmatter({ skill: "s", model: resolved })).toThrow(/does not recognise/);
     }
   });
 
   it("leaves a name that genuinely resolves as a string unquoted", () => {
     for (const name of ["haiku", "research-topic", "1.2.3", "y2", "on-call", "no-op"]) {
-      const front = stepFrontmatter({ skill: name, model: name });
+      const front = stepFrontmatter({ skill: name });
       expect(front.skills).toBe(`[${name}]`);
-      expect(front.model).toBe(name);
     }
   });
 
