@@ -20,7 +20,7 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join, relative, resolve } from "node:path";
 
 import type { Graph } from "./ir.js";
 import { runSuite } from "./testrun.js";
@@ -95,12 +95,22 @@ function writeSuite(suite: TestSuite, out: string): string {
   return path;
 }
 
+/** A path as the reader would type it, when it is under the working directory. */
+function display(path: string): string {
+  const here = relative(process.cwd(), path);
+  return here === "" || here.startsWith("..") ? path : here;
+}
+
 function reportCoverage(suite: TestSuite): void {
   const { total, covered, uncovered } = suite.coverage;
   console.log(`${suite.cases.length} cases, covering ${covered} of ${total} reachable outcomes`);
   if (uncovered.length === 0) return;
+  // Not a shortfall, and saying "not covered" next to "8 of 8" reads as a
+  // contradiction. These are outcomes nothing can reach, which is a fact about
+  // the graph rather than a gap in the suite, so it comes with the reason.
   console.log("");
-  console.log(`${uncovered.length} not covered:`);
+  const count = uncovered.length;
+  console.log(`${count} further ${count === 1 ? "outcome is" : "outcomes are"} unreachable:`);
   for (const entry of uncovered) {
     console.log(`  ${entry.outcome}`);
     console.log(`    ${entry.reason}`);
@@ -152,8 +162,8 @@ function main(argv: string[]): number {
   const { graph, from } = loadGraph(args.graph);
   const suite = generateSuite(graph, { seed: args.seed });
   const path = writeSuite(suite, args.out);
-  console.log(`read ${from}`);
-  console.log(`wrote ${path}`);
+  console.log(`read ${display(from)}`);
+  console.log(`wrote ${display(path)}`);
   console.log("");
 
   if (args.collectOnly) {

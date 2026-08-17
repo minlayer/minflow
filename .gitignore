@@ -33,3 +33,9 @@ Thumbs.db
 
 # Spike (local verification harness, not shipped)
 spike/
+
+# Generated suites and their scratch builds
+.minflow/
+
+# Recorded demos and the scratch project they were recorded in
+demos/
