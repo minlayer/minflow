@@ -162,6 +162,46 @@ function runCase(graph: Graph, pluginDir: string, scratch: string, testCase: Tes
     return { decision: out === "" ? null : out, stderr: finished.stderr };
   };
 
+  // A command node runs inside the dispatcher, between two of the runner's
+  // stops, so it never gets a stop of its own. Its observations have to be in
+  // place for the fire that drains it, which is the one belonging to the step
+  // before it.
+  const commandNodes = new Set(
+    graph.nodes.filter((node) => isCommandNode(node)).map((node) => node.id),
+  );
+
+  // Keyed by node, because one fire can resolve observations for a step and for
+  // every command node drained after it, and they share the inline payload key.
+  // A flat value per node is not enough either: a retry to a command node visits
+  // it twice inside one fire, so repeats become a list consumed in order.
+  const answersFor = (steps: TestCase["steps"]): Record<string, Observations | Observations[]> => {
+    const answering: Record<string, Observations | Observations[]> = {};
+    for (const step of steps) {
+      const already = answering[step.node];
+      if (already === undefined) {
+        answering[step.node] = step.observations;
+      } else if (Array.isArray(already)) {
+        already.push(step.observations);
+      } else {
+        answering[step.node] = [already, step.observations];
+      }
+    }
+    return answering;
+  };
+
+  // A command node at the entry drains during the start itself, before any step
+  // has stopped, so there is no earlier fire to hang its answers on. They have to
+  // be on disk before the runner first stands by, or the node resolves against
+  // the world and the case silently tests something else.
+  const leading: TestCase["steps"] = [];
+  for (const step of testCase.steps) {
+    if (!commandNodes.has(step.node)) break;
+    leading.push(step);
+  }
+  if (leading.length > 0) {
+    writeFileSync(stubs, JSON.stringify(answersFor(leading)), "utf8");
+  }
+
   // The two-beat start: the command seeds state and says nothing, then the
   // runner stands by and is redirected into the entry step.
   fire({
@@ -187,48 +227,20 @@ function runCase(graph: Graph, pluginDir: string, scratch: string, testCase: Tes
       last_assistant_message: message,
     });
 
-  // A command node runs inside the dispatcher, between two of the runner's
-  // stops, so it never gets a stop of its own. Its observations have to be in
-  // place for the fire that drains it, which is the one belonging to the step
-  // before it.
-  const commandNodes = new Set(
-    graph.nodes.filter((node) => isCommandNode(node)).map((node) => node.id),
-  );
-
   for (let index = 0; index < testCase.steps.length; index += 1) {
     const step = testCase.steps[index];
     if (step === undefined) continue;
     if (commandNodes.has(step.node)) continue;
 
-    // Keyed by node: this fire may resolve observations for this step and for
-    // every command node drained after it, and they share the inline payload
-    // key. Flattening them would let one node's payload become another's.
-    //
-    // A node can also appear twice in the same fire, which is what a retry to a
-    // command node is, and then one entry per node is not enough either: the
-    // case that fails a build once and passes it on the retry needs the two
-    // visits answered differently. Repeats become a list the dispatcher consumes
-    // in order.
-    const answering: Record<string, Observations | Observations[]> = {};
-    const answerWith = (node: string, observations: Observations): void => {
-      const already = answering[node];
-      if (already === undefined) {
-        answering[node] = observations;
-      } else if (Array.isArray(already)) {
-        already.push(observations);
-      } else {
-        answering[node] = [already, observations];
-      }
-    };
-
-    answerWith(step.node, step.observations);
+    // This step, plus every command node drained after it on the same fire.
+    const batch: TestCase["steps"] = [step];
     for (let ahead = index + 1; ahead < testCase.steps.length; ahead += 1) {
       const next = testCase.steps[ahead];
       if (next === undefined || !commandNodes.has(next.node)) break;
-      answerWith(next.node, next.observations);
+      batch.push(next);
     }
 
-    writeFileSync(stubs, JSON.stringify(answering), "utf8");
+    writeFileSync(stubs, JSON.stringify(answersFor(batch)), "utf8");
     const fired = stop(inlineReport(step.observations));
 
     // A transition that asks parks the run, and the harness plays the part the

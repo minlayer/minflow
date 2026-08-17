@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-08-17
+
+### Fixed
+
+- A generated case whose **entry is a command node** now answers that node.
+  Every other command node is drained on the fire belonging to the step before
+  it, and that is where its answers were written. An entry command node has no
+  step before it: it runs while the runner is still standing by for the first
+  time, so its answers were never written at all and it resolved against the
+  world instead. A case that needed the command to fail on its first visit
+  walked straight past the divert, and the walk check blamed the graph.
+
 ## [0.1.1] - 2026-08-17
 
 ### Fixed
@@ -124,7 +136,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Vitest test suite, and GitHub Actions for CI and publishing.
 - Placeholder release reserving the `minflow` package name on npm.
 
-[Unreleased]: https://github.com/minlayer/minflow/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/minlayer/minflow/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/minlayer/minflow/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/minlayer/minflow/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/minlayer/minflow/compare/v0.0.1...v0.1.0
 [0.0.1]: https://github.com/minlayer/minflow/compare/v0.0.0...v0.0.1
