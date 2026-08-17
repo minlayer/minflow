@@ -33,7 +33,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
-import { DISPATCHER_PATH, emit, pluginNameFor } from "./emit/claude-code.js";
+import { DISPATCHER_PATH, emit, gateCommandsFor, pluginNameFor } from "./emit/claude-code.js";
 import type { Graph, JsonValue } from "./ir.js";
 import { isCommandNode } from "./ir.js";
 import type { Skill } from "./skill.js";
@@ -169,6 +169,7 @@ function runCase(graph: Graph, pluginDir: string, scratch: string, testCase: Tes
   const commandNodes = new Set(
     graph.nodes.filter((node) => isCommandNode(node)).map((node) => node.id),
   );
+  const gates = gateCommandsFor(graph);
 
   // Keyed by node, because one fire can resolve observations for a step and for
   // every command node drained after it, and they share the inline payload key.
@@ -271,6 +272,35 @@ function runCase(graph: Graph, pluginDir: string, scratch: string, testCase: Tes
       // Beat three: the session spawns the runner again to stand by.
       stop("Standing by.");
     }
+
+    // A gate parks the run for a person to look, and it is released by a command
+    // that person runs. The harness plays that part too, exactly as it plays the
+    // session's part for an ask. Refusing to would leave every node downstream of
+    // a gate untestable, which is the opposite of what a coverage tool is for.
+    //
+    // This is not auto mode waving a gate through. Auto mode governs a live run
+    // doing real work, where removing the human is the whole danger. Nothing here
+    // does any work: the observations are synthetic and the only question is
+    // whether the routing is right.
+    const parked = parkedGate(dataDir);
+    if (parked !== null) {
+      const release = gates.find((entry) => entry.gate === parked.gate);
+      if (release === undefined) {
+        problems.push(`the run parked at gate "${parked.gate}", which the plugin does not define`);
+        continue;
+      }
+      fire({
+        hook_event_name: "UserPromptExpansion",
+        session_id: "plan",
+        command_name: release.resume,
+        command_args: parked.runId,
+        command_source: "plugin",
+        expansion_type: "slash_command",
+      });
+      // Releasing only flips the state back to running: the resume command's own
+      // body is what spawns a fresh runner, so the stand-by stop is that runner.
+      stop("Standing by.");
+    }
   }
 
   const walked = traceWalk(dataDir);
@@ -306,6 +336,29 @@ function inlineReport(observations: Record<string, { ok: boolean; value?: JsonVa
     return `Done.\n\n\`\`\`json\n${JSON.stringify(result.value, null, 2)}\n\`\`\``;
   }
   return "Done.";
+}
+
+/**
+ * The gate a run is parked at, or null when it is not parked.
+ *
+ * Read from the state the dispatcher saved rather than from its message, which
+ * is prose written for a person.
+ */
+function parkedGate(dataDir: string): { runId: string; gate: string } | null {
+  const dir = join(dataDir, "runs");
+  if (!existsSync(dir)) return null;
+  for (const name of readdirSync(dir).sort()) {
+    let state: { runId?: string; status?: string; gate?: string };
+    try {
+      state = JSON.parse(readFileSync(join(dir, name), "utf8")) as typeof state;
+    } catch {
+      continue;
+    }
+    if (state.status !== "awaiting" || typeof state.gate !== "string") continue;
+    if (typeof state.runId !== "string") continue;
+    return { runId: state.runId, gate: state.gate };
+  }
+  return null;
 }
 
 /** The nodes a run visited, in order, read out of the trace it wrote. */

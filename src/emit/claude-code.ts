@@ -4040,6 +4040,27 @@ ${DISPATCHER_BODY}`;
  * @param opts - Naming and manifest metadata the graph cannot supply.
  * @returns Relative POSIX paths to file contents.
  */
+/**
+ * Every gate's qualified resume and reject commands, exactly as the emitted
+ * plugin registers them.
+ *
+ * Exported for the test harness. A gate is released by a command a person runs,
+ * so without these there is no way to drive a generated case past one, and
+ * everything downstream of a gate would be untestable.
+ */
+export function gateCommandsFor(
+  ir: Graph,
+  opts: EmitOptions = {},
+): { gate: string; resume: string; reject: string }[] {
+  const pluginName = pluginNameFor(ir, opts);
+  const runCommand = commandNameFor(opts.command ?? `run-${pluginName}`, "the run command");
+  return gatesOf(ir, runCommand).map((gate) => ({
+    gate: gate.gate,
+    resume: qualified(pluginName, gate.resume),
+    reject: qualified(pluginName, gate.reject),
+  }));
+}
+
 export function emit(ir: Graph, opts: EmitOptions = {}): PluginFiles {
   const pluginName = pluginNameFor(ir, opts);
   // Folded before anything is named after it: a command name is also a file name

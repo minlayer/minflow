@@ -60,6 +60,17 @@ function commandAtEntry() {
   return wf.compile();
 }
 
+/** A graph with a gate, which parks the run until a person releases it. */
+function gated() {
+  const wf = workflow({ name: "gated" });
+  wf.step("draft", { skill: "s" });
+  wf.step("ship", { skill: "s" });
+  wf.entry("draft");
+  wf.gate("draft", "ship", { command: "approve" });
+  wf.edge("ship", END);
+  return wf.compile();
+}
+
 const skills = () => [Skill.from({ name: "s", description: "Does a step.", body: "# s\n" })];
 
 describe("what a graph can decide", () => {
@@ -220,6 +231,24 @@ describe("running a plan against the emitted dispatcher", () => {
     // fail first walked straight past the divert.
     const diverting = plan.cases.find((entry) => entry.walk.includes("fix"));
     expect(diverting?.walk).toEqual(["check", "fix", "check", "ship"]);
+
+    const result = runSuite(graph, plan, { skills: skills() });
+    for (const testCase of result.cases) {
+      expect({ id: testCase.id, problems: testCase.problems }).toEqual({
+        id: testCase.id,
+        problems: [],
+      });
+    }
+  });
+
+  it("releases a gate, so what is downstream of one can be tested at all", () => {
+    const graph = gated();
+    const plan = generateSuite(graph);
+
+    // A gate is released by a command a person runs. Without the harness playing
+    // that part the run parks and stays parked, so every node past a gate is
+    // unreachable to the suite and reported as a routing failure that is not one.
+    expect(plan.cases.some((entry) => entry.walk.includes("ship"))).toBe(true);
 
     const result = runSuite(graph, plan, { skills: skills() });
     for (const testCase of result.cases) {
