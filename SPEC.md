@@ -142,7 +142,7 @@ Nothing else crosses the boundary. A verdict that is not a string, or one outsid
 
 §1.2 claims a compiled graph is testable with no model in the loop. This is how, and it is a capability the compiler ships rather than something each author builds.
 
-**Generation and execution are separate verbs**, on the `terraform plan` and `terraform apply` model. Introspecting a graph writes a **test plan**, a readable artifact naming every case it intends to run and the exact inputs that force each one. Running consumes a plan. Nothing implicit decides what gets tested, and a reader who wants to know what will run opens the file.
+**The generated suite is an artifact.** `minflow test` derives a suite of cases from the graph, writes it under `.minflow/`, and runs it, the way a test runner collects a suite before executing it. The written suite names every case, the decision it targets, and the exact inputs that force it, so nothing implicit decides what gets tested and a reader who wants to know opens the file. `--collect-only` stops after writing, for when you want to look first.
 
 #### 1.6.1 What is derivable, and why it is derivable here
 
@@ -169,19 +169,19 @@ The `matches` row is the only one needing more than arithmetic, and it is a solv
 
 The consequence worth stating: **there is no guard kind minflow cannot force**, so an uncoverable edge means a graph problem rather than a generator limitation, and is reported as such.
 
-#### 1.6.2 The plan
+#### 1.6.2 The suite
 
-A plan is JSON, written to a scratch directory rather than into the source tree, on the precedent of `target/`, `.pytest_cache` and every other build cache.
+The suite is JSON, written to a scratch directory rather than into the source tree, on the precedent of `target/`, `.pytest_cache` and every other build cache.
 
-It carries the graph hash it was generated against, so a plan run against a changed graph is refused rather than silently testing something else; the seed, so generation is reproducible; and one entry per case. A case names the edges it covers, the walk it expects, and, per step, the payload and observations that force the next transition.
+It carries the graph hash it was generated against, so a suite run against a changed graph is refused rather than silently testing something else; the seed, so generation is reproducible; and one entry per case. A case names the outcomes it covers, the walk it expects, and, per step, the observations and any answers that force the next transition.
 
-Cases are chosen greedily for edge coverage: repeatedly take the path covering the most so-far-uncovered edges. A cycle is entered at most as many times as its retry limit allows, which bounds the walk without special-casing loops.
-
-The plan is the readable artifact. Everything after it is execution.
+One case is generated per outcome not already covered on the way to another, which keeps cases short and independent. A single long tour would cover the same ground in fewer runs and be a worse test: the first failure would mask everything after it, and nobody could read it. A cycle is entered at most as many times as its retry ceiling allows, which bounds the walk without special-casing loops.
 
 #### 1.6.3 Execution
 
-Executing a plan drives the **real emitted dispatcher**, not a simulation of it. Each case replays as hook payloads on stdin with the case's synthetic step outputs, and the run's own trace is then checked against the walk the plan predicted. The trace records `via`, the edge id, on every decision, so a completed run is literally a walk over the transition table and validating it is a graph check rather than string matching.
+Running the suite drives the **real emitted dispatcher**, not a simulation of it. Each case replays as hook payloads on stdin with the case's synthetic step outputs, and the run's own trace is then checked against the walk the suite predicted. The trace records `via`, the edge id, on every decision, so a completed run is literally a walk over the transition table and validating it is a graph check rather than string matching.
+
+Two things the harness cannot force, which is why one seam exists. It cannot make an arbitrary shell command exit as it likes, so observations are answered from a file named by `MINFLOW_TEST_OBSERVATIONS`, keyed by node because a fire that drains a command node resolves observations for two nodes at once. And an ask parks the run, so the harness plays the session's part: it relays the marker, writes the answers, and respawns the runner. That drives the real ask rather than putting the workflow into auto mode, which would test a path real users are not on.
 
 This is what makes execution worth its cost over the static lint: it exercises the artifact rather than the graph. Template resolution on a branch nobody took, a delivery obligation the wrong lane satisfies, an ask whose questions the step never produced, a command node whose interpolated path is wrong. Every one is well-formed in the graph and broken in the plugin.
 
@@ -198,7 +198,7 @@ It also does not test the work. A generated case proves the graph routed, not th
 Two, on the convention every test runner uses for an expensive tier: `go test -short`, `cargo test -- --ignored`, `pytest -m slow`.
 
 - **Free.** No model, no network, deterministic, fast enough for every commit. Everything above.
-- **Live**, opt-in behind an explicit flag. A real run with a real model and no human, which requires the workflow's **auto mode** (§3.13). It costs money, so it warns before it starts, and it runs in a temporary directory so a smoke test cannot leave counterfeit output where real output lives.
+- **Live**, a separate thing rather than a bigger version of the above. A real run with a real model and no human, which requires the workflow's **auto mode** (§3.13) and turns it on itself: `--auto` is how a smoke run goes unattended, never something the operator types. It costs money, so it warns before it starts, and it runs in a temporary directory so a smoke test cannot leave counterfeit output where real output lives. `minflow test` never does any of this.
 
 ## §2 The portability thesis
 

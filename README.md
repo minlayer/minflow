@@ -138,12 +138,12 @@ retry's ceiling is, which boxes cost a model call and which are mechanical.
 ### Tests generated from the graph
 
 ```bash
-minflow plan     # introspect the graph, write .minflow/plan.json
-minflow test     # run it against a real emitted dispatcher
+minflow test                  # derive a suite from the graph, write it, run it
+minflow test --collect-only   # write it and stop, to read first
 ```
 
-Generation and execution are separate verbs on purpose. The plan is a file you
-read: every case, the decision it targets, and the exact inputs that force it.
+The suite it generates is an artifact under `.minflow/`, meant to be read: every
+case, the decision it targets, and the exact inputs that force it.
 
 It aims at **branch coverage**, since unreachable nodes and dead ends are already
 compile errors. Automatic generation over a control-flow graph normally stalls on

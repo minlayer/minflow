@@ -78,7 +78,7 @@ type End = "__end__";
 export type Observations = Record<string, ObservationResult>;
 
 /** One decision inside a case: what the host answers, and what should follow. */
-export interface PlanStep {
+export interface TestStep {
   /** The node the run is at. */
   node: NodeId;
   /** The outcome this step is arranged to produce. */
@@ -95,11 +95,11 @@ export interface PlanStep {
 }
 
 /** One generated run. */
-export interface PlanCase {
+export interface TestCase {
   id: string;
   /** Outcome ids this case covers, in order. */
   covers: string[];
-  steps: PlanStep[];
+  steps: TestStep[];
   /** The node sequence the graph says this case should visit. */
   walk: NodeId[];
   /** How the run should finish. */
@@ -113,7 +113,7 @@ export interface Uncovered {
 }
 
 /** The written artifact. Readable on purpose: it is what will be run. */
-export interface TestPlan {
+export interface TestSuite {
   /** Bumped when the plan's own shape changes. */
   planVersion: 1;
   workflow: string;
@@ -121,7 +121,7 @@ export interface TestPlan {
   graphHash: string;
   /** Seeds the one thing that needs randomness, string generation for `matches`. */
   seed: number;
-  cases: PlanCase[];
+  cases: TestCase[];
   coverage: {
     total: number;
     covered: number;
@@ -130,8 +130,8 @@ export interface TestPlan {
   };
 }
 
-/** Options for {@link generatePlan}. */
-export interface PlanOptions {
+/** Options for {@link generateSuite}. */
+export interface SuiteOptions {
   /** Seeds string generation. Same seed, same plan. */
   seed?: number;
   /** Ceiling on generated cases, so a pathological graph cannot run away. */
@@ -791,7 +791,7 @@ function routeTo(outcomes: Outcome[], entry: NodeId, target: NodeId): Outcome[] 
  * ground in fewer runs and would be a worse test: the first failure would mask
  * everything after it, and nobody could read it.
  */
-export function generatePlan(graph: Graph, options: PlanOptions = {}): TestPlan {
+export function generateSuite(graph: Graph, options: SuiteOptions = {}): TestSuite {
   const seed = options.seed ?? DEFAULT_SEED;
   const maxCases = options.maxCases ?? DEFAULT_MAX_CASES;
 
@@ -799,7 +799,7 @@ export function generatePlan(graph: Graph, options: PlanOptions = {}): TestPlan 
   const covered = new Set<string>();
   const uncovered: Uncovered[] = [];
   const impossible = new Set<string>();
-  const cases: PlanCase[] = [];
+  const cases: TestCase[] = [];
 
   for (const outcome of outcomes) {
     if (outcome.infeasible !== undefined) {
@@ -856,7 +856,7 @@ export function generatePlan(graph: Graph, options: PlanOptions = {}): TestPlan 
 }
 
 /** A case, or the reason the run it describes could not be arranged. */
-type BuiltCase = { ok: true; plan: PlanCase } | { ok: false; reason: string; impossible: boolean };
+type BuiltCase = { ok: true; plan: TestCase } | { ok: false; reason: string; impossible: boolean };
 
 /**
  * Turn a chosen sequence of outcomes into a runnable case.
@@ -872,7 +872,7 @@ function buildCase(
   seed: number,
   id: string,
 ): BuiltCase {
-  const steps: PlanStep[] = [];
+  const steps: TestStep[] = [];
   const walk: NodeId[] = [];
   const covers: string[] = [];
 
@@ -887,7 +887,7 @@ function buildCase(
 
     for (let attempt = 0; attempt < repeats; attempt += 1) {
       walk.push(outcome.from);
-      const step: PlanStep = {
+      const step: TestStep = {
         node: outcome.from,
         outcome: outcome.id,
         observations: solved.observations,
@@ -901,7 +901,7 @@ function buildCase(
   const last = chosen[chosen.length - 1];
   if (last === undefined) return { ok: false, reason: "no outcomes chosen", impossible: false };
 
-  let ends: PlanCase["ends"] = "error";
+  let ends: TestCase["ends"] = "error";
   if (last.kind === "exhaust" || last.kind === "nomatch") ends = "error";
   else if (last.to !== undefined && isEnd(last.to)) ends = "end";
   else if (graph.edges.find((edge) => edge.id === last.edge)?.gate !== undefined) ends = "gate";
@@ -926,10 +926,10 @@ function carryToTerminal(
   outcomes: Outcome[],
   from: Outcome,
   seed: number,
-  steps: PlanStep[],
+  steps: TestStep[],
   walk: NodeId[],
   covers: string[],
-): { ok: true; ends: PlanCase["ends"] } | { ok: false; ends: PlanCase["ends"]; reason: string } {
+): { ok: true; ends: TestCase["ends"] } | { ok: false; ends: TestCase["ends"]; reason: string } {
   const seen = new Set<NodeId>();
   let node = successorOf(from);
 
@@ -947,7 +947,7 @@ function carryToTerminal(
     const solved = solveOutcome(graph, next, seed);
     if (!solved.ok) return { ok: false, ends: "error", reason: solved.reason };
     walk.push(node);
-    const step: PlanStep = { node, outcome: next.id, observations: solved.observations };
+    const step: TestStep = { node, outcome: next.id, observations: solved.observations };
     if (solved.answers !== undefined) step.answers = solved.answers;
     steps.push(step);
     covers.push(next.id);

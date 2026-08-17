@@ -1,14 +1,17 @@
 #!/usr/bin/env node
 /**
- * The command line: generate a test plan, and run one.
+ * The command line.
  *
- * Two verbs, deliberately separate. `plan` introspects a graph and **writes**
- * what it intends to run, as a file you can read. `test` runs a plan. Nothing
- * implicit decides what gets tested, which is the whole point of the split.
+ * One verb: `minflow test` derives a suite of cases from the graph, writes it
+ * out, and runs it. The generated suite is an **artifact you can read**, the way
+ * a collected pytest suite is: every case, the decision it targets, and the
+ * exact inputs that force it, on disk under `.minflow/`. Nothing implicit
+ * decides what gets tested, and `--collect-only` stops before running for when
+ * you want to look first.
  *
- * **`test` never runs a model and never touches the network.** It replays
- * generated cases against a real emitted dispatcher with synthetic step outputs.
- * A live run against a real model is a different thing entirely and is not this.
+ * **It never runs a model and never touches the network.** Cases replay against
+ * a real emitted dispatcher with synthetic step outputs. A live run against a
+ * real model is a different thing entirely and is not this.
  *
  * The graph is the input, and a compiled plugin already carries it as
  * `workflow.compiled.json`, so nothing here has to load a user's TypeScript.
@@ -20,12 +23,12 @@ import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "no
 import { join, resolve } from "node:path";
 
 import type { Graph } from "./ir.js";
-import { generatePlan, type TestPlan } from "./testplan.js";
-import { runPlan } from "./testrun.js";
+import { runSuite } from "./testrun.js";
+import { generateSuite, type TestSuite } from "./testsuite.js";
 
-/** Where the plan and the scratch build live, on the precedent of every build cache. */
+/** Where the suite and the scratch build live, on the precedent of every build cache. */
 const OUT_DIR = ".minflow";
-const PLAN_FILE = "plan.json";
+const SUITE_FILE = "suite.json";
 
 /** Places a compiled graph is likely to be, in the order they are tried. */
 const GRAPH_CANDIDATES = [
@@ -39,10 +42,11 @@ interface Args {
   graph?: string;
   out: string;
   seed: number;
+  collectOnly: boolean;
 }
 
 function parse(argv: string[]): Args {
-  const args: Args = { command: argv[0] ?? "help", out: OUT_DIR, seed: 1 };
+  const args: Args = { command: argv[0] ?? "help", out: OUT_DIR, seed: 1, collectOnly: false };
   for (let index = 1; index < argv.length; index += 1) {
     const token = argv[index];
     if (token === undefined) continue;
@@ -50,6 +54,8 @@ function parse(argv: string[]): Args {
       args.out = argv[++index] ?? OUT_DIR;
     } else if (token === "--seed") {
       args.seed = Number(argv[++index] ?? 1);
+    } else if (token === "--collect-only") {
+      args.collectOnly = true;
     } else if (token === "--live") {
       args.command = "live";
     } else if (!token.startsWith("-")) {
@@ -82,16 +88,16 @@ function loadGraph(explicit: string | undefined): { graph: Graph; from: string }
   );
 }
 
-function writePlan(plan: TestPlan, out: string): string {
+function writeSuite(suite: TestSuite, out: string): string {
   mkdirSync(resolve(out), { recursive: true });
-  const path = join(resolve(out), PLAN_FILE);
-  writeFileSync(path, `${JSON.stringify(plan, null, 2)}\n`, "utf8");
+  const path = join(resolve(out), SUITE_FILE);
+  writeFileSync(path, `${JSON.stringify(suite, null, 2)}\n`, "utf8");
   return path;
 }
 
-function reportCoverage(plan: TestPlan): void {
-  const { total, covered, uncovered } = plan.coverage;
-  console.log(`${plan.cases.length} cases, covering ${covered} of ${total} reachable outcomes`);
+function reportCoverage(suite: TestSuite): void {
+  const { total, covered, uncovered } = suite.coverage;
+  console.log(`${suite.cases.length} cases, covering ${covered} of ${total} reachable outcomes`);
   if (uncovered.length === 0) return;
   console.log("");
   console.log(`${uncovered.length} not covered:`);
@@ -107,14 +113,18 @@ function main(argv: string[]): number {
   if (args.command === "help" || args.command === "--help" || args.command === "-h") {
     console.log(
       [
-        "minflow plan [graph]     introspect a graph and write the test plan",
-        "minflow test [graph]     run the plan. No model, no network, deterministic",
+        "minflow test [graph]     derive a suite from the graph, write it, and run it",
+        "                         No model, no network, deterministic",
         "",
-        "  --out <dir>            where the plan and the scratch build go. Default .minflow",
+        "  --collect-only         write the suite and stop, without running it",
+        "  --out <dir>            where the suite and scratch build go. Default .minflow",
         "  --seed <n>             seeds string generation for pattern guards. Default 1",
         "",
         "[graph] is a workflow.compiled.json, or a plugin directory holding one.",
         "Omitted, it is looked for in plugin/, ., and dist/.",
+        "",
+        "The suite it writes is meant to be read. It names every case, the decision",
+        "each one targets, and the exact inputs that force it.",
       ].join("\n"),
     );
     return 0;
@@ -127,23 +137,11 @@ function main(argv: string[]): number {
         "",
         "It is a different thing from `minflow test`: a real model, a real run, real cost,",
         "in a temporary directory so it cannot leave counterfeit output where real output",
-        "lives. Compiled workflows already have the half it needs, which is auto mode:",
-        "start one with --auto and it answers its own questions and stops at any gate.",
+        "lives. Compiled workflows already have the half it needs, which is auto mode,",
+        "and `minflow test --live` will turn it on itself rather than asking you to.",
       ].join("\n"),
     );
     return 2;
-  }
-
-  const { graph, from } = loadGraph(args.graph);
-
-  if (args.command === "plan") {
-    const plan = generatePlan(graph, { seed: args.seed });
-    const path = writePlan(plan, args.out);
-    console.log(`read ${from}`);
-    console.log(`wrote ${path}`);
-    console.log("");
-    reportCoverage(plan);
-    return 0;
   }
 
   if (args.command !== "test") {
@@ -151,13 +149,23 @@ function main(argv: string[]): number {
     return 2;
   }
 
-  const plan = generatePlan(graph, { seed: args.seed });
-  const path = writePlan(plan, args.out);
+  const { graph, from } = loadGraph(args.graph);
+  const suite = generateSuite(graph, { seed: args.seed });
+  const path = writeSuite(suite, args.out);
   console.log(`read ${from}`);
   console.log(`wrote ${path}`);
   console.log("");
 
-  const result = runPlan(graph, plan, { scratch: join(resolve(args.out), "scratch") });
+  if (args.collectOnly) {
+    for (const testCase of suite.cases) {
+      console.log(`  ${testCase.id}  ${testCase.walk.join(" > ")}`);
+    }
+    console.log("");
+    reportCoverage(suite);
+    return 0;
+  }
+
+  const result = runSuite(graph, suite, { scratch: join(resolve(args.out), "scratch") });
   for (const testCase of result.cases) {
     console.log(
       `  ${testCase.passed ? "ok  " : "FAIL"} ${testCase.id}  ${testCase.expected.join(" > ")}`,
@@ -165,7 +173,7 @@ function main(argv: string[]): number {
     for (const problem of testCase.problems) console.log(`       ${problem}`);
   }
   console.log("");
-  reportCoverage(plan);
+  reportCoverage(suite);
   console.log("");
 
   const failed = result.cases.filter((testCase) => !testCase.passed).length;

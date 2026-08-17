@@ -2,8 +2,8 @@ import { describe, expect, it } from "vitest";
 
 import { END, judge, retry, when, workflow } from "../src/builder.js";
 import { Skill } from "../src/skill.js";
-import { generatePlan, outcomesOf, solveOutcome } from "../src/testplan.js";
-import { runPlan } from "../src/testrun.js";
+import { runSuite } from "../src/testrun.js";
+import { generateSuite, outcomesOf, solveOutcome } from "../src/testsuite.js";
 
 /** A graph with a branch, a retry with a ceiling, and a divert. */
 function branchy() {
@@ -107,17 +107,17 @@ describe("forcing a decision", () => {
 
 describe("a generated plan", () => {
   it("covers every outcome the graph can reach, and names the ones it cannot", () => {
-    const plan = generatePlan(branchy());
+    const plan = generateSuite(branchy());
     expect(plan.coverage.covered).toBe(plan.coverage.total);
     expect(plan.coverage.uncovered.map((entry) => entry.outcome)).toContain("fix/nomatch");
   });
 
   it("is reproducible: same graph and seed, same plan", () => {
-    expect(generatePlan(branchy(), { seed: 3 })).toEqual(generatePlan(branchy(), { seed: 3 }));
+    expect(generateSuite(branchy(), { seed: 3 })).toEqual(generateSuite(branchy(), { seed: 3 }));
   });
 
   it("takes a retry to its ceiling by repeating the step", () => {
-    const plan = generatePlan(branchy());
+    const plan = generateSuite(branchy());
     const exhausting = plan.cases.find((entry) => entry.covers.includes("build:1/exhaust"));
     // limit 2, so three attempts: the third is the one past the ceiling.
     expect(exhausting?.walk.filter((node) => node === "build")).toHaveLength(3);
@@ -125,16 +125,16 @@ describe("a generated plan", () => {
   });
 
   it("pins itself to the graph it was generated against", () => {
-    const plan = generatePlan(branchy());
+    const plan = generateSuite(branchy());
     const other = { ...branchy(), hash: "0000000000000000" };
-    expect(() => runPlan(other, plan, { skills: skills() })).toThrow(/Regenerate the plan/);
+    expect(() => runSuite(other, plan, { skills: skills() })).toThrow(/Regenerate the plan/);
   });
 });
 
 describe("running a plan against the emitted dispatcher", () => {
   it("walks exactly where the plan said it would, on every case", () => {
     const graph = branchy();
-    const result = runPlan(graph, generatePlan(graph), { skills: skills() });
+    const result = runSuite(graph, generateSuite(graph), { skills: skills() });
     for (const testCase of result.cases) {
       expect({ id: testCase.id, problems: testCase.problems }).toEqual({
         id: testCase.id,
@@ -148,13 +148,13 @@ describe("running a plan against the emitted dispatcher", () => {
     // The plan is generated from the graph, then the graph is bent underneath it
     // so the run takes a different route. The walk check is what notices.
     const graph = branchy();
-    const plan = generatePlan(graph);
+    const plan = generateSuite(graph);
     const bent = structuredClone(graph);
     const edge = bent.edges.find((candidate) => candidate.id === "draft:1");
     if (edge !== undefined) edge.goto = "fix";
     bent.hash = graph.hash;
 
-    const result = runPlan(bent, plan, { skills: skills() });
+    const result = runSuite(bent, plan, { skills: skills() });
     expect(result.passed).toBe(false);
     expect(result.cases.some((testCase) => /walked/.test(testCase.problems.join(" ")))).toBe(true);
   });

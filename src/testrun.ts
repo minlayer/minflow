@@ -37,7 +37,7 @@ import { DISPATCHER_PATH, emit, pluginNameFor } from "./emit/claude-code.js";
 import type { Graph, JsonValue } from "./ir.js";
 import { isCommandNode } from "./ir.js";
 import type { Skill } from "./skill.js";
-import type { Observations, PlanCase, TestPlan } from "./testplan.js";
+import type { Observations, TestCase, TestSuite } from "./testsuite.js";
 
 /** What one case did. */
 export interface CaseResult {
@@ -55,10 +55,10 @@ export interface CaseResult {
 export interface RunResult {
   passed: boolean;
   cases: CaseResult[];
-  coverage: TestPlan["coverage"];
+  coverage: TestSuite["coverage"];
 }
 
-/** Options for {@link runPlan}. */
+/** Options for {@link runSuite}. */
 export interface RunOptions {
   /** Skills to ship into the plugin under test, as `emit` takes them. */
   skills?: Skill[];
@@ -73,7 +73,7 @@ export interface RunOptions {
  * stale plan silently testing something else is worse than no plan, and the
  * graph hash is exactly the thing that can tell.
  */
-export function runPlan(graph: Graph, plan: TestPlan, options: RunOptions = {}): RunResult {
+export function runSuite(graph: Graph, plan: TestSuite, options: RunOptions = {}): RunResult {
   if (plan.graphHash !== graph.hash) {
     throw new Error(
       `minflow: this plan was generated against graph ${plan.graphHash}, but the graph now ` +
@@ -127,7 +127,7 @@ function writeFilesSync(files: Record<string, string>, destDir: string): void {
  * as the platform invokes it, so nothing here can accidentally test an in-process
  * shortcut that the real thing does not take.
  */
-function runCase(graph: Graph, pluginDir: string, scratch: string, testCase: PlanCase): CaseResult {
+function runCase(graph: Graph, pluginDir: string, scratch: string, testCase: TestCase): CaseResult {
   const name = pluginNameFor(graph);
   const dataDir = mkdtempSync(join(scratch, "data-"));
   const projectDir = mkdtempSync(join(scratch, "project-"));
