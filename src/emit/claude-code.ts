@@ -990,16 +990,23 @@ function askProtocolSection(pluginName: string): string {
 }
 
 function runCommandFile(ir: Graph, pluginName: string): string {
+  // `--new` is always offered, unlike `--auto`: every workflow can be
+  // interrupted, so every workflow can be resumed, and the flag is how you say
+  // you meant to start over rather than continue.
+  const hints = graphAsks(ir)
+    ? "[--auto to answer the run's own questions instead of asking you] [--new to start over " +
+      "instead of resuming]"
+    : "[--new to start over instead of resuming]";
   return commandFor(
-    `Start the "${ir.name}" workflow.`,
+    `Start or resume the "${ir.name}" workflow.`,
     spawnRunnerBody(
       pluginName,
-      `Start the **${oneLine(ir.name)}** workflow, which begins at \`${ir.entry}\`.`,
+      `Start the **${oneLine(ir.name)}** workflow, which begins at \`${ir.entry}\`.\n\n` +
+        "If a previous run stopped part way through, this picks it up where it left off " +
+        "instead of starting again, and says so. Everything already finished is kept.",
       graphAsks(ir),
     ),
-    // Only offered when there is something to answer. A flag advertised on a
-    // workflow that never asks is a flag that does nothing.
-    graphAsks(ir) ? "[--auto to answer the run's own questions instead of asking you]" : undefined,
+    hints,
   );
 }
 
@@ -2107,6 +2114,10 @@ const ASK_MARKER = "MINFLOW-ASK";
 // answers nobody is coming to give.
 const AUTO_FLAG = /(^|\s)--auto\b/;
 
+// Forces a fresh run when one is sitting there half finished. The default is to
+// resume, because the expensive mistake is redoing work, not continuing it.
+const NEW_FLAG = /(^|\s)--new\b/;
+
 // A test seam, and the only one in this file.
 //
 // Set to a path, it answers observations from that file instead of resolving
@@ -2262,6 +2273,83 @@ function linkSession(sessionId, runId) {
 // Every run parked at a gate, which is how a resume finds its run from a session
 // that never started it. Reading a directory of small JSON files is the whole
 // index: there is no second one to keep consistent with the state files.
+// Runs whose session went away mid-flight.
+//
+// The state is intact and its node already points at the step the run was about to
+// take, so such a run is exactly as resumable as one parked at a gate. Nothing
+// was ever wired to pick it up, which is how ninety minutes of work became
+// unrecoverable the first time a session limit was hit.
+//
+// Only "running" is claimed here. "awaiting" is a gate and has its own command.
+// "asking" put questions in front of a session that is now gone, and resuming it
+// means asking again rather than continuing, so it is reported rather than
+// silently resumed into a destination whose answers never arrived.
+function resumableRuns() {
+  let entries = [];
+  try {
+    entries = fs.readdirSync(path.join(DATA, "runs"));
+  } catch (error) {
+    return [];
+  }
+  const found = [];
+  for (const entry of entries) {
+    if (entry.slice(-5) !== ".json") continue;
+    const state = readJson(path.join(DATA, "runs", entry));
+    if (state === null || state.status !== "running") continue;
+    found.push(state);
+  }
+  return found;
+}
+
+/** Runs stalled mid-ask, which need answers rather than a resume. */
+function askingRuns() {
+  let entries = [];
+  try {
+    entries = fs.readdirSync(path.join(DATA, "runs"));
+  } catch (error) {
+    return [];
+  }
+  const found = [];
+  for (const entry of entries) {
+    if (entry.slice(-5) !== ".json") continue;
+    const state = readJson(path.join(DATA, "runs", entry));
+    if (state === null || state.status !== "asking") continue;
+    found.push(state);
+  }
+  return found;
+}
+
+/**
+ * Which stalled run the entry command meant, when it meant one at all.
+ *
+ * The same order of preference gate resume uses, and for the same reason:
+ * resuming the wrong run is worse than asking which.
+ */
+function resumableRunFor(event, sessionId) {
+  const named = commandArgument(event).replace(AUTO_FLAG, "").replace(NEW_FLAG, "").trim();
+  const candidates = resumableRuns();
+  if (candidates.length === 0) return { none: true };
+  if (named !== "") {
+    for (const state of candidates) {
+      if (state.runId === named) return { state: state };
+    }
+    return { none: true };
+  }
+  const linked = runIdForSession(sessionId);
+  for (const state of candidates) {
+    if (state.runId === linked) return { state: state };
+  }
+  if (candidates.length === 1) return { state: candidates[0] };
+  const ids = candidates.map(function (state) {
+    return state.runId + ' at step "' + state.node + '"';
+  });
+  return {
+    error:
+      candidates.length + " runs stopped part way through: " + ids.join(", ") +
+      ". Name the one to resume, or pass --new to start a fresh run.",
+  };
+}
+
 function parkedRuns(gate) {
   let entries = [];
   try {
@@ -3137,11 +3225,40 @@ function startRun(event, sessionId) {
     );
     return;
   }
+  const argument = commandArgument(event);
+
+  // SPEC section 3.5: one static command serves both a fresh run and a run
+  // resumed at any node, which is why the command body tells the runner to stand
+  // by rather than naming a step. Gate resume has always used that. A run whose
+  // session died mid-flight can use it too, and until now nothing did, so the
+  // work was simply lost.
+  if (!NEW_FLAG.test(argument)) {
+    const stalled = askingRuns();
+    if (stalled.length > 0 && resumableRuns().length === 0) {
+      const one = stalled[0];
+      report(
+        "run " + one.runId + ' is waiting on answers before step "' + one.node +
+          '", so it needs those answers rather than a resume. Answer it, or pass --new to start ' +
+          "a fresh run.",
+      );
+      return;
+    }
+    const found = resumableRunFor(event, sessionId);
+    if (found.error) {
+      report(found.error);
+      return;
+    }
+    if (found.state) {
+      resumeRun(found.state, graph, sessionId);
+      return;
+    }
+  }
+
   const runId = mintRunId();
   // Read once, at the start, and carried for the life of the run. A run cannot
   // become unattended halfway through, and every later decision can see that the
   // answers behind it were invented.
-  const auto = AUTO_FLAG.test(commandArgument(event));
+  const auto = AUTO_FLAG.test(argument);
   const state = {
     runId: runId,
     graphHash: PLUGIN.graphHash,
@@ -3173,6 +3290,48 @@ function startRun(event, sessionId) {
     run: runId,
     node: state.node,
   });
+}
+
+/**
+ * Pick a stalled run back up where it stopped.
+ *
+ * The same three steps gate resume takes, for the same reason: the state already
+ * names the node to continue into, so resuming is flipping the status and letting
+ * the command's own body spawn a fresh runner.
+ *
+ * The auto flag is carried, never re-read from the arguments. A run cannot change its
+ * mind halfway about whether a human is behind it, and the answers already
+ * recorded were given under whichever mode was in force.
+ */
+function resumeRun(parked, graph, sessionId) {
+  if (parked.graphHash !== graph.hash) {
+    report(
+      "run " + parked.runId + " started against graph " + parked.graphHash + ", but " +
+        PLUGIN.graphFile + " now hashes to " + graph.hash +
+        ". Refusing to resume it: its nodes may have moved. Pass --new to start a fresh run.",
+    );
+    return;
+  }
+  if (needsAgent(parked.node) && typeof PLUGIN.agents[parked.node] !== "string") {
+    report('no agent is registered for node "' + parked.node + '". Regenerate the plugin.');
+    return;
+  }
+  const state = Object.assign({}, parked, { status: "running" });
+  delete state.host;
+  saveState(withScratch(state, startingScratch(state)));
+  linkSession(sessionId, state.runId);
+  appendTrace(state.runId, {
+    at: new Date().toISOString(),
+    decision: "resume",
+    session: sessionId,
+    run: state.runId,
+    node: state.node,
+    steps: state.steps,
+  });
+  report(
+    "resuming run " + state.runId + ' at step "' + state.node + '", ' + state.steps +
+      " steps in. Everything already finished is kept. Pass --new to start over instead.",
+  );
 }
 
 // A gate resume may arrive in a session that never started the run, which is the

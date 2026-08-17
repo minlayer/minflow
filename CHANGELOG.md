@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-17
+
+### Added
+
+- **A run interrupted mid-flight can be resumed from the entry command.** A long
+  workflow will be interrupted: a session limit, a closed laptop, a crash. Its
+  state was already intact and already pointed at the step it was about to take,
+  and SPEC section 3.5 already said "one static command therefore serves both a
+  fresh run and a run resumed at any node", which is how gate resume has always
+  worked. Nothing was wired to it for an interrupted run, so the work was simply
+  lost. Running the entry command again now picks the run up where it stopped and
+  reports what it resumed.
+
+  Resuming is the default, because the expensive mistake is redoing work rather
+  than continuing it. `--new` starts a fresh run and leaves the stopped one
+  alone. The auto flag is carried rather than re-read, so a run cannot change
+  halfway about whether a human is behind it. A run whose graph hash no longer
+  matches is refused rather than resumed against nodes that may have moved, and
+  several stopped runs are named rather than guessed between. A run stopped
+  mid-ask is reported as needing its answers, not resumed past them.
+
+- The entry command now always carries an `argument-hint`, since every workflow
+  can be interrupted and therefore resumed.
+
 ## [0.1.4] - 2026-08-17
 
 ### Fixed
@@ -168,7 +192,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Vitest test suite, and GitHub Actions for CI and publishing.
 - Placeholder release reserving the `minflow` package name on npm.
 
-[Unreleased]: https://github.com/minlayer/minflow/compare/v0.1.4...HEAD
+[Unreleased]: https://github.com/minlayer/minflow/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/minlayer/minflow/compare/v0.1.4...v0.2.0
 [0.1.4]: https://github.com/minlayer/minflow/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/minlayer/minflow/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/minlayer/minflow/compare/v0.1.1...v0.1.2

@@ -81,6 +81,23 @@ Every compiled workflow also accepts `--auto` on its entry command, which answer
 its own questions and runs unattended. It is the same mechanism either way, so an
 unattended run exercises the real ask path rather than a mode that skips it.
 
+### A run you can pick back up
+
+A long workflow will be interrupted. A session limit, a closed laptop, a crash.
+Running the entry command again **resumes where it stopped** and says so, rather
+than starting over:
+
+```
+resuming run run-20260817045146-b71a96 at step "draft-findings", 12 steps in.
+Everything already finished is kept. Pass --new to start over instead.
+```
+
+Resuming is the default because the expensive mistake is redoing work, not
+continuing it. `--new` starts fresh and leaves the stopped run alone. A run whose
+graph has changed underneath it is refused rather than resumed against nodes that
+may have moved, and when several runs are stopped it names them instead of
+guessing.
+
 ### Sign-off that actually blocks
 
 `wf.gate()` parks the run and waits for a human to release it, across sessions if
@@ -205,9 +222,10 @@ registrations are scoped so that nothing fires during unrelated work.
 ## Status
 
 Working: the builder, the IR, the graph lint, the transition evaluator, run
-context interpolation, command nodes, interactive asks, auto mode, skills shipped
-inside the plugin, skill validation, Mermaid output, generated tests, and the
-Claude Code backend. 640 tests, none of which need a model.
+context interpolation, command nodes, interactive asks, auto mode, resuming an
+interrupted run, skills shipped inside the plugin, skill validation, Mermaid
+output, generated tests, and the Claude Code backend. 646 tests, none of which
+need a model.
 
 A compiled workflow runs: the transition cycle, a judge verdict, a gate parked in
 one session and released in another, a retry to its limit, a command node routing
