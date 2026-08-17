@@ -42,6 +42,24 @@ function retriedCommand() {
   return wf.compile();
 }
 
+/**
+ * A graph whose entry is a command node.
+ *
+ * It drains during the start itself, before any step has stopped, so there is no
+ * earlier fire to hang its answers on.
+ */
+function commandAtEntry() {
+  const wf = workflow({ name: "command-at-entry" });
+  wf.run("check", { command: "true" });
+  wf.step("fix", { skill: "s" });
+  wf.step("ship", { skill: "s" });
+  wf.entry("check");
+  wf.edge("check", "ship", when.field("exitCode").equals(0), { otherwise: "fix" });
+  wf.edge("fix", "check");
+  wf.edge("ship", END);
+  return wf.compile();
+}
+
 const skills = () => [Skill.from({ name: "s", description: "Does a step.", body: "# s\n" })];
 
 describe("what a graph can decide", () => {
@@ -180,6 +198,28 @@ describe("running a plan against the emitted dispatcher", () => {
       (entry) => entry.walk.filter((node) => node === "build").length === 2,
     );
     expect(failsThenPasses?.walk).toEqual(["draft", "build", "build", "ship"]);
+
+    const result = runSuite(graph, plan, { skills: skills() });
+    for (const testCase of result.cases) {
+      expect({ id: testCase.id, problems: testCase.problems }).toEqual({
+        id: testCase.id,
+        problems: [],
+      });
+    }
+  });
+
+  it("answers a command node that drains during the start", () => {
+    const graph = commandAtEntry();
+    const plan = generateSuite(graph);
+
+    // Every other command node is drained on the fire belonging to the step
+    // before it, and that is where its answers are written. An entry command
+    // node has no step before it: it runs while the runner is still standing by
+    // for the first time. Its answers were never written at all, so it resolved
+    // against the world, the command succeeded, and the case that needed it to
+    // fail first walked straight past the divert.
+    const diverting = plan.cases.find((entry) => entry.walk.includes("fix"));
+    expect(diverting?.walk).toEqual(["check", "fix", "check", "ship"]);
 
     const result = runSuite(graph, plan, { skills: skills() });
     for (const testCase of result.cases) {
