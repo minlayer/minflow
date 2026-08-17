@@ -716,7 +716,7 @@ function stringGenerator(seed: number): (pattern: string, match: boolean) => str
     if (!match) {
       // Almost anything fails a pattern; check rather than assume, since a
       // pattern like /.*/ matches everything and cannot be falsified.
-      for (const candidate of ["minflow-no-match", "", " "]) {
+      for (const candidate of ["minflow-no-match", "", " "]) {
         if (!new RegExp(pattern).test(candidate)) return candidate;
       }
       return "minflow-no-match";

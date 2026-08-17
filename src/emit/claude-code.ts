@@ -2122,11 +2122,33 @@ const AUTO_FLAG = /(^|\s)--auto\b/;
 // same line every unit test draws around a mock. A real run never sets it.
 const TEST_OBSERVATIONS = process.env.MINFLOW_TEST_OBSERVATIONS || "";
 
+// How many resolution passes this process has already run for each node.
+//
+// A retry sends a command node back to itself without leaving the dispatcher, so
+// both visits happen inside one fire and share this process. The harness is
+// blocked while that runs and cannot rewrite the file between them, which means
+// the visits have to be told apart from in here or the second silently answers
+// with the first's values.
+const stubVisits = Object.create(null);
+
+// A resolution pass is about to run for this node.
+function advanceStubVisit(node) {
+  if (TEST_OBSERVATIONS === "" || typeof node !== "string") return;
+  stubVisits[node] = (stubVisits[node] === undefined ? -1 : stubVisits[node]) + 1;
+}
+
 // One stubbed answer, or null when there is none for this node and key.
 function stubFor(node, key) {
   const stubs = stubbedObservations();
   if (stubs === null || typeof node !== "string") return null;
-  const forNode = stubs[node];
+  let forNode = stubs[node];
+  // A list is one entry per visit, in order. Past its end the last entry stands,
+  // so a node answered the same way every time needs no list at all.
+  if (Array.isArray(forNode)) {
+    if (forNode.length === 0) return null;
+    const visit = stubVisits[node] === undefined ? 0 : stubVisits[node];
+    forNode = forNode[visit < forNode.length ? visit : forNode.length - 1];
+  }
   if (forNode === null || typeof forNode !== "object" || !Object.hasOwn(forNode, key)) return null;
   return forNode[key];
 }
@@ -3323,6 +3345,8 @@ function settle(graph, state) {
       start: false,
     };
 
+    advanceStubVisit(current.node);
+
     const resolved = {};
     for (const request of runtime.observationsFor(graph, current)) {
       if (request.kind === "judge") {
@@ -3799,6 +3823,7 @@ function onSubagentStop(event, state) {
   // guards run out of budget here, visibly, rather than running out of the
   // platform's hook timeout, which would discard this process's output whole.
   startGuardBudget();
+  advanceStubVisit(state.node);
 
   const resolved = {};
   let outstanding = null;

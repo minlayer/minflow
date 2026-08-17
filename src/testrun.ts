@@ -203,11 +203,29 @@ function runCase(graph: Graph, pluginDir: string, scratch: string, testCase: Tes
     // Keyed by node: this fire may resolve observations for this step and for
     // every command node drained after it, and they share the inline payload
     // key. Flattening them would let one node's payload become another's.
-    const answering: Record<string, Observations> = { [step.node]: step.observations };
+    //
+    // A node can also appear twice in the same fire, which is what a retry to a
+    // command node is, and then one entry per node is not enough either: the
+    // case that fails a build once and passes it on the retry needs the two
+    // visits answered differently. Repeats become a list the dispatcher consumes
+    // in order.
+    const answering: Record<string, Observations | Observations[]> = {};
+    const answerWith = (node: string, observations: Observations): void => {
+      const already = answering[node];
+      if (already === undefined) {
+        answering[node] = observations;
+      } else if (Array.isArray(already)) {
+        already.push(observations);
+      } else {
+        answering[node] = [already, observations];
+      }
+    };
+
+    answerWith(step.node, step.observations);
     for (let ahead = index + 1; ahead < testCase.steps.length; ahead += 1) {
       const next = testCase.steps[ahead];
       if (next === undefined || !commandNodes.has(next.node)) break;
-      answering[next.node] = next.observations;
+      answerWith(next.node, next.observations);
     }
 
     writeFileSync(stubs, JSON.stringify(answering), "utf8");
