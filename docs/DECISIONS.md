@@ -242,6 +242,70 @@ Only ergonomics need a human session.
 
 **Revisit when** a second backend exists, since that is the point at which a portable doorway starts being worth something.
 
+### D28. Model selection leaks provider names into the IR, and is left leaking for now
+
+**Decided:** `model` stays a free-form `string` holding a provider's own model
+name, and the debt is written down rather than paid today.
+
+**The problem.** The IR's entire claim is that it is platform-independent. §1
+puts it plainly, and the README's "Why a compiler" says everything valuable lives
+at that level and "outlives any one platform". Then `Node.model` holds
+`"haiku"`, `"sonnet"` or `"opus"`, which are Anthropic product names. A workflow
+definition that names one has a Claude Code dependency written into the layer
+whose purpose is not having one, and a second backend cannot read it without
+either understanding Anthropic's product line or rejecting the graph.
+
+It is worse than a naming problem, in two ways that make it a real defect rather
+than an aesthetic complaint:
+
+- **Nothing validates it.** `builder.ts` assigns `options.model` straight through
+  with no check, so `"sonnett"` compiles clean and produces an agent that names a
+  model the platform does not have. Everywhere else the compiler is fastidious
+  about exactly this class of mistake: an unknown node reference throws on the
+  line that contains it, a `{{ctx}}` reference that does not dominate is a
+  compile error, a skill whose frontmatter would not load is refused. This is a
+  hole in that discipline.
+- **The backend does no translating.** The emitter copies the value verbatim into
+  the agent's frontmatter. So the one place where adaptation belongs, and would be
+  trivial, does nothing, which is the layering rule in AGENTS.md inverted: the IR
+  carries the platform detail and the backend passes it through.
+
+**`tools` has the identical leak**, and is latent only because nothing uses it
+yet: a tool allowlist would carry Claude Code tool names (`Read`, `Bash`,
+`WebSearch`) in the same provider-agnostic interface.
+
+**What it should be.** An agnostic capability tier in the IR, translated per
+backend:
+
+```
+model?: "small" | "medium" | "large"
+```
+
+with the Claude Code backend mapping `small` to `haiku`, `medium` to `sonnet`,
+`large` to `opus`, and absent meaning inherit. Size words rather than
+`fast`/`balanced`/`deep` because the axis authors actually reason about is how
+much capability to spend, and because a tier is a relative claim within one
+provider's line rather than an absolute one. Three tiers rather than five because
+every current provider ships about three, and a tier nothing maps to is worse
+than a tier that is missing.
+
+An enum also buys the validation the string cannot have: a bad tier becomes a
+compile error, at the authoring line, like every other authoring mistake.
+
+**Considered and rejected: pinning exact models in the IR anyway**, on the
+argument that reproducibility needs an exact version. It does, but that belongs in
+`EmitOptions`, where every other platform-specific fact already lives, as a
+per-backend override map. The graph says how much capability a step deserves; the
+emit call says which model that means today. Those are different lifetimes: the
+first is a property of the workflow, the second changes every few months.
+
+**Why it is left for now.** The rename is breaking, it touches the IR, the
+builder, the emitter, the SPEC's node table and every graph in the wild, and it
+arrived in the middle of a cost fix that needed to land. Live with it knowingly.
+The mitigation is indirection at the call site: nimble-researcher declares three
+named tiers in one place, so the eventual migration is three lines rather than
+thirteen. Recorded as L23.
+
 ### D22. Track the emerging portable orchestration API
 
 **Observed:** a third party has ported `agent()` / `parallel()` / `pipeline()` to run against Codex, Gemini, and pi, script shape unchanged.

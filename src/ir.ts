@@ -97,11 +97,22 @@ export interface StepNode extends NodeBase {
   params?: Record<string, JsonValue>;
   /** Structured-output contract for the step, as JSON Schema. */
   schema?: JsonValue;
-  /** Per-node model override. Defaults to inheriting the session's. */
+  /**
+   * Per-node model override. Defaults to inheriting the session's.
+   *
+   * **A known defect, deliberately unpaid: this holds a provider's own model
+   * name.** `"haiku"` in an IR whose whole claim is to outlive any one platform
+   * is a Claude Code dependency written into the layer that exists not to have
+   * one, and nothing validates it, so a misspelling compiles clean and names a
+   * model the platform does not have. It should be an agnostic tier, `small`,
+   * `medium` or `large`, translated by each backend, with exact pinning moved to
+   * the emit call where every other platform-specific fact already lives.
+   * Changing it is breaking, so it waits. See D28 and L23.
+   */
   model?: string;
-  /** Per-step turn ceiling. */
+  /** Per-step turn ceiling. Provider-agnostic: a turn is a turn. */
   maxTurns?: number;
-  /** Tool allowlist for the step. */
+  /** Tool allowlist for the step. Carries the same leak as {@link model}. */
   tools?: string[];
 }
 
