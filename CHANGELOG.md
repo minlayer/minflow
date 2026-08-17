@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-08-17
+
+### Fixed
+
+- A generated case that visits one node twice in a single hook fire now
+  answers each visit in turn. A retry whose guard leaves a command node sends
+  that node back to itself, and a command node is drained without leaving the
+  dispatcher, so both visits happen in one process and the harness cannot
+  rewrite its answers between them. Answering per node let the second visit
+  overwrite the first, so a case meant to fail a build once and pass it on the
+  retry advanced on the first attempt, and the walk check blamed the graph for
+  it.
+- `src` ships in the package. The maps in `dist` name `../src/*.ts`, which was
+  not there, so every stack trace through minflow pointed at a file the tarball
+  did not contain.
+- `minflow test` prints paths relative to the working directory when they are
+  under it, rather than absolute ones.
+- `minflow test` no longer reports unreachable outcomes as "not covered"
+  directly beneath the count of covered ones, which read as a contradiction.
+  They are outcomes nothing can reach, the reachable count already excludes
+  them, and each still carries its reason.
+- A literal NUL in `testsuite.ts` made the file binary to `grep` and every tool
+  that reads it as text.
+
 ## [0.1.0] - 2026-08-17
 
 ### Added
@@ -100,7 +124,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Vitest test suite, and GitHub Actions for CI and publishing.
 - Placeholder release reserving the `minflow` package name on npm.
 
-[Unreleased]: https://github.com/minlayer/minflow/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/minlayer/minflow/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/minlayer/minflow/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/minlayer/minflow/compare/v0.0.1...v0.1.0
 [0.0.1]: https://github.com/minlayer/minflow/compare/v0.0.0...v0.0.1
 [0.0.0]: https://github.com/minlayer/minflow/releases/tag/v0.0.0
