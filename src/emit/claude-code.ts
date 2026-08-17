@@ -142,6 +142,11 @@ export interface PluginAuthor {
  */
 export const ASK_MARKER = "MINFLOW-ASK";
 
+// How a run is told to answer its own questions. An argument rather than an
+// environment variable, so a run that was unattended is visible in its own
+// transcript, which is exactly where you look when you doubt an answer.
+const AUTO_FLAG = /(^|\s)--auto(\s|$)/;
+
 /** Where a plugin's skills live, per the Agent Plugins layout. */
 export const SKILLS_DIR = "skills";
 
@@ -912,8 +917,10 @@ function hooksFor(pluginName: string, commands: string[]): string {
  * blocks that expansion and takes over, so the text matters only when routing is
  * disabled or the plugin is inspected by hand.
  */
-function commandFor(description: string, body: string): string {
-  return frontmatter([["description", yaml(oneLine(description))]], body);
+function commandFor(description: string, body: string, argumentHint?: string): string {
+  const fields: [string, string][] = [["description", yaml(oneLine(description))]];
+  if (argumentHint !== undefined) fields.push(["argument-hint", yaml(argumentHint)]);
+  return frontmatter(fields, body);
 }
 
 /**
@@ -995,6 +1002,9 @@ function runCommandFile(ir: Graph, pluginName: string): string {
       `Start the **${oneLine(ir.name)}** workflow, which begins at \`${ir.entry}\`.`,
       graphAsks(ir),
     ),
+    // Only offered when there is something to answer. A flag advertised on a
+    // workflow that never asks is a flag that does nothing.
+    graphAsks(ir) ? "[--auto to answer the run's own questions instead of asking you]" : undefined,
   );
 }
 
@@ -1653,6 +1663,8 @@ function cloneState(state) {
   // Carried through opaquely. The host owns this; we neither read it nor drop
   // it, and dropping it would strand whatever multi-pass work it is tracking.
   if (state.host !== undefined) next.host = Object.assign({}, state.host);
+  // Carried, not dropped: it is a property of the run, not of a transition.
+  if (state.auto !== undefined) next.auto = state.auto;
   return next;
 }
 
@@ -1674,6 +1686,8 @@ function runningClone(state) {
     outputs: Object.assign({}, state.outputs),
   };
   if (state.host !== undefined) next.host = Object.assign({}, state.host);
+  // Carried, not dropped: it is a property of the run, not of a transition.
+  if (state.auto !== undefined) next.auto = state.auto;
   return next;
 }
 
@@ -2088,6 +2102,11 @@ const COMMAND_OUTPUT_MAX = 1048576;
 // questions file that does not exist. The same literal appears in the run
 // command's body; a test holds the two together.
 const ASK_MARKER = "MINFLOW-ASK";
+
+// How a run is told to answer its own questions. An argument rather than an
+// environment variable, so a run that was unattended is visible in its own
+// transcript, which is exactly where you look when you doubt an answer.
+const AUTO_FLAG = /(^|\s)--auto(\s|$)/;
 
 // One budget for a whole resolution pass, not one per command.
 //
@@ -3061,6 +3080,10 @@ function startRun(event, sessionId) {
     return;
   }
   const runId = mintRunId();
+  // Read once, at the start, and carried for the life of the run. A run cannot
+  // become unattended halfway through, and every later decision can see that the
+  // answers behind it were invented.
+  const auto = AUTO_FLAG.test(commandArgument(event));
   const state = {
     runId: runId,
     graphHash: PLUGIN.graphHash,
@@ -3068,6 +3091,7 @@ function startRun(event, sessionId) {
     status: "running",
     attempts: {},
     steps: 0,
+    auto: auto,
     outputs: {},
   };
   if (needsAgent(state.node) && typeof PLUGIN.agents[state.node] !== "string") {
@@ -3382,6 +3406,25 @@ function act(graph, state, transition) {
     return;
   }
 
+  if (transition.kind === "ask" && state.auto === true) {
+    // Unattended. The questions never leave for the session; the runner answers
+    // them, which is the judge round trip of section 3.3 carrying a JSON object
+    // rather than one word. Marked relayed because there is nothing to relay.
+    const pending = transition.state;
+    pending.ask.relayed = true;
+    pending.ask.auto = true;
+    saveState(departed(pending));
+    appendTrace(state.runId, {
+      at: new Date().toISOString(),
+      decision: "ask-auto",
+      run: state.runId,
+      node: state.node,
+      questions: transition.questions.length,
+    });
+    block(autoAskReason(transition.questions));
+    return;
+  }
+
   if (transition.kind === "ask") {
     // Beat one of three. A subagent cannot reach the user, so the questions have
     // to travel out to the session, and the only channel to it is the runner's
@@ -3408,6 +3451,29 @@ function act(graph, state, transition) {
         "",
         ASK_MARKER + " " + target,
       ].join("\n"),
+    );
+    return;
+  }
+
+  if (transition.kind === "gate" && state.auto === true) {
+    // A gate is a wall, not a pause. An ask exists because the workflow needs a
+    // fact and inventing one unattended is reasonable; a gate exists because a
+    // person has to look, and waving that through would make gates meaningless.
+    // A workflow that cannot be smoke tested without passing a gate has said
+    // something about where its gate is.
+    saveState(departed(transition.state));
+    appendTrace(state.runId, {
+      at: new Date().toISOString(),
+      decision: "gate-blocked-auto",
+      run: state.runId,
+      node: state.node,
+      gate: transition.gate,
+    });
+    deleteState(state.runId);
+    report(
+      "run " + state.runId + ' reached the "' + transition.gate + '" gate and stopped, because ' +
+        "it was started with --auto. A gate waits for a person to look at something, so an " +
+        "unattended run does not pass one. Everything before the gate ran.",
     );
     return;
   }
@@ -3457,6 +3523,70 @@ function act(graph, state, transition) {
   report("run " + state.runId + " stopped: [" + transition.code + "] " + transition.message);
 }
 
+// What the runner is told when a run answers its own questions.
+//
+// The options are enumerated verbatim, so the answer is a choice from a closed
+// set rather than free composition, which is what makes validating it possible.
+function autoAskReason(questions) {
+  const lines = [
+    "minflow: this run was started with --auto, so it answers its own questions.",
+    "",
+    "Answer each of these as the most sensible default for an unattended run. Do not ask",
+    "anyone, and do not stop to think aloud.",
+    "",
+  ];
+  for (const question of questions) {
+    lines.push("- " + question.header + ": " + question.question);
+    for (const option of question.options) {
+      lines.push(
+        "    " + option.label + (option.description ? "  (" + option.description + ")" : ""),
+      );
+    }
+  }
+  lines.push(
+    "",
+    "Reply with ONLY a JSON object mapping each header above to the exact label you chose,",
+    "in a single fenced json block, with nothing after it.",
+  );
+  return lines.join("\n");
+}
+
+// The runner's answers, folded onto the options that were actually offered.
+//
+// A label nobody offered is replaced with the first option rather than stalling
+// the run: an unattended run that hangs on its own invented answer has defeated
+// its purpose. Every substitution is returned so it can be recorded, because the
+// difference between "it chose this" and "it was corrected to this" is the whole
+// value of the trace afterwards.
+function foldAutoAnswers(questions, reported) {
+  const answers = {};
+  const corrections = [];
+  const given = reported !== null && typeof reported === "object" && !Array.isArray(reported)
+    ? reported
+    : {};
+
+  for (const question of questions) {
+    const labels = question.options.map(function (option) {
+      return option.label;
+    });
+    const fallback = labels.length > 0 ? labels[0] : "";
+    const raw = given[question.header];
+    const chosen = typeof raw === "string" ? raw.trim() : "";
+
+    if (labels.indexOf(chosen) !== -1) {
+      answers[question.header] = chosen;
+      continue;
+    }
+    answers[question.header] = fallback;
+    corrections.push({
+      header: question.header,
+      answered: chosen === "" ? null : chosen,
+      used: fallback,
+    });
+  }
+  return { answers: answers, corrections: corrections };
+}
+
 // Beats two and four of an ask.
 //
 // Two: the runner has just said the marker line. Rendering no decision is what
@@ -3464,7 +3594,7 @@ function act(graph, state, transition) {
 //
 // Four: the session has asked, written the answers, and spawned the runner
 // again. The answers become an output like any other and the run carries on.
-function onAskStop(state) {
+function onAskStop(event, state) {
   const ask = state.ask;
   if (ask === null || ask === undefined) {
     report(
@@ -3491,6 +3621,22 @@ function onAskStop(state) {
     return;
   }
 
+  if (ask.auto === true) {
+    const parsed = parseInlinePayload(event.last_assistant_message);
+    const folded = foldAutoAnswers(ask.questions, parsed.ok ? parsed.value : null);
+    appendTrace(state.runId, {
+      at: new Date().toISOString(),
+      decision: "ask-auto-answered",
+      run: state.runId,
+      node: state.node,
+      as: ask.as,
+      answers: folded.answers,
+      corrections: folded.corrections,
+      unparseable: parsed.ok ? null : parsed.error,
+    });
+    return resumeFromAsk(state, ask, folded.answers);
+  }
+
   const answers = readAskAnswers(state.runId);
   if (!answers.ok) {
     if (answers.missing) {
@@ -3508,6 +3654,19 @@ function onAskStop(state) {
     return;
   }
 
+  appendTrace(state.runId, {
+    at: new Date().toISOString(),
+    decision: "ask-answered",
+    run: state.runId,
+    node: state.node,
+    as: ask.as,
+  });
+  return resumeFromAsk(state, ask, answers.value);
+}
+
+// One resume path, whichever way the answers arrived. The answers become an
+// output under the ask's own id and the run carries on from where it parked.
+function resumeFromAsk(state, ask, answers) {
   const graph = requireGraph();
   if (graph === null) return;
 
@@ -3516,16 +3675,9 @@ function onAskStop(state) {
   delete next.host;
   next.status = "running";
   next.outputs = Object.assign({}, state.outputs);
-  next.outputs[ask.as] = answers.value;
+  next.outputs[ask.as] = answers;
   next.steps = state.steps + 1;
 
-  appendTrace(state.runId, {
-    at: new Date().toISOString(),
-    decision: "ask-answered",
-    run: state.runId,
-    node: next.node,
-    as: ask.as,
-  });
   clearAskFiles(state.runId);
 
   const landed = settle(graph, next);
@@ -3548,7 +3700,7 @@ function onSubagentStop(event, state) {
   // No state means this runner is not ours, or its run is already finished.
   // Saying nothing is the whole of the zero-idle-footprint requirement (D9).
   if (state === null) return;
-  if (state.status === "asking") return onAskStop(state);
+  if (state.status === "asking") return onAskStop(event, state);
   if (state.status !== "running") return;
 
   const graph = requireGraph();

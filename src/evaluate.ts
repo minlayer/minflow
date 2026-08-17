@@ -418,6 +418,11 @@ function cloneState(state: RunState): RunState {
   // Carried through opaquely. The host owns this; we neither read it nor drop
   // it, and dropping it would strand whatever multi-pass work it is tracking.
   if (state.host !== undefined) next.host = { ...state.host };
+  // Carried, not dropped. It is a property of the whole run rather than of any
+  // one transition, and a run that silently stopped being unattended halfway
+  // through would answer its first questions itself and then wait forever for
+  // somebody to answer the rest.
+  if (state.auto !== undefined) next.auto = state.auto;
   return next;
 }
 
@@ -445,6 +450,11 @@ function runningClone(state: RunState): RunState {
     outputs: { ...state.outputs },
   };
   if (state.host !== undefined) next.host = { ...state.host };
+  // Carried, not dropped. It is a property of the whole run rather than of any
+  // one transition, and a run that silently stopped being unattended halfway
+  // through would answer its first questions itself and then wait forever for
+  // somebody to answer the rest.
+  if (state.auto !== undefined) next.auto = state.auto;
   return next;
 }
 

@@ -402,6 +402,14 @@ export interface RunState {
   gate?: string;
   /** The ask in flight, when status is `asking`. */
   ask?: PendingAsk;
+  /**
+   * Whether this run answers its own questions instead of putting them to a user.
+   *
+   * Set once at the start and carried for the life of the run, so a run cannot
+   * become unattended halfway through, and so every later decision can see that
+   * the answers behind it were invented.
+   */
+  auto?: boolean;
   /** Retry counts, keyed by edge id. */
   attempts: Record<string, number>;
   /** Total steps taken, against the run-wide ceiling. */
@@ -472,6 +480,14 @@ export interface PendingAsk {
   questions: AskQuestion[];
   /** Whether the questions have been handed off to whatever can ask them. */
   relayed: boolean;
+  /**
+   * Whether the answers come from the runner rather than from a user.
+   *
+   * Recorded on the ask rather than read from the run, because it decides where
+   * the *answers* are looked for, and looking in the wrong place is the one way
+   * this can hang.
+   */
+  auto?: boolean;
 }
 
 // ---------------------------------------------------------------------------

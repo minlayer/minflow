@@ -1363,7 +1363,7 @@ interface Harness {
    * then stands by and stops, and it is that stop, a `SubagentStop`, which gets
    * redirected into the first step. Returns the redirect.
    */
-  begin(session?: string): Fired;
+  begin(session?: string, args?: string): Fired;
 }
 
 /** A `SubagentStop` payload: the runner has stopped, and this is what it said. */
@@ -1450,9 +1450,9 @@ async function withPlugin(
           stderr: finished.stderr,
         };
       },
-      begin(session = "session-1") {
+      begin(session = "session-1", args = "") {
         const name = pluginNameFor(ir);
-        const started = harness.fire(typed(`${name}:run-${name}`, session));
+        const started = harness.fire(typed(`${name}:run-${name}`, session, args));
         // Seeding only. A decision here would cancel the command.
         expect(started.decision).toBeNull();
         return harness.fire(stopped("Standing by.", session));
@@ -1521,6 +1521,9 @@ describe("a run, driven through the emitted dispatcher", () => {
         status: "running",
         attempts: {},
         steps: 0,
+        // Read once from the command's arguments and carried for the life of the
+        // run, so a run cannot become unattended halfway through.
+        auto: false,
         outputs: {},
         // Marked as not started, so the runner's first stop hands over the entry
         // step instead of evaluating guards on a node that has not run.
@@ -3532,5 +3535,128 @@ describe("skills shipped inside the plugin", () => {
     // `commandIr()` has a command node, which names no skill. Supplying only the
     // step skill has to be a complete set.
     expect(() => emit(commandIr(), { skills: suppliedSkills() })).not.toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Auto mode
+// ---------------------------------------------------------------------------
+
+/** A graph that asks, then gates, so both auto behaviours are reachable. */
+function autoIr(): Graph {
+  const wf = workflow({ name: "unattended" });
+  wf.step("scan", { skill: "s", output: { ready: "boolean" } });
+  wf.step("write", { skill: "s" });
+  wf.step("ship", { skill: "s" });
+  wf.entry("scan");
+  wf.ask("scan", "write", {
+    questions: [
+      {
+        question: "Which lane?",
+        header: "Lane",
+        options: [{ label: "Fast" }, { label: "Thorough" }],
+      },
+      {
+        question: "Who is running this?",
+        header: "Owner",
+        options: [{ label: "Nobody" }, { label: "Somebody" }],
+      },
+    ],
+  });
+  wf.gate("write", "ship", { command: "approve" });
+  wf.edge("ship", END);
+  return wf.compile();
+}
+
+describe("a run started with --auto", () => {
+  it("answers its own questions without ever reaching the session", async () => {
+    await withPlugin(autoIr(), (plugin) => {
+      plugin.begin("session-1", "--auto");
+      expect(plugin.onlyRun().auto).toBe(true);
+
+      // The step reports, and the runner is asked for the answers directly.
+      // Nothing is written for a session to read, and no marker is emitted.
+      const asked = plugin.fire(stopped(reported({ ready: true })));
+      expect(asked.decision?.decision).toBe("block");
+      expect(asked.reason).not.toContain(ASK_MARKER);
+      expect(asked.reason).toContain("Which lane?");
+      expect(asked.reason).toContain("Thorough");
+      expect(asked.reason).toContain("--auto");
+
+      // It answers, and the run continues with no human anywhere.
+      const resumed = plugin.fire(stopped(reported({ Lane: "Thorough", Owner: "Nobody" })));
+      expect(resumed.decision?.decision).toBe("block");
+      expect(resumed.reason).toContain("unattended:step-write");
+      expect(plugin.onlyRun().outputs["scan-answers"]).toEqual({
+        Lane: "Thorough",
+        Owner: "Nobody",
+      });
+    });
+  });
+
+  it("corrects an answer nobody offered rather than stalling on it", async () => {
+    await withPlugin(autoIr(), (plugin) => {
+      plugin.begin("session-1", "--auto");
+      plugin.fire(stopped(reported({ ready: true })));
+
+      // "Medium" was never an option, and Owner is missing entirely.
+      const resumed = plugin.fire(stopped(reported({ Lane: "Medium" })));
+      expect(resumed.decision?.decision).toBe("block");
+      expect(plugin.onlyRun().outputs["scan-answers"]).toEqual({
+        Lane: "Fast",
+        Owner: "Nobody",
+      });
+
+      // And the correction is in the trace, because "it chose this" and "it was
+      // corrected to this" are different facts about the run.
+      const answered = plugin.trace().find((entry) => entry.decision === "ask-auto-answered");
+      expect(answered?.corrections).toEqual([
+        { header: "Lane", answered: "Medium", used: "Fast" },
+        { header: "Owner", answered: null, used: "Nobody" },
+      ]);
+    });
+  });
+
+  it("records an unparseable reply rather than pretending it answered", async () => {
+    await withPlugin(autoIr(), (plugin) => {
+      plugin.begin("session-1", "--auto");
+      plugin.fire(stopped(reported({ ready: true })));
+      plugin.fire(stopped("I have thought about it at length but produced no JSON."));
+
+      const answered = plugin.trace().find((entry) => entry.decision === "ask-auto-answered");
+      expect(answered?.unparseable).not.toBeNull();
+      // It still proceeds, on the first option of each question.
+      expect(plugin.onlyRun().outputs["scan-answers"]).toEqual({
+        Lane: "Fast",
+        Owner: "Nobody",
+      });
+    });
+  });
+
+  it("stops at a gate, because a gate is a wall", async () => {
+    await withPlugin(autoIr(), (plugin) => {
+      plugin.begin("session-1", "--auto");
+      plugin.fire(stopped(reported({ ready: true })));
+      plugin.fire(stopped(reported({ Lane: "Fast", Owner: "Nobody" })));
+
+      // `write` finishes and the next transition is the gate.
+      const gated = plugin.fire(stopped("wrote it"));
+      expect(gated.decision).toBeNull();
+      expect(gated.stderr).toContain('reached the "approve" gate and stopped');
+      expect(gated.stderr).toContain("--auto");
+      // The run is over rather than parked: nothing is coming to release it.
+      expect(plugin.runs()).toHaveLength(0);
+      expect(plugin.trace().some((entry) => entry.decision === "gate-blocked-auto")).toBe(true);
+    });
+  });
+
+  it("leaves an ordinary run entirely alone", async () => {
+    await withPlugin(autoIr(), (plugin) => {
+      plugin.begin();
+      expect(plugin.onlyRun().auto).toBe(false);
+      const asked = plugin.fire(stopped(reported({ ready: true })));
+      // The marker path, unchanged.
+      expect(asked.reason).toContain(ASK_MARKER);
+    });
   });
 });

@@ -47,62 +47,99 @@ wf.branch("review", judge("Are there unresolved findings?"), {
 await claudeCode.writeFiles(claudeCode.emit(wf.compile()), "./research-ship");
 ```
 
+## What you get
+
+### Routing nothing can talk its way out of
+
+Every transition is decided by evaluating a table in code. A model never chooses
+what happens next, it only produces the value a guard reads.
+
 `when.*` is a library of mechanical predicates that cost no tokens: an exit code,
 a file on disk, a field of a step's output. `judge()` is the one conspicuous way
 to ask a model for a verdict, so reaching for judgment is a visible decision
-rather than an accident.
+rather than something that happens by default.
 
-Three kinds of node and edge do the work that prose in a skill file cannot:
+### Steps that are not model calls
 
-| | What it is |
-|---|---|
-| `wf.run()` | A **command node**. Runs a shell command instead of a model, records `{ exitCode, stdout, stderr }` as its output, and costs no model call and no round trip |
-| `wf.ask()` | Puts questions to the user and **resumes on its own**. Nobody types a command to continue |
-| `wf.gate()` | Parks for human sign-off and waits for a resume command. A wall, not a pause |
+`wf.run("check", { command: "npm test" })` runs a shell command instead of a
+model. Its output is `{ exitCode, stdout, stderr }`, which guards read like any
+other payload, and a chain of them resolves between two of the runner's stops.
+Anything a script can decide costs no model call, no round trip, and cannot be
+graded generously by the thing it is checking.
 
-An ask and a gate look similar and are not: an ask needs a fact, a gate needs a
-person to look.
+### Questions that answer themselves back into the run
 
-A step reads an earlier step's output by interpolating it:
+`wf.ask()` puts questions to the user and the run **resumes on its own**. Nobody
+types a command to continue.
+
+That is harder than it sounds and is why it is a feature rather than a line of
+prose in a skill: a subagent has no way to reach the user at all. The questions
+travel out through the runner's final message, the answers come back through a
+file, and the run picks up where it left off.
+
+### Sign-off that actually blocks
+
+`wf.gate()` parks the run and waits for a human to release it, across sessions if
+need be.
+
+An ask and a gate look similar and are not. **An ask needs a fact. A gate needs a
+person to look.** That distinction is enforced rather than documented: an
+unattended run answers asks and refuses to pass a gate, because a mode that
+removes the human from the one mechanism whose purpose is human judgment would
+make gates meaningless.
+
+### Reading an earlier step's output, with a proof
 
 ```ts
 wf.step("plan", { skill: "write-plan", prompt: "Write a plan from:\n\n{{ctx.research.notes}}" });
 ```
 
-That reference is legal only when `research` **dominates** `plan`, meaning every
-route through the graph reaches `plan` through `research`, so the value cannot be
-present on one branch and missing on another. When it is not, compiling fails and
-names a route that reaches `plan` while skipping `research`, rather than leaving
+Legal only when `research` **dominates** `plan`, meaning every route through the
+graph reaches `plan` through `research`. When it does not, compiling fails and
+names the route that reaches `plan` while skipping `research`, instead of leaving
 you to find out on the branch nobody tested.
 
-## Skills ship inside the plugin
+### Skills that ship, and stay private
 
-`emit` takes the skills a graph names and writes them into the plugin, **every
-copy `user-invocable: false`**. A compiled workflow has exactly one public
-surface, its entry command; its steps are implementation, and a plugin exposing
-each internal step as a separately invocable skill has as many public surfaces as
-it has steps.
+`emit` writes every skill the graph names into the plugin, each copy
+`user-invocable: false`. A compiled workflow has exactly one public surface, its
+entry command. Its steps are implementation, and a plugin exposing each internal
+step as a separately invocable skill has as many public surfaces as it has steps.
 
 Your own files are untouched. These are copies, which is what a compiler does
-with source. `Skill` reads one from a directory, brings its bundled
+with source. `Skill` reads one from its directory, brings the bundled
 `references/` and `scripts/` along, types the fields minflow reasons about, and
-carries every other frontmatter field through the round trip unchanged.
+carries every other frontmatter field through unchanged.
 
-Two things worth running before you ship a workflow:
+### Mistakes caught before anything runs
+
+Unreachable nodes, dead ends, cycles that provably cannot terminate, a `ctx`
+reference to a step that might not have run, a judge guard on an edge leaving a
+command node: all compile errors, all reported at the line that caused them.
 
 ```ts
-import { checkSkills, discoverSkills, toMermaid } from "minflow";
-
 const problems = checkSkills(ir, await discoverSkills([".claude/skills"]));
-console.log(toMermaid(ir));
 ```
 
 `checkSkills` matters more than it sounds. Claude Code skips a skill it cannot
 resolve with only a debug-log warning, so a step whose skill is missing runs
-without its instructions and the run reports nothing wrong. `toMermaid` is the
-reading path: the builder gives up the transition table's one-glance legibility
-in exchange for errors at the offending line, and the diagram buys it back,
-including where a run parks for a human and what a retry's ceiling is.
+without its instructions and the run reports nothing wrong.
+
+### A graph you can actually read
+
+```ts
+console.log(toMermaid(ir));
+```
+
+The builder trades the transition table's one-glance legibility for errors at the
+offending line. The diagram buys it back: where a run parks for a human, what a
+retry's ceiling is, which boxes cost a model call and which are mechanical.
+
+### Zero idle footprint
+
+An installed workflow runs nothing when no workflow is running. Both hook
+registrations are matcher-scoped, so nothing fires during unrelated work. This is
+a hard requirement of the design rather than an optimisation.
 
 ## Why a compiler
 
