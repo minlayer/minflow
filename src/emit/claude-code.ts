@@ -69,15 +69,17 @@
 import { observationsFor } from "../evaluate.js";
 import { canonicalize } from "../hash.js";
 import type {
+  Graph,
   Guard,
-  IrNode,
   JsonValue,
+  Node,
   NodeId,
   PayloadSource,
   RunState,
-  WorkflowIr,
+  StepNode,
 } from "../ir.js";
-import { DEFAULT_PAYLOAD_SOURCE } from "../ir.js";
+import { DEFAULT_PAYLOAD_SOURCE, isCommandNode, templateOf } from "../ir.js";
+import type { Skill } from "../skill.js";
 
 // ---------------------------------------------------------------------------
 // The artifact's shape
@@ -129,6 +131,23 @@ export interface PluginAuthor {
 }
 
 /** Everything the emitter cannot derive from the graph. All of it optional. */
+/**
+ * The line a runner says to carry an ask out to the session.
+ *
+ * Deliberately unlike anything a model writes by accident, because the command
+ * body matches on it and a false positive sends the session hunting for a
+ * questions file that was never written. The emitted dispatcher carries its own
+ * copy of this literal, since it is generated as raw text rather than
+ * interpolated; a test holds the two together.
+ */
+export const ASK_MARKER = "MINFLOW-ASK";
+
+/** Where a plugin's skills live, per the Agent Plugins layout. */
+export const SKILLS_DIR = "skills";
+
+/** The file that makes a directory a skill. */
+const SKILL_FILE_NAME = "SKILL.md";
+
 export interface EmitOptions {
   /**
    * Plugin name. Defaults to the workflow name, sanitized into the portable
@@ -155,6 +174,42 @@ export interface EmitOptions {
   homepage?: string;
   /** Optional manifest `license`. */
   license?: string;
+  /**
+   * Extra files to ship inside the plugin, as relative POSIX paths to contents.
+   *
+   * A compiled workflow usually needs something beside the graph: a script a
+   * `when.exitZero` guard runs, a template a step fills in, a fixture a check
+   * compares against. Without this they have to be written separately, which
+   * makes a correct plugin the product of two steps instead of one, and makes
+   * `emit`'s file map an incomplete description of what ships.
+   *
+   * Refused rather than merged when a path is absolute, escapes the plugin root,
+   * or collides with a generated file. An asset quietly replacing the dispatcher
+   * is a plugin that installs, validates, and cannot route.
+   */
+  assets?: Record<string, string>;
+  /**
+   * The skills this graph's steps name, which ship inside the plugin.
+   *
+   * **Every emitted copy is `user-invocable: false`.** A compiled workflow has
+   * exactly one public surface, its entry command; its steps are implementation,
+   * and a plugin exposing nine separately invocable skills alongside the command
+   * has nine surfaces that mean nothing on their own. That is a property of what
+   * a compiled workflow *is*, so it is imposed here rather than left to the
+   * author to remember on every skill.
+   *
+   * The author's own files are never touched. These are copies, which is what a
+   * compiler does with source.
+   *
+   * Supplying any skill means supplying all of them: a partial set would emit a
+   * plugin that resolves some steps from inside itself and others from whatever
+   * happens to be installed, which is worse than either.
+   *
+   * Omit entirely for the older shape, where skills are resolved from the user's
+   * environment at run time and `checkSkills` is the only guard against one
+   * having gone missing.
+   */
+  skills?: Skill[];
 }
 
 // ---------------------------------------------------------------------------
@@ -229,7 +284,7 @@ function walkGuard(guard: Guard, into: DeliveryObligations): void {
  * `evaluate.ts`, one level up. That produces requests for the host, this
  * produces instructions for the step.
  */
-export function obligationsFor(ir: WorkflowIr, nodeId: NodeId): DeliveryObligations {
+export function obligationsFor(ir: Graph, nodeId: NodeId): DeliveryObligations {
   const obligations: DeliveryObligations = {
     inline: false,
     payloadFiles: [],
@@ -250,7 +305,7 @@ export function obligationsFor(ir: WorkflowIr, nodeId: NodeId): DeliveryObligati
  * "what will this node be asked for" can be put to the evaluator's own seam
  * rather than answered a second time here.
  */
-function probeState(ir: WorkflowIr, nodeId: NodeId): RunState {
+function probeState(ir: Graph, nodeId: NodeId): RunState {
   return {
     runId: "",
     graphHash: ir.hash,
@@ -273,7 +328,7 @@ function probeState(ir: WorkflowIr, nodeId: NodeId): RunState {
  * alone would tell such a step to write only its file and then fail it at run
  * time for the inline block nobody asked it for.
  */
-function requestedLanes(ir: WorkflowIr, nodeId: NodeId): { inline: boolean; files: string[] } {
+function requestedLanes(ir: Graph, nodeId: NodeId): { inline: boolean; files: string[] } {
   const files: string[] = [];
   let inline = false;
   for (const request of observationsFor(ir, probeState(ir, nodeId))) {
@@ -321,7 +376,7 @@ function slug(raw: string): string {
  * Throws when nothing survives the fold, because a nameless plugin does not
  * load and failing at compile time is the only place that is cheap to fix.
  */
-export function pluginNameFor(ir: WorkflowIr, opts: EmitOptions = {}): string {
+export function pluginNameFor(ir: Graph, opts: EmitOptions = {}): string {
   const source = opts.name ?? ir.name;
   const name = slug(source);
   if (name === "") {
@@ -399,10 +454,14 @@ function commandNameFor(raw: string, source: string): string {
  * stays in `workflow.compiled.json`, and this map is what the dispatcher uses to
  * get from one to the other.
  */
-export function agentNames(ir: WorkflowIr): Record<NodeId, string> {
+export function agentNames(ir: Graph): Record<NodeId, string> {
   const names: Record<NodeId, string> = {};
   const taken = new Set<string>([RUNNER_AGENT]);
   for (const node of ir.nodes) {
+    // A command node is run by the dispatcher, not spawned, so it has no agent
+    // and gets no wrapper file. Leaving it out here is what makes that true
+    // everywhere downstream, since the emit loop skips a node with no name.
+    if (isCommandNode(node)) continue;
     const body = slug(node.id);
     // Both slices are re-trimmed: an id long enough to be cut can put the cut
     // right after a hyphen, and `step-a-` is not a legal name.
@@ -464,7 +523,7 @@ interface GateCommands {
  * give the second gate no way to be rejected, and the first gate's command would
  * kill whichever run the dispatcher found first.
  */
-function gatesOf(ir: WorkflowIr, runCommand: string): GateCommands[] {
+function gatesOf(ir: Graph, runCommand: string): GateCommands[] {
   const resumes: { gate: string; resume: string }[] = [];
   const seen = new Set<string>();
   const taken = new Set<string>([runCommand]);
@@ -644,7 +703,7 @@ function fence(language: string, contents: string): string {
 // ---------------------------------------------------------------------------
 
 /**
- * The two placeholder forms a node's prompt may carry (see `IrNode.prompt`).
+ * The two placeholder forms a node's prompt may carry (see `Node.prompt`).
  *
  * Held as sources rather than as regular expressions because a `g` flag carries
  * a `lastIndex` between calls, and the same pattern is both replaced with and
@@ -706,8 +765,8 @@ function hasPlaceholder(text: string): boolean {
  * step handed a literal `{{params.depth}}` reads it as part of its instructions,
  * and nothing downstream can tell that apart from a task that meant to say that.
  */
-function promptWithParams(node: IrNode): string | undefined {
-  const prompt = node.prompt;
+function promptWithParams(node: Node): string | undefined {
+  const prompt = templateOf(node);
   if (prompt === undefined) return undefined;
   const params = node.params ?? {};
   return prompt.replace(new RegExp(PARAM_REFERENCE, "g"), (_match: string, key: string) => {
@@ -765,7 +824,7 @@ function authorOf(opts: EmitOptions): JsonValue {
   return rendered;
 }
 
-function manifestFor(ir: WorkflowIr, opts: EmitOptions, pluginName: string): string {
+function manifestFor(ir: Graph, opts: EmitOptions, pluginName: string): string {
   const steps = ir.nodes.length;
   const manifest: Record<string, JsonValue> = {
     name: pluginName,
@@ -874,32 +933,78 @@ function commandFor(description: string, body: string): string {
  * step. That indirection is what makes one static command work for a fresh run
  * and for a run resumed at any node.
  */
-function spawnRunnerBody(pluginName: string, headline: string): string {
-  return [
+const STAND_BY = "Stand by. You will be told which step to spawn. Spawn nothing until then.";
+
+function spawnRunnerBody(pluginName: string, headline: string, hasAsks: boolean): string {
+  const lines = [
     headline,
     "",
     `Spawn the subagent \`${qualified(pluginName, RUNNER_AGENT)}\` with the Agent tool, and give`,
     "it exactly this instruction, verbatim:",
     "",
-    "> Stand by. You will be told which step to spawn. Spawn nothing until then.",
+    `> ${STAND_BY}`,
     "",
     "Do not do any of the workflow's own work yourself, and spawn nothing else. Report",
     "back whatever the runner returns.",
+  ];
+  if (hasAsks) lines.push("", askProtocolSection(pluginName));
+  return lines.join("\n");
+}
+
+/**
+ * The half of the ask protocol that runs in the session rather than in a hook.
+ *
+ * It lives in a command body because that is the only text this plugin can put
+ * into the main conversation, and the main conversation is the only context that
+ * can reach the user: a subagent has no question tool and no channel to the
+ * terminal. The hook drives everything else; this is the one hand-off it cannot
+ * make on its own.
+ *
+ * Emitted only for a graph that actually asks, so a workflow without asks
+ * carries no instructions about a marker it will never see.
+ */
+function askProtocolSection(pluginName: string): string {
+  return [
+    `## If the runner reports \`${ASK_MARKER}\``,
+    "",
+    `Its final message will sometimes be exactly \`${ASK_MARKER} <path>\`. That means the`,
+    "workflow needs answers from the user before it can continue. Every time you see it, do",
+    "exactly this and nothing else:",
+    "",
+    `1. Read the JSON file at \`<path>\`. It holds a \`questions\` array and an \`answersPath\`.`,
+    "2. Call the `AskUserQuestion` tool with those questions, verbatim. Do not add to them,",
+    "   reword them, drop any of them, or answer them yourself.",
+    "3. Write the user's answers to `answersPath` as a JSON object mapping each question's",
+    "   `header` to the label the user picked. For a multi-select question, use an array of",
+    "   labels. Create the file if it does not exist.",
+    `4. Spawn \`${qualified(pluginName, RUNNER_AGENT)}\` again with the Agent tool and give it`,
+    "   exactly this instruction, verbatim:",
+    "",
+    `   > ${STAND_BY}`,
+    "",
+    "Step 4 is not optional. The run is parked until that runner stops, and nothing else will",
+    "restart it. This can happen several times in one run, so apply it on every marker.",
   ].join("\n");
 }
 
-function runCommandFile(ir: WorkflowIr, pluginName: string): string {
+function runCommandFile(ir: Graph, pluginName: string): string {
   return commandFor(
     `Start the "${ir.name}" workflow.`,
     spawnRunnerBody(
       pluginName,
       `Start the **${oneLine(ir.name)}** workflow, which begins at \`${ir.entry}\`.`,
+      graphAsks(ir),
     ),
   );
 }
 
+/** Whether any edge in the graph raises an ask, which decides whether the protocol ships. */
+function graphAsks(ir: Graph): boolean {
+  return ir.edges.some((edge) => edge.ask !== undefined);
+}
+
 function gateCommandFiles(
-  ir: WorkflowIr,
+  ir: Graph,
   pluginName: string,
   gates: GateCommands[],
 ): Record<string, string> {
@@ -911,6 +1016,7 @@ function gateCommandFiles(
         pluginName,
         `Release the **${oneLine(gate.gate)}** gate on the "${oneLine(ir.name)}" workflow, ` +
           "which is parked awaiting sign-off. It continues at whichever node it parked into.",
+        graphAsks(ir),
       ),
     );
     files[`${COMMANDS_DIR}/${gate.reject}.md`] = commandFor(
@@ -931,7 +1037,7 @@ function gateCommandFiles(
 // Agents
 // ---------------------------------------------------------------------------
 
-function runnerFor(ir: WorkflowIr, pluginName: string, runCommand: string): string {
+function runnerFor(ir: Graph, pluginName: string, runCommand: string): string {
   const fields: [string, string][] = [
     ["name", RUNNER_AGENT],
     [
@@ -968,8 +1074,8 @@ function runnerFor(ir: WorkflowIr, pluginName: string, runCommand: string): stri
 }
 
 function stepBody(
-  ir: WorkflowIr,
-  node: IrNode,
+  ir: Graph,
+  node: StepNode,
   obligations: DeliveryObligations,
   pluginName: string,
   gates: Map<string, GateCommands>,
@@ -1106,8 +1212,8 @@ function stepBody(
 }
 
 function stepFor(
-  ir: WorkflowIr,
-  node: IrNode,
+  ir: Graph,
+  node: StepNode,
   agent: string,
   obligations: DeliveryObligations,
   pluginName: string,
@@ -1342,6 +1448,14 @@ function collectGuard(guard, into, seen) {
   }
 }
 
+// Whether a node is contracted to produce a readable payload. A step is when it
+// declares a schema; a command node always is, since its exit code and output are
+// the payload every guard leaving it reads.
+function declaresPayload(node) {
+  if (node === undefined) return false;
+  return node.kind === "command" ? true : node.schema !== undefined;
+}
+
 // Everything the host must find out to decide the transitions out of state.node,
 // deduplicated by key and in first-encountered order. Every outgoing edge
 // contributes, including ones whose guard will never be reached: observations
@@ -1358,7 +1472,7 @@ function observationsFor(ir, state) {
   const node = ir.nodes.find(function (candidate) {
     return candidate.id === state.node;
   });
-  if (node !== undefined && node.schema !== undefined) {
+  if (declaresPayload(node)) {
     const request = requestFor({ kind: "payload", from: DEFAULT_PAYLOAD_SOURCE });
     if (!seen.has(request.key)) {
       seen.add(request.key);
@@ -1614,13 +1728,17 @@ function payloadOutput(ir, state, resolved) {
   const node = ir.nodes.find(function (candidate) {
     return candidate.id === state.node;
   });
-  if (found === undefined && node !== undefined && node.schema !== undefined) {
+  if (found === undefined && declaresPayload(node)) {
     return {
       ok: false,
       error:
         'node "' +
         state.node +
-        '" declares a schema but produced no readable payload: ' +
+        '" ' +
+        (node !== undefined && node.kind === "command"
+          ? "is a command node, whose exit code and output are its payload, but produced none"
+          : "declares a schema but produced no readable payload") +
+        ": " +
         failures.join(", ") +
         ". A declared output contract that is not met is an error, not an empty output.",
     };
@@ -1680,9 +1798,109 @@ function fireEdge(ir, state, resolved, edge) {
     next.node = edge.goto;
     return { kind: "gate", gate: edge.gate, to: edge.goto, via: edge.id, state: next };
   }
+  if (edge.ask !== undefined) {
+    if (isEnd(edge.goto)) {
+      return errorTransition(
+        state,
+        "invalid-graph",
+        "edge " + edge.id + ' out of "' + state.node +
+          '" asks on the way to END. A run mid-ask stores the node it will resume into, and ' +
+          "END is not a node, so the answers could never be delivered anywhere.",
+      );
+    }
+    const questions = askQuestions(ir, state, resolved, edge, edge.ask);
+    if (typeof questions === "string") {
+      return errorTransition(state, "invalid-graph", questions);
+    }
+    const next = departingState(ir, state, resolved);
+    if (isDepartureError(next)) return errorTransition(state, "observation-failed", next.error);
+    next.status = "asking";
+    next.node = edge.goto;
+    next.ask = {
+      edge: edge.id,
+      to: edge.goto,
+      as: edge.ask.as,
+      questions: questions,
+      relayed: false,
+    };
+    return {
+      kind: "ask",
+      questions: questions,
+      as: edge.ask.as,
+      to: edge.goto,
+      via: edge.id,
+      state: next,
+    };
+  }
   const next = departingState(ir, state, resolved);
   if (isDepartureError(next)) return errorTransition(state, "observation-failed", next.error);
   return moveTo(next, edge.goto, edge.id, edge.event);
+}
+
+// The questions an ask puts, resolved to values, or the reason they cannot be.
+function askQuestions(ir, state, resolved, edge, ask) {
+  if (ask.questions.kind === "static") return ask.questions.items;
+
+  const payload = payloadOutput(ir, state, resolved);
+  if (!payload.ok) {
+    return (
+      "edge " + edge.id + ' out of "' + state.node +
+        '" asks with questions read from its payload, but the payload could not be read: ' +
+        payload.error
+    );
+  }
+  const found =
+    payload.value === undefined ? undefined : readPath(payload.value, ask.questions.path);
+  if (found === undefined) {
+    return (
+      "edge " + edge.id + ' out of "' + state.node + '" asks with questions at "' +
+        ask.questions.path +
+        '" of its payload, and that path holds nothing. A step that raises an ask has to ' +
+        "produce the questions it wants put."
+    );
+  }
+  const problem = questionListProblem(found);
+  if (problem !== undefined) {
+    return (
+      "edge " + edge.id + ' out of "' + state.node + '" asks with questions at "' +
+        ask.questions.path + '" of its payload, but ' + problem
+    );
+  }
+  return found;
+}
+
+// Why a value cannot be a question list, or undefined when it can. These came out
+// of a model's payload and go straight into a dialog the user sees.
+function questionListProblem(value) {
+  if (!Array.isArray(value)) return "it is not a list of questions.";
+  if (value.length === 0) return "the list is empty.";
+  for (let index = 0; index < value.length; index += 1) {
+    const entry = value[index];
+    const at = "question " + (index + 1);
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+      return at + " is not an object.";
+    }
+    if (typeof entry.question !== "string" || entry.question.trim() === "") {
+      return at + " has no question text.";
+    }
+    if (typeof entry.header !== "string" || entry.header.trim() === "") {
+      return at + " has no header.";
+    }
+    const options = entry.options;
+    if (!Array.isArray(options) || options.length === 0) {
+      return at + " offers no options.";
+    }
+    for (let position = 0; position < options.length; position += 1) {
+      const option = options[position];
+      if (option === null || typeof option !== "object" || Array.isArray(option)) {
+        return at + " has an option that is not an object.";
+      }
+      if (typeof option.label !== "string" || option.label.trim() === "") {
+        return at + " has an option with no label.";
+      }
+    }
+  }
+  return undefined;
 }
 
 function applyOtherwise(ir, state, resolved, edge, otherwise) {
@@ -1857,6 +2075,19 @@ const ROOT = process.env.CLAUDE_PLUGIN_ROOT || path.join(__dirname, "..");
 // repository, so they are resolved against the project directory the hook
 // environment reports rather than against whatever cwd this process inherited.
 const PROJECT = process.env.CLAUDE_PROJECT_DIR || process.cwd();
+
+// Ceiling on what a command node's stdout and stderr may carry into run state.
+// Its output is recorded as the node's payload and persisted, so an unbounded
+// one turns a chatty build into a state file nothing can load. A command whose
+// output matters past this belongs in a file the next node reads.
+const COMMAND_OUTPUT_MAX = 1048576;
+
+// The one line that carries an ask out of a subagent and into the session. Kept
+// deliberately unlike anything a model writes by accident, because the command
+// body matches on it and a false positive would send the session hunting for a
+// questions file that does not exist. The same literal appears in the run
+// command's body; a test holds the two together.
+const ASK_MARKER = "MINFLOW-ASK";
 
 // One budget for a whole resolution pass, not one per command.
 //
@@ -2164,7 +2395,14 @@ function taskFor(graph, state) {
   const node = graph.nodes.find(function (candidate) {
     return candidate !== null && typeof candidate === "object" && candidate.id === state.node;
   });
-  if (!node || typeof node.prompt !== "string") return { text: "" };
+  if (!node) return { text: "" };
+  // A command node interpolates its command exactly as a step interpolates its
+  // prompt, so one substitution serves both and neither can drift from the
+  // dominance rule the compiler checked.
+  const isCommand = node.kind === "command";
+  const template = isCommand ? node.command : node.prompt;
+  const noun = isCommand ? "its command" : "its prompt";
+  if (typeof template !== "string") return { text: "" };
   const params = node.params !== null && typeof node.params === "object" ? node.params : {};
   const outputs = state.outputs !== null && typeof state.outputs === "object" ? state.outputs : {};
 
@@ -2173,18 +2411,18 @@ function taskFor(graph, state) {
     if (failure === null) failure = detail;
     return "";
   };
-  const text = node.prompt.replace(ANY_PLACEHOLDER, function (match, kind, reference) {
+  const text = template.replace(ANY_PLACEHOLDER, function (match, kind, reference) {
     if (kind === "params") {
       if (!Object.hasOwn(params, reference)) {
         return stop(
-          "its prompt interpolates {{params." + reference + "}}, which the step does not declare",
+          noun + " interpolates {{params." + reference + "}}, which the node does not declare",
         );
       }
       return interpolatedValue(params[reference]);
     }
     const found = readOutputPath(outputs, reference);
     if (found.error) {
-      return stop("its prompt interpolates {{ctx." + reference + "}}, but " + found.error);
+      return stop(noun + " interpolates {{ctx." + reference + "}}, but " + found.error);
     }
     return interpolatedValue(found.value);
   });
@@ -2202,6 +2440,89 @@ function taskFor(graph, state) {
     };
   }
   return { text: text };
+}
+
+// Where an ask's questions are written for the session to read, and where it is
+// to write the answers back. Under the plugin's data directory rather than the
+// user's repository: these are run plumbing, not artifacts of the work, and a
+// half-answered question list committed by accident helps nobody.
+function askDir() {
+  return path.join(DATA, "asks");
+}
+
+function askQuestionsPath(runId) {
+  return path.join(askDir(), runId + "-questions.json");
+}
+
+function askAnswersPath(runId) {
+  return path.join(askDir(), runId + "-answers.json");
+}
+
+// The file the session reads. Self-describing on purpose: it carries the path
+// its answers belong at, so the protocol in the command body never has to derive
+// one filename from another.
+function writeAskFile(state, questions) {
+  const target = askQuestionsPath(state.runId);
+  fs.mkdirSync(askDir(), { recursive: true });
+  fs.writeFileSync(
+    target,
+    JSON.stringify(
+      {
+        runId: state.runId,
+        workflow: PLUGIN.workflow,
+        questions: questions,
+        answersPath: askAnswersPath(state.runId),
+      },
+      null,
+      2,
+    ),
+    "utf8",
+  );
+  return target;
+}
+
+// The answers, or why they cannot be used. An unreadable or malformed answers
+// file is a broken contract rather than an empty answer: routing on nothing
+// would hand the next step a blank where the user's decision should be.
+function readAskAnswers(runId) {
+  const target = askAnswersPath(runId);
+  if (!fs.existsSync(target)) return { ok: false, missing: true };
+  let text = "";
+  try {
+    text = fs.readFileSync(target, "utf8");
+  } catch (error) {
+    return { ok: false, error: "could not read the answers at " + target + ": " + error.message };
+  }
+  const parsed = tryParse(text);
+  if (!parsed.ok) {
+    return { ok: false, error: "the answers at " + target + " are not valid JSON: " + parsed.error };
+  }
+  const value = parsed.value;
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return {
+      ok: false,
+      error: "the answers at " + target + " are not a JSON object of answers keyed by header",
+    };
+  }
+  return { ok: true, value: value };
+}
+
+function clearAskFiles(runId) {
+  for (const target of [askQuestionsPath(runId), askAnswersPath(runId)]) {
+    try {
+      if (fs.existsSync(target)) fs.unlinkSync(target);
+    } catch (error) {
+      // Leftover plumbing is untidy, never wrong: the next ask overwrites it.
+    }
+  }
+}
+
+// Whether a node needs an agent registered for it. A command node does not: the
+// dispatcher runs it rather than spawning it, so demanding an agent would refuse
+// a perfectly good graph whose entry, or whose node after a gate, is mechanical.
+function needsAgent(nodeId) {
+  const found = PLUGIN.commandNodes.indexOf(nodeId);
+  return found === -1;
 }
 
 // The instruction the runner acts on: spawn one named agent, pass it one text.
@@ -2410,6 +2731,62 @@ function runGuardCommand(command) {
     };
   }
   return { ok: true, value: finished.status === 0 };
+}
+
+// A command node's own execution, as distinct from a guard's. The difference is
+// what a failure means: a guard that could not run leaves a question unanswered,
+// while a command node that could not run has failed to produce the payload its
+// outgoing edges read, which is a broken contract either way but is reported
+// against the node rather than against a predicate.
+//
+// A non-zero exit is NOT a failure here. It is the answer, and it is what
+// when.field("exitCode") exists to read.
+function runCommandNode(node, command) {
+  const ceiling = typeof node.timeoutMs === "number" ? node.timeoutMs : guardTimeLeft();
+  const remaining = Math.min(ceiling, guardTimeLeft());
+  if (remaining <= 0) {
+    return {
+      ok: false,
+      error: budgetSpent('before command node "' + node.id + '" could start'),
+    };
+  }
+  const finished = childProcess.spawnSync(command, {
+    shell: true,
+    cwd: PROJECT,
+    encoding: "utf8",
+    timeout: remaining,
+    maxBuffer: COMMAND_OUTPUT_MAX,
+  });
+  if (finished.error || typeof finished.status !== "number") {
+    if (finished.error && finished.error.code === "ETIMEDOUT") {
+      return {
+        ok: false,
+        error:
+          'command node "' + node.id + '" was killed after ' + remaining +
+          "ms without exiting. A command that never finished reported nothing, so there is no " +
+          "payload to route on.",
+      };
+    }
+    if (finished.error) {
+      return {
+        ok: false,
+        error: 'command node "' + node.id + '" could not run: ' + finished.error.message,
+      };
+    }
+    return {
+      ok: false,
+      error:
+        'command node "' + node.id + '" was killed by ' + finished.signal + " before it exited",
+    };
+  }
+  return {
+    ok: true,
+    value: {
+      exitCode: finished.status,
+      stdout: typeof finished.stdout === "string" ? finished.stdout : "",
+      stderr: typeof finished.stderr === "string" ? finished.stderr : "",
+    },
+  };
 }
 
 // The one place delivery is visible. Above this the run is JSON; below it there
@@ -2693,7 +3070,7 @@ function startRun(event, sessionId) {
     steps: 0,
     outputs: {},
   };
-  if (typeof PLUGIN.agents[state.node] !== "string") {
+  if (needsAgent(state.node) && typeof PLUGIN.agents[state.node] !== "string") {
     report(
       'no agent is registered for the entry node "' + state.node + '". Regenerate the plugin.',
     );
@@ -2768,7 +3145,7 @@ function releaseGate(event, sessionId, gate) {
   const state = Object.assign({}, parked, { status: "running" });
   delete state.gate;
   delete state.host;
-  if (typeof PLUGIN.agents[state.node] !== "string") {
+  if (needsAgent(state.node) && typeof PLUGIN.agents[state.node] !== "string") {
     report('no agent is registered for node "' + state.node + '". Regenerate the plugin.');
     return;
   }
@@ -2835,6 +3212,126 @@ function departed(state) {
   return next;
 }
 
+// Where a run lands once every command node in front of it has run.
+//
+// A command node is not spawned, it executes here, inside the dispatcher,
+// between two runner stops. So arriving at one is not a reason to instruct the
+// runner: it is work to do now, followed by another transition to decide. The
+// loop drains a whole chain of them for one hook fire, which is what makes a
+// mechanical check cost no model call and no round trip.
+//
+// Returns the state to instruct the runner from, or null when the run has
+// already been concluded here and there is nothing left to spawn.
+function settle(graph, state) {
+  let current = state;
+  for (;;) {
+    const node = graph.nodes.find(function (candidate) {
+      return candidate !== null && typeof candidate === "object" && candidate.id === current.node;
+    });
+    if (!node || node.kind !== "command") {
+      saveState(current);
+      return current;
+    }
+
+    const resolvedCommand = taskFor(graph, current);
+    if (resolvedCommand.error) {
+      concludeWithError(current, "invalid-graph", resolvedCommand.error);
+      return null;
+    }
+
+    const outcome = runCommandNode(node, resolvedCommand.text);
+    appendTrace(current.runId, {
+      at: new Date().toISOString(),
+      decision: "command",
+      run: current.runId,
+      node: current.node,
+      command: resolvedCommand.text,
+      exitCode: outcome.ok ? outcome.value.exitCode : null,
+      error: outcome.ok ? null : outcome.error,
+    });
+
+    // The command's own result is the node's payload, seeded into a scratch so
+    // that every guard leaving the node reads it through exactly the path an
+    // inline payload takes. Nothing here knows it did not come off a runner.
+    const scratch = {
+      node: current.node,
+      steps: current.steps,
+      answers: {},
+      asking: null,
+      payload: outcome.ok ? { value: outcome.value } : { error: outcome.error },
+      observations: {},
+      start: false,
+    };
+
+    const resolved = {};
+    for (const request of runtime.observationsFor(graph, current)) {
+      if (request.kind === "judge") {
+        // Refused by the compiler, so reaching this means a graph came from
+        // somewhere else. Saying so beats hanging on a question nobody can ask.
+        concludeWithError(
+          current,
+          "invalid-graph",
+          'node "' + current.node +
+            '" is a command node with a judge guard on an edge leaving it. There is no model in ' +
+            "the loop at that moment, so the verdict can never be obtained.",
+        );
+        return null;
+      }
+      resolved[request.key] = resolveRequest(request, {}, scratch, false);
+    }
+
+    const transition = runtime.evaluate(graph, current, resolved);
+    appendTrace(current.runId, {
+      at: new Date().toISOString(),
+      decision: transition.kind,
+      run: current.runId,
+      node: current.node,
+      via: transition.via === undefined ? null : transition.via,
+      to: transition.to === undefined ? null : transition.to,
+      steps: transition.state.steps,
+    });
+
+    if (transition.kind === "advance" || transition.kind === "retry") {
+      current = departed(transition.state);
+      continue;
+    }
+    if (transition.kind === "gate") {
+      saveState(departed(transition.state));
+      const commands = PLUGIN.gates[transition.gate];
+      report(
+        "run " + current.runId + ' is parked at the "' + transition.gate + '" gate, before step "' +
+          transition.to + '". Run /' + (commands ? commands.resume : transition.gate) +
+          " to continue" + (commands ? ", or /" + commands.reject + " to abandon it" : "") + ".",
+      );
+      return null;
+    }
+    if (transition.kind === "end") {
+      deleteState(current.runId);
+      report("run " + current.runId + ' finished at command node "' + current.node + '".');
+      return null;
+    }
+    concludeWithError(current, transition.code, transition.message);
+    return null;
+  }
+}
+
+// An errored run must not be left on disk: at status "running" it is still live,
+// so the next runner stop would load it, re-evaluate the same failure, and
+// report it again. The trace is what survives a run (D11).
+function concludeWithError(state, code, message) {
+  appendTrace(state.runId, {
+    at: new Date().toISOString(),
+    decision: "stopped",
+    run: state.runId,
+    node: state.node,
+    code: code,
+    message: message,
+    state: state,
+  });
+  deleteState(state.runId);
+  report("run " + state.runId + " stopped: [" + code + "] " + message);
+}
+
 function act(graph, state, transition) {
   appendTrace(state.runId, {
     at: new Date().toISOString(),
@@ -2847,15 +3344,19 @@ function act(graph, state, transition) {
   });
 
   if (transition.kind === "advance") {
-    const instruction = stepInstruction(graph, transition.state);
+    // Where it lands may be past the transition's own target: any command nodes
+    // in between run here rather than being spawned, so a run can travel several
+    // nodes on one hook fire, and the message names where it actually stopped.
+    const landed = settle(graph, departed(transition.state));
+    if (landed === null) return;
+    const instruction = stepInstruction(graph, landed);
     if (instruction.error) {
       report(instruction.error);
       return;
     }
-    saveState(departed(transition.state));
     block(
       [
-        'minflow: step "' + state.node + '" is done; the run advances to "' + transition.to + '".',
+        'minflow: step "' + state.node + '" is done; the run advances to "' + landed.node + '".',
         "",
         instruction.text,
       ].join("\n"),
@@ -2876,6 +3377,36 @@ function act(graph, state, transition) {
           transition.reason,
         "",
         instruction.text,
+      ].join("\n"),
+    );
+    return;
+  }
+
+  if (transition.kind === "ask") {
+    // Beat one of three. A subagent cannot reach the user, so the questions have
+    // to travel out to the session, and the only channel to it is the runner's
+    // final message. So the runner is blocked here and told to say one exact
+    // line; it is allowed to actually stop on the beat after this one, which is
+    // when that line lands where something can act on it.
+    let target = "";
+    try {
+      target = writeAskFile(transition.state, transition.questions);
+    } catch (error) {
+      report(
+        "run " + state.runId + " could not write its questions: " + error.message +
+          ". The run is stopped rather than continued without the answers.",
+      );
+      deleteState(state.runId);
+      return;
+    }
+    saveState(departed(transition.state));
+    block(
+      [
+        "minflow: the workflow needs answers from the user before it can continue.",
+        "",
+        "Reply with exactly this line and nothing else, then stop:",
+        "",
+        ASK_MARKER + " " + target,
       ].join("\n"),
     );
     return;
@@ -2926,10 +3457,98 @@ function act(graph, state, transition) {
   report("run " + state.runId + " stopped: [" + transition.code + "] " + transition.message);
 }
 
+// Beats two and four of an ask.
+//
+// Two: the runner has just said the marker line. Rendering no decision is what
+// lets it stop for real, which is what puts that line in front of the session.
+//
+// Four: the session has asked, written the answers, and spawned the runner
+// again. The answers become an output like any other and the run carries on.
+function onAskStop(state) {
+  const ask = state.ask;
+  if (ask === null || ask === undefined) {
+    report(
+      "run " + state.runId + " is marked as asking but carries no questions. Its state is " +
+        "inconsistent and the run is stopped rather than resumed into a node it may not belong " +
+        "at.",
+    );
+    deleteState(state.runId);
+    return;
+  }
+
+  if (ask.relayed !== true) {
+    const next = Object.assign({}, state);
+    next.ask = Object.assign({}, ask, { relayed: true });
+    saveState(next);
+    appendTrace(state.runId, {
+      at: new Date().toISOString(),
+      decision: "ask-relayed",
+      run: state.runId,
+      node: state.node,
+      questions: ask.questions.length,
+    });
+    // No decision: the runner stops, and its last message is the marker.
+    return;
+  }
+
+  const answers = readAskAnswers(state.runId);
+  if (!answers.ok) {
+    if (answers.missing) {
+      report(
+        "run " + state.runId + " is waiting on answers that were never written to " +
+          askAnswersPath(state.runId) + ". Answer the questions in " +
+          askQuestionsPath(state.runId) + ", write them to that path, and spawn " +
+          PLUGIN.runner + " again.",
+      );
+      return;
+    }
+    report("run " + state.runId + " cannot use its answers: " + answers.error);
+    deleteState(state.runId);
+    clearAskFiles(state.runId);
+    return;
+  }
+
+  const graph = requireGraph();
+  if (graph === null) return;
+
+  const next = Object.assign({}, state);
+  delete next.ask;
+  delete next.host;
+  next.status = "running";
+  next.outputs = Object.assign({}, state.outputs);
+  next.outputs[ask.as] = answers.value;
+  next.steps = state.steps + 1;
+
+  appendTrace(state.runId, {
+    at: new Date().toISOString(),
+    decision: "ask-answered",
+    run: state.runId,
+    node: next.node,
+    as: ask.as,
+  });
+  clearAskFiles(state.runId);
+
+  const landed = settle(graph, next);
+  if (landed === null) return;
+  const instruction = stepInstruction(graph, landed);
+  if (instruction.error) {
+    report(instruction.error);
+    return;
+  }
+  block(
+    [
+      "minflow: the answers are in; the run continues at \"" + landed.node + "\".",
+      "",
+      instruction.text,
+    ].join("\n"),
+  );
+}
+
 function onSubagentStop(event, state) {
   // No state means this runner is not ours, or its run is already finished.
   // Saying nothing is the whole of the zero-idle-footprint requirement (D9).
   if (state === null) return;
+  if (state.status === "asking") return onAskStop(state);
   if (state.status !== "running") return;
 
   const graph = requireGraph();
@@ -2959,23 +3578,26 @@ function onSubagentStop(event, state) {
   // itself had produced anything. Hand it the step instead. This is the same
   // block-and-redirect the spike verified on this event.
   if (scratch.start === true) {
-    const first = stepInstruction(graph, state);
+    scratch.start = false;
+    // The entry node may itself be a command node, and so may every node after
+    // it, so a run can be settled before any step is ever spawned.
+    const landed = settle(graph, withScratch(state, scratch));
+    if (landed === null) return;
+    const first = stepInstruction(graph, landed);
     if (first.error) {
       report(first.error);
       return;
     }
-    scratch.start = false;
-    saveState(withScratch(state, scratch));
     appendTrace(state.runId, {
       at: new Date().toISOString(),
       decision: "begin",
       run: state.runId,
-      node: state.node,
+      node: landed.node,
     });
     block(
       [
         'minflow: run ' + state.runId + ' of the "' + PLUGIN.workflow + '" begins at step "' +
-          state.node + '".',
+          landed.node + '".',
         "",
         first.text,
       ].join("\n"),
@@ -3122,7 +3744,7 @@ process.stdin.on("end", function () {
  * no decision at all.
  */
 function dispatcherFor(
-  ir: WorkflowIr,
+  ir: Graph,
   pluginName: string,
   runCommand: string,
   names: Record<NodeId, string>,
@@ -3149,6 +3771,10 @@ function dispatcherFor(
     runner: qualified(pluginName, RUNNER_AGENT),
     gates,
     agents: names,
+    // Named rather than derived from the absence of an agent, so that a genuinely
+    // missing agent stays the reportable fault it is instead of being read as a
+    // node the dispatcher was supposed to run itself.
+    commandNodes: ir.nodes.filter((node) => isCommandNode(node)).map((node) => node.id),
   };
 
   // One line, always: this is a `//` comment, so a workflow name carrying a line
@@ -3194,7 +3820,7 @@ ${DISPATCHER_BODY}`;
  * @param opts - Naming and manifest metadata the graph cannot supply.
  * @returns Relative POSIX paths to file contents.
  */
-export function emit(ir: WorkflowIr, opts: EmitOptions = {}): PluginFiles {
+export function emit(ir: Graph, opts: EmitOptions = {}): PluginFiles {
   const pluginName = pluginNameFor(ir, opts);
   // Folded before anything is named after it: a command name is also a file name
   // under `commands/`, so an unchecked one writes wherever its separators point.
@@ -3222,6 +3848,8 @@ export function emit(ir: WorkflowIr, opts: EmitOptions = {}): PluginFiles {
   Object.assign(files, gateCommandFiles(ir, pluginName, gates));
   const byGate = gateIndex(gates);
   for (const node of ir.nodes) {
+    // A command node runs in the dispatcher and has no wrapper to write.
+    if (isCommandNode(node)) continue;
     const agent = names[node.id];
     if (agent === undefined) continue;
     files[`agents/${agent}.md`] = stepFor(
@@ -3236,7 +3864,99 @@ export function emit(ir: WorkflowIr, opts: EmitOptions = {}): PluginFiles {
   // Canonical, not insertion-ordered: this file is the graph's value on disk, and
   // it has to match for two graphs `graphHash` calls identical.
   files[COMPILED_GRAPH_PATH] = canonicalJsonFile(ir);
+  mergeSkills(files, ir, opts.skills);
+  // Last, so every generated path already exists to collide against.
+  mergeAssets(files, opts.assets);
   return files;
+}
+
+/**
+ * Write the graph's skills into the plugin, every one of them private.
+ *
+ * Bundled resources come too. A skill is a directory: a body that says "see
+ * `references/rules.md`" is broken by a copy that brings only the body, and
+ * broken silently, because the body still loads and the step runs anyway.
+ */
+function mergeSkills(files: PluginFiles, ir: Graph, skills: Skill[] | undefined): void {
+  if (skills === undefined) return;
+
+  const supplied = new Map<string, Skill>();
+  for (const skill of skills) supplied.set(skill.name, skill);
+
+  const needed = new Set<string>();
+  for (const node of ir.nodes) {
+    if (!isCommandNode(node)) needed.add(node.skill);
+  }
+
+  const missing = [...needed].filter((name) => !supplied.has(name)).sort();
+  if (missing.length > 0) {
+    throw new Error(
+      `minflow: emit was given skills but not these, which steps name: ${missing.join(", ")}. ` +
+        "A partial set ships a plugin that resolves some steps from inside itself and others " +
+        "from whatever happens to be installed. Supply every skill the graph names, or none.",
+    );
+  }
+
+  for (const name of [...needed].sort()) {
+    const skill = supplied.get(name);
+    if (skill === undefined) continue;
+
+    const problems = skill.problems();
+    if (problems.length > 0) {
+      const detail = problems.map((problem) => `${problem.field} ${problem.detail}`).join(" ");
+      throw new Error(`minflow: the skill "${name}" cannot be shipped: ${detail}`);
+    }
+
+    // A skill whose frontmatter name disagrees with its directory does not
+    // resolve, and the platform reports that as a debug-log line nobody reads.
+    const directory = `${SKILLS_DIR}/${name}`;
+    files[`${directory}/${SKILL_FILE_NAME}`] = skill.withUserInvocable(false).toMarkdown();
+
+    for (const [relative, contents] of Object.entries(skill.files).sort()) {
+      files[`${directory}/${relative}`] = contents;
+    }
+  }
+}
+
+/**
+ * Fold {@link EmitOptions.assets} into the generated map, or refuse.
+ *
+ * Every rejection here is a case where the plugin would still install and still
+ * validate, so nothing downstream would report it. The path checks mirror
+ * {@link writeFiles}, which cannot be the only guard: `emit` is pure and its map
+ * is asserted against in tests that never touch a filesystem.
+ */
+function mergeAssets(files: PluginFiles, assets: EmitOptions["assets"]): void {
+  if (assets === undefined) return;
+  for (const raw of Object.keys(assets).sort()) {
+    const contents = assets[raw];
+    if (contents === undefined) continue;
+    const at = `minflow: asset "${raw}"`;
+    if (raw.trim() === "") {
+      throw new Error("minflow: an asset path cannot be empty.");
+    }
+    if (raw.startsWith("/") || /^[A-Za-z]:/.test(raw)) {
+      throw new Error(`${at} must be relative to the plugin root, not absolute.`);
+    }
+    if (raw.includes("\\")) {
+      throw new Error(`${at} must use POSIX separators, so "/" rather than "\\".`);
+    }
+    const segments = raw.split("/");
+    if (segments.some((segment) => segment === "..")) {
+      throw new Error(`${at} escapes the plugin root. Asset paths cannot contain "..".`);
+    }
+    if (segments.some((segment) => segment === "" || segment === ".")) {
+      throw new Error(`${at} has an empty or "." path segment.`);
+    }
+    if (raw in files) {
+      throw new Error(
+        `${at} collides with a file the compiler generates. ` +
+          "Pick another path: an asset overwriting a generated file produces a plugin " +
+          "that installs and validates but cannot route.",
+      );
+    }
+    files[raw] = contents;
+  }
 }
 
 // ---------------------------------------------------------------------------

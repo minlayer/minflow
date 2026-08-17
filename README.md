@@ -28,12 +28,17 @@ wf.step("plan",      { skill: "write-plan" });
 wf.step("implement", { skill: "implement-plan", maxTurns: 25 });
 wf.step("review",    { skill: "review-changes" });
 
+wf.run("typecheck", { command: "npm run typecheck" });          // no model call
+
 wf.entry("research");
 
-wf.edge("research", "plan",    when.fileExists("notes.md"));
-wf.gate("plan", "implement",   { command: "approve-plan" });   // human sign-off
-wf.edge("implement", "review", when.exitZero("npm test"),
-                               { otherwise: retry(3, "tests failing") });
+wf.ask("research", "plan", {                                    // asks, then resumes
+  questions: [{ question: "Ship behind a flag?", header: "Flag",
+                options: [{ label: "Yes" }, { label: "No" }] }],
+});
+wf.edge("plan", "typecheck");
+wf.edge("typecheck", "implement", when.field("exitCode").equals(0));
+wf.gate("implement", "review",  { command: "approve-diff" });   // human sign-off
 wf.branch("review", judge("Are there unresolved findings?"), {
   no:  END,
   yes: "implement",
@@ -47,6 +52,17 @@ a file on disk, a field of a step's output. `judge()` is the one conspicuous way
 to ask a model for a verdict, so reaching for judgment is a visible decision
 rather than an accident.
 
+Three kinds of node and edge do the work that prose in a skill file cannot:
+
+| | What it is |
+|---|---|
+| `wf.run()` | A **command node**. Runs a shell command instead of a model, records `{ exitCode, stdout, stderr }` as its output, and costs no model call and no round trip |
+| `wf.ask()` | Puts questions to the user and **resumes on its own**. Nobody types a command to continue |
+| `wf.gate()` | Parks for human sign-off and waits for a resume command. A wall, not a pause |
+
+An ask and a gate look similar and are not: an ask needs a fact, a gate needs a
+person to look.
+
 A step reads an earlier step's output by interpolating it:
 
 ```ts
@@ -58,6 +74,19 @@ route through the graph reaches `plan` through `research`, so the value cannot b
 present on one branch and missing on another. When it is not, compiling fails and
 names a route that reaches `plan` while skipping `research`, rather than leaving
 you to find out on the branch nobody tested.
+
+## Skills ship inside the plugin
+
+`emit` takes the skills a graph names and writes them into the plugin, **every
+copy `user-invocable: false`**. A compiled workflow has exactly one public
+surface, its entry command; its steps are implementation, and a plugin exposing
+each internal step as a separately invocable skill has as many public surfaces as
+it has steps.
+
+Your own files are untouched. These are copies, which is what a compiler does
+with source. `Skill` reads one from a directory, brings its bundled
+`references/` and `scripts/` along, types the fields minflow reasons about, and
+carries every other frontmatter field through the round trip unchanged.
 
 Two things worth running before you ship a workflow:
 
@@ -102,6 +131,7 @@ research-ship/
   commands/approve-plan.md       one resume command per gate, plus its reject
   agents/runner.md               spawns one step at a time, makes no routing decisions
   agents/step-*.md               one wrapper per node, preloading that node's skill
+  skills/*/SKILL.md              every skill the graph names, shipped user-invocable: false
   hooks/hooks.json               two registrations, both matcher-scoped
   hooks/dispatch.cjs             evaluates the transition table after each step
   workflow.compiled.json         the compiled graph
@@ -115,21 +145,34 @@ registrations are scoped so that nothing fires during unrelated work.
 ## Status
 
 Working: the builder, the IR, the graph lint, the transition evaluator, run
-context interpolation, skill validation, Mermaid output, and the Claude Code
-backend. 557 tests, none of which need a model.
+context interpolation, command nodes, interactive asks, skills shipped inside the
+plugin, skill validation, Mermaid output, and the Claude Code backend. 619 tests,
+none of which need a model.
 
 A compiled workflow runs: the transition cycle, a judge verdict, a gate parked in
 one session and released in another, and a retry to its limit have each been
 driven end to end on a real install.
 
 Platform behaviour is verified by execution rather than assumed. The claims the
-design rests on were measured against Claude Code `2.1.229`, and
+design rests on were measured against Claude Code `2.1.229` and re-confirmed on
+`2.1.232`, and
 [`docs/VERIFICATION.md`](./docs/VERIFICATION.md) records what was checked, how,
 and what to re-check against a future release.
 
 Not done: backends for the other Agent Plugins clients (Codex CLI, Cursor,
 GitHub Copilot, VS Code, Kiro). Their packaging is settled by the Agent Plugins
 1.0.0 standard; their orchestration seam is not yet investigated.
+
+Specified and not yet built: generated tests. A compiled graph is a control-flow
+graph whose guards are data rather than code, so the inputs that force a given
+branch are derivable by inspection rather than by solving a predicate. `SPEC.md`
+§1.6 describes writing a readable test plan and executing it against the real
+emitted dispatcher, and §3.13 describes the auto mode a live run needs.
+
+Also not done, and wanted: broader graph shapes. A run has one current node, so
+graphs are sequential today. Parallel branches and their joins are the one shape
+the transition table cannot express, and adding them is the next capability
+worth having (L22).
 
 ## Documentation
 

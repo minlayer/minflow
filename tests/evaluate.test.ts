@@ -3,13 +3,13 @@ import { describe, expect, it } from "vitest";
 import { evaluate, observationKey, observationsFor } from "../src/evaluate.js";
 import { canonicalize } from "../src/hash.js";
 import type {
+  Edge,
   FieldOp,
+  Graph,
   Guard,
-  IrEdge,
   JsonValue,
   ObservationResult,
   RunState,
-  WorkflowIr,
 } from "../src/ir.js";
 import { DEFAULT_PAYLOAD_SOURCE, END } from "../src/ir.js";
 
@@ -20,7 +20,7 @@ import { DEFAULT_PAYLOAD_SOURCE, END } from "../src/ir.js";
 
 const HASH = "graph-hash-1";
 
-function makeIr(edges: IrEdge[], nodeIds: string[] = ["a", "b", "c"]): WorkflowIr {
+function makeIr(edges: Edge[], nodeIds: string[] = ["a", "b", "c"]): Graph {
   return {
     irVersion: 1,
     name: "wf",
@@ -32,7 +32,7 @@ function makeIr(edges: IrEdge[], nodeIds: string[] = ["a", "b", "c"]): WorkflowI
 }
 
 /** Give one node an output contract, leaving the rest of the fixture alone. */
-function withNodeSchema(ir: WorkflowIr, id: string, schema: JsonValue): WorkflowIr {
+function withNodeSchema(ir: Graph, id: string, schema: JsonValue): Graph {
   return {
     ...ir,
     nodes: ir.nodes.map((node) => (node.id === id ? { ...node, schema } : node)),
@@ -84,7 +84,7 @@ function withPayload(value: JsonValue): Record<string, ObservationResult> {
 }
 
 /** One edge, advancing to `b` when the guard holds and to `c` when it does not. */
-function guardGraph(guard: Guard): WorkflowIr {
+function guardGraph(guard: Guard): Graph {
   return makeIr([
     {
       id: "e1",
@@ -1550,8 +1550,8 @@ describe("otherwise", () => {
   const testsKey = observationKey({ kind: "exitZero", command: "npm test" });
   const failing: Record<string, ObservationResult> = { [testsKey]: { ok: true, value: false } };
 
-  function retryGraph(limit?: number): WorkflowIr {
-    const edge: IrEdge = {
+  function retryGraph(limit?: number): Graph {
+    const edge: Edge = {
       id: "e1",
       from: "a",
       event: "pass",
@@ -1784,7 +1784,7 @@ describe("state.host", () => {
 
   const paths: Array<{
     name: string;
-    graph: WorkflowIr;
+    graph: Graph;
     resolved: Record<string, ObservationResult>;
     over: StateOverrides;
     kind: string;

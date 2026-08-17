@@ -22,7 +22,7 @@
 
 import { createHash } from "node:crypto";
 
-import type { WorkflowIr } from "./ir.js";
+import type { Graph } from "./ir.js";
 
 /**
  * Hex characters kept from the digest.
@@ -35,7 +35,7 @@ import type { WorkflowIr } from "./ir.js";
 export const GRAPH_HASH_LENGTH = 16;
 
 /** A graph to hash, with or without a `hash` field already stamped on it. */
-export type HashableGraph = WorkflowIr | Omit<WorkflowIr, "hash">;
+export type HashableGraph = Graph | Omit<Graph, "hash">;
 
 /**
  * Deterministic JSON serialization.

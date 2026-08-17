@@ -11,12 +11,17 @@ describe("the public surface", () => {
     // means updating this line.
     expect(Object.keys(minflow).sort()).toEqual([
       "END",
+      "MAX_DESCRIPTION_LENGTH",
+      "MAX_NAME_LENGTH",
       "SKILL_FILE",
+      "Skill",
       "VERSION",
+      "askFrom",
       "checkSkills",
       "claudeCode",
       "discoverSkills",
       "evaluate",
+      "isCommandNode",
       "judge",
       "lintGraph",
       "observationKey",
@@ -57,12 +62,21 @@ describe("the public surface", () => {
     wf.step("implement", { skill: "implement-plan", maxTurns: 25 });
     wf.step("review", { skill: "review-changes" });
 
+    wf.run("typecheck", { command: "npm run typecheck" });
+
     wf.entry("research");
-    wf.edge("research", "plan", minflow.when.fileExists("notes.md"));
-    wf.gate("plan", "implement", { command: "approve-plan" });
-    wf.edge("implement", "review", minflow.when.exitZero("npm test"), {
-      otherwise: minflow.retry(3, "tests failing"),
+    wf.ask("research", "plan", {
+      questions: [
+        {
+          question: "Ship behind a flag?",
+          header: "Flag",
+          options: [{ label: "Yes" }, { label: "No" }],
+        },
+      ],
     });
+    wf.edge("plan", "typecheck");
+    wf.edge("typecheck", "implement", minflow.when.field("exitCode").equals(0));
+    wf.gate("implement", "review", { command: "approve-diff" });
     wf.branch("review", minflow.judge("Are there unresolved findings?"), {
       no: minflow.END,
       yes: "implement",
@@ -70,7 +84,13 @@ describe("the public surface", () => {
 
     const ir = wf.compile();
     expect(ir.entry).toBe("research");
-    expect(ir.nodes.map((node) => node.id)).toEqual(["research", "plan", "implement", "review"]);
+    expect(ir.nodes.map((node) => node.id)).toEqual([
+      "research",
+      "plan",
+      "implement",
+      "review",
+      "typecheck",
+    ]);
     expect(ir.hash).toMatch(/^[0-9a-f]{16}$/);
     expect(minflow.lintGraph(ir)).toEqual([]);
 

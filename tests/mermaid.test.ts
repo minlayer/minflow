@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { END, judge, retry, when, workflow } from "../src/builder.js";
-import type { Guard, IrEdge, IrNode, WorkflowIr } from "../src/ir.js";
+import type { Edge, Graph, Guard, Node } from "../src/ir.js";
 import type { MermaidOptions } from "../src/mermaid.js";
 import { toMermaid } from "../src/mermaid.js";
 
@@ -14,7 +14,7 @@ import { toMermaid } from "../src/mermaid.js";
 // is to show what the documented example actually renders as.
 // ---------------------------------------------------------------------------
 
-function graph(over: { entry?: string; nodes?: IrNode[]; edges?: IrEdge[] }): WorkflowIr {
+function graph(over: { entry?: string; nodes?: Node[]; edges?: Edge[] }): Graph {
   const nodes = over.nodes ?? [
     { id: "a", skill: "skill-a" },
     { id: "b", skill: "skill-b" },
@@ -31,7 +31,7 @@ function graph(over: { entry?: string; nodes?: IrNode[]; edges?: IrEdge[] }): Wo
 
 /** One edge per guard, all leaving the same node, so one render shows them all. */
 function guardLabels(guards: Guard[], options?: MermaidOptions): string[] {
-  const edges: IrEdge[] = guards.map((guard, index) => ({
+  const edges: Edge[] = guards.map((guard, index) => ({
     id: `a:${index + 1}`,
     from: "a",
     event: `e${index + 1}`,
@@ -46,7 +46,7 @@ function guardLabels(guards: Guard[], options?: MermaidOptions): string[] {
 }
 
 /** The example in SPEC §1.3, verbatim. */
-function specExample(): WorkflowIr {
+function specExample(): Graph {
   const wf = workflow({ name: "research-and-ship" });
 
   wf.step("research", {
@@ -120,7 +120,7 @@ describe("toMermaid", () => {
     expect(toMermaid(ir)).toBe(first);
     // A second IR that is equal without being the same object, since a graph is
     // rendered from a fresh parse as often as from the object that built it.
-    expect(toMermaid(JSON.parse(JSON.stringify(ir)) as WorkflowIr)).toBe(first);
+    expect(toMermaid(JSON.parse(JSON.stringify(ir)) as Graph)).toBe(first);
   });
 });
 

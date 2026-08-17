@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import type { IrNode } from "../src/ir.js";
+import type { Node } from "../src/ir.js";
 import {
   checkSkills,
   type DiscoveredSkill,
@@ -36,7 +36,7 @@ function withFrontmatter(
 
 /** A graph of nodes naming skills, which is all these checks read. */
 function graph(...pairs: [node: string, skill: string][]): SkillReferencingGraph {
-  const nodes: IrNode[] = pairs.map(([id, skill]) => ({ id, skill }));
+  const nodes: Node[] = pairs.map(([id, skill]) => ({ id, skill }));
   return { nodes };
 }
 

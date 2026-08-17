@@ -16,17 +16,8 @@
  * @packageDocumentation
  */
 
-import type {
-  End,
-  FieldOp,
-  Guard,
-  IrEdge,
-  JsonValue,
-  NodeId,
-  PayloadSource,
-  WorkflowIr,
-} from "./ir.js";
-import { END, isEnd } from "./ir.js";
+import type { Edge, End, FieldOp, Graph, Guard, JsonValue, NodeId, PayloadSource } from "./ir.js";
+import { END, isCommandNode, isEnd } from "./ir.js";
 
 /** Options for {@link toMermaid}. */
 export interface MermaidOptions {
@@ -99,7 +90,7 @@ const RESERVED = new Set([
  * Reads the graph and nothing else: no clock, no filesystem, no mutation of the
  * argument.
  */
-export function toMermaid(ir: WorkflowIr, options: MermaidOptions = {}): string {
+export function toMermaid(ir: Graph, options: MermaidOptions = {}): string {
   const direction = options.direction ?? "TD";
   const depth = options.guardDepth ?? DEFAULT_GUARD_DEPTH;
 
@@ -136,7 +127,11 @@ export function toMermaid(ir: WorkflowIr, options: MermaidOptions = {}): string 
   for (const node of ir.nodes) {
     const assigned = claim(node.id);
     identifiers.set(node.id, assigned);
-    declarations.push(stepShape(assigned, `${node.id} (${node.skill})`));
+    declarations.push(
+      isCommandNode(node)
+        ? commandShape(assigned, `${node.id} ($ ${node.command})`)
+        : stepShape(assigned, `${node.id} (${node.skill})`),
+    );
   }
   const start = claim(START);
 
@@ -148,7 +143,10 @@ export function toMermaid(ir: WorkflowIr, options: MermaidOptions = {}): string 
     const from = identifierFor(edge.from);
     // A gated edge does not continue into `goto`, it ends the run segment and
     // waits, so it is drawn as a different kind of arrow and not only labelled.
-    const arrow = edge.gate === undefined ? "-->" : "-.->";
+    // An ask stops too, but resumes by itself, so it gets a thick arrow rather
+    // than a dotted one: the run does not end there and the picture should not
+    // suggest it does.
+    const arrow = edge.gate !== undefined ? "-.->" : edge.ask !== undefined ? "==>" : "-->";
     links.push(link(from, arrow, passLabel(edge, depth), identifierFor(edge.goto)));
 
     const otherwise = edge.otherwise;
@@ -180,6 +178,17 @@ function stepShape(name: string, text: string): string {
   return `  ${name}["${escapeLabel(text)}"]`;
 }
 
+/**
+ * A command node is a subroutine box, not a plain one.
+ *
+ * The distinction is the point of drawing the graph at all: a reader has to see
+ * at a glance which boxes cost a model call and which are mechanical, and the
+ * `$` on the label says the same thing again for anyone reading the source.
+ */
+function commandShape(name: string, text: string): string {
+  return `  ${name}[["${escapeLabel(text)}"]]`;
+}
+
 /** END is a stadium rather than a box, so a terminal is not read as a step. */
 function terminalShape(name: string): string {
   return `  ${name}(["END"])`;
@@ -194,7 +203,7 @@ function link(from: string, arrow: string, text: string, to: string): string {
 // Labels
 // ---------------------------------------------------------------------------
 
-function passLabel(edge: IrEdge, depth: number): string {
+function passLabel(edge: Edge, depth: number): string {
   const parts: string[] = [];
   // An unlabelled arrow already says the transition is unconditional, so
   // writing "always" along it adds a word and no information.
@@ -203,6 +212,15 @@ function passLabel(edge: IrEdge, depth: number): string {
   // actually types is a backend's business, since each one folds the name into
   // its own command syntax.
   if (edge.gate !== undefined) parts.push(`awaits human: ${edge.gate}`);
+  // An ask says how many questions and where the answers land, because those two
+  // facts are what a later step's ctx references depend on.
+  if (edge.ask !== undefined) {
+    const count =
+      edge.ask.questions.kind === "static"
+        ? `${edge.ask.questions.items.length} question${edge.ask.questions.items.length === 1 ? "" : "s"}`
+        : `asks (from ${edge.ask.questions.path})`;
+    parts.push(`${count} to ${edge.ask.as}`);
+  }
   return parts.join(", ");
 }
 

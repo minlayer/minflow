@@ -18,10 +18,14 @@
 
 import { canonicalize } from "./hash.js";
 import type {
+  AskQuestion,
+  AskSpec,
+  Edge,
   End,
+  Graph,
   Guard,
-  IrEdge,
   JsonValue,
+  Node,
   NodeId,
   ObservationRequest,
   ObservationResult,
@@ -30,9 +34,21 @@ import type {
   RunState,
   Transition,
   TransitionErrorCode,
-  WorkflowIr,
 } from "./ir.js";
-import { DEFAULT_PAYLOAD_SOURCE, isEnd } from "./ir.js";
+import { DEFAULT_PAYLOAD_SOURCE, isCommandNode, isEnd } from "./ir.js";
+
+/**
+ * Whether a node is contracted to produce a readable payload.
+ *
+ * A step is contracted when it declares a schema. A command node always is: its
+ * exit code and output *are* the payload, which is what the guards leaving it
+ * read, so a command node that reports nothing has failed rather than returned
+ * an empty result.
+ */
+function declaresPayload(node: Node | undefined): boolean {
+  if (node === undefined) return false;
+  return isCommandNode(node) ? true : node.schema !== undefined;
+}
 
 /** Run-wide ceiling applied when the caller does not name one. */
 const DEFAULT_STEP_CEILING = 1000;
@@ -188,7 +204,7 @@ function collectGuard(guard: Guard, into: ObservationRequest[], seen: Set<string
  * them, so a lane a guard names explicitly stays earlier in enumeration order
  * and therefore still wins rule 7a.
  */
-export function observationsFor(ir: WorkflowIr, state: RunState): ObservationRequest[] {
+export function observationsFor(ir: Graph, state: RunState): ObservationRequest[] {
   const requests: ObservationRequest[] = [];
   const seen = new Set<string>();
   for (const edge of ir.edges) {
@@ -196,7 +212,7 @@ export function observationsFor(ir: WorkflowIr, state: RunState): ObservationReq
     collectGuard(edge.guard, requests, seen);
   }
   const node = ir.nodes.find((candidate) => candidate.id === state.node);
-  if (node?.schema !== undefined) {
+  if (declaresPayload(node)) {
     const request = requestFor({ kind: "payload", from: DEFAULT_PAYLOAD_SOURCE });
     if (!seen.has(request.key)) {
       seen.add(request.key);
@@ -443,7 +459,7 @@ function runningClone(state: RunState): RunState {
  */
 function withoutAttemptsFrom(
   attempts: Record<string, number>,
-  ir: WorkflowIr,
+  ir: Graph,
   node: NodeId,
 ): Record<string, number> {
   const departed = new Set(ir.edges.filter((edge) => edge.from === node).map((edge) => edge.id));
@@ -480,7 +496,7 @@ function errorTransition(state: RunState, code: TransitionErrorCode, message: st
  * the inline lane empty, so the requirement is one-of, not all-of.
  */
 function payloadOutput(
-  ir: WorkflowIr,
+  ir: Graph,
   state: RunState,
   resolved: Record<string, ObservationResult>,
 ): { ok: true; value?: JsonValue } | { ok: false; error: string } {
@@ -500,16 +516,20 @@ function payloadOutput(
   }
 
   const node = ir.nodes.find((candidate) => candidate.id === state.node);
-  if (found === undefined && node?.schema !== undefined) {
-    // `failures` cannot be empty here: a node declaring a schema always gets a
-    // payload request from observationsFor, and every request that did not land
-    // in `found` landed in `failures`. An unreachable fallback string would be a
-    // branch no test could ever defend.
+  if (found === undefined && declaresPayload(node)) {
+    // `failures` cannot be empty here: a node contracted to produce a payload
+    // always gets a payload request from observationsFor, and every request that
+    // did not land in `found` landed in `failures`. An unreachable fallback
+    // string would be a branch no test could ever defend.
     const detail = failures.join(", ");
+    const contract =
+      node !== undefined && isCommandNode(node)
+        ? "is a command node, whose exit code and output are its payload, but produced none"
+        : "declares a schema but produced no readable payload";
     return {
       ok: false,
       error:
-        `node "${state.node}" declares a schema but produced no readable payload: ${detail}. ` +
+        `node "${state.node}" ${contract}: ${detail}. ` +
         "A declared output contract that is not met is an error, not an empty output.",
     };
   }
@@ -528,7 +548,7 @@ function payloadOutput(
  * the host has already been told to persist.
  */
 function departingState(
-  ir: WorkflowIr,
+  ir: Graph,
   state: RunState,
   resolved: Record<string, ObservationResult>,
 ): RunState | { error: string } {
@@ -557,10 +577,10 @@ function moveTo(next: RunState, target: NodeId | End, via: string, event: string
 }
 
 function fireEdge(
-  ir: WorkflowIr,
+  ir: Graph,
   state: RunState,
   resolved: Record<string, ObservationResult>,
-  edge: IrEdge,
+  edge: Edge,
 ): Transition {
   if (edge.gate !== undefined) {
     if (isEnd(edge.goto)) {
@@ -590,16 +610,130 @@ function fireEdge(
     next.node = edge.goto;
     return { kind: "gate", gate: edge.gate, to: edge.goto, via: edge.id, state: next };
   }
+  if (edge.ask !== undefined) {
+    if (isEnd(edge.goto)) {
+      return errorTransition(
+        state,
+        "invalid-graph",
+        `edge ${edge.id} out of "${state.node}" asks on the way to END. A run mid-ask stores ` +
+          "the node it will resume into, and END is not a node, so the answers could never be " +
+          "delivered anywhere. Put the ask before the step that needs the answers.",
+      );
+    }
+    const questions = askQuestions(ir, state, resolved, edge, edge.ask);
+    if (typeof questions === "string") {
+      return errorTransition(state, "invalid-graph", questions);
+    }
+    // The node the run will continue into is written down now, exactly as a gate
+    // does, because the answers arrive on a later pass with no memory of which
+    // edge raised them. Unlike a gate, `node` stays put: the ask has not left
+    // this node yet, and moving it would make an unanswered ask look like an
+    // arrival at the destination.
+    const next = departingState(ir, state, resolved);
+    if (isDepartureError(next)) return errorTransition(state, "observation-failed", next.error);
+    next.status = "asking";
+    // The destination is written into `node` now, exactly as a gate does, so
+    // resuming is only a matter of flipping the status back. `status` is what
+    // distinguishes a run parked mid-ask from one that has arrived.
+    next.node = edge.goto;
+    next.ask = {
+      edge: edge.id,
+      to: edge.goto,
+      as: edge.ask.as,
+      questions,
+      relayed: false,
+    };
+    return { kind: "ask", questions, as: edge.ask.as, to: edge.goto, via: edge.id, state: next };
+  }
   const next = departingState(ir, state, resolved);
   if (isDepartureError(next)) return errorTransition(state, "observation-failed", next.error);
   return moveTo(next, edge.goto, edge.id, edge.event);
 }
 
-function applyOtherwise(
-  ir: WorkflowIr,
+/**
+ * The questions an ask puts, resolved to values, or the reason they cannot be.
+ *
+ * A static list is already values. An `output` list is read out of the payload
+ * of the node being left, which is what lets a step compute its own questions
+ * rather than the author having to know them when writing the graph.
+ */
+function askQuestions(
+  ir: Graph,
   state: RunState,
   resolved: Record<string, ObservationResult>,
-  edge: IrEdge,
+  edge: Edge,
+  ask: AskSpec,
+): AskQuestion[] | string {
+  if (ask.questions.kind === "static") return ask.questions.items;
+
+  const payload = payloadOutput(ir, state, resolved);
+  if (!payload.ok) {
+    return (
+      `edge ${edge.id} out of "${state.node}" asks with questions read from its payload, ` +
+      `but the payload could not be read: ${payload.error}`
+    );
+  }
+  const value = payload.value;
+  const found = value === undefined ? undefined : readPath(value, ask.questions.path);
+  if (found === undefined) {
+    return (
+      `edge ${edge.id} out of "${state.node}" asks with questions at "${ask.questions.path}" ` +
+      "of its payload, and that path holds nothing. A step that raises an ask has to produce " +
+      "the questions it wants put."
+    );
+  }
+  const problem = questionListProblem(found);
+  if (problem !== undefined) {
+    return (
+      `edge ${edge.id} out of "${state.node}" asks with questions at "${ask.questions.path}" ` +
+      `of its payload, but ${problem}`
+    );
+  }
+  return found as unknown as AskQuestion[];
+}
+
+/**
+ * Why a value cannot be a question list, or undefined when it can.
+ *
+ * Checked here rather than trusted, because these questions came out of a model's
+ * payload and go straight into a dialog the user sees. A malformed one has to be
+ * a reported error rather than an empty prompt with no options.
+ */
+function questionListProblem(value: JsonValue): string | undefined {
+  if (!Array.isArray(value)) return "it is not a list of questions.";
+  if (value.length === 0) return "the list is empty.";
+  for (const [index, entry] of value.entries()) {
+    const at = `question ${index + 1}`;
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+      return `${at} is not an object.`;
+    }
+    if (typeof entry.question !== "string" || entry.question.trim() === "") {
+      return `${at} has no question text.`;
+    }
+    if (typeof entry.header !== "string" || entry.header.trim() === "") {
+      return `${at} has no header.`;
+    }
+    const options = entry.options;
+    if (!Array.isArray(options) || options.length === 0) {
+      return `${at} offers no options.`;
+    }
+    for (const option of options) {
+      if (option === null || typeof option !== "object" || Array.isArray(option)) {
+        return `${at} has an option that is not an object.`;
+      }
+      if (typeof option.label !== "string" || option.label.trim() === "") {
+        return `${at} has an option with no label.`;
+      }
+    }
+  }
+  return undefined;
+}
+
+function applyOtherwise(
+  ir: Graph,
+  state: RunState,
+  resolved: Record<string, ObservationResult>,
+  edge: Edge,
   otherwise: Otherwise,
 ): Transition {
   if (otherwise.kind === "goto") {
@@ -666,7 +800,7 @@ function ordinal(value: number): string {
  * @param opts - `stepCeiling` defaults to 1000.
  */
 export function evaluate(
-  ir: WorkflowIr,
+  ir: Graph,
   state: RunState,
   resolved: Record<string, ObservationResult>,
   opts?: { stepCeiling?: number },
