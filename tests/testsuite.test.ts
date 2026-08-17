@@ -20,6 +20,28 @@ function branchy() {
   return wf.compile();
 }
 
+/**
+ * A graph whose retry lands on a command node.
+ *
+ * `branchy` retries a step, and a step gets a fresh hook fire per visit. A
+ * command node is drained without leaving the dispatcher, so its visits share
+ * one process, which is the case that can tell them apart from the one that
+ * cannot.
+ */
+function retriedCommand() {
+  const wf = workflow({ name: "retried-command" });
+  wf.step("draft", { skill: "s" });
+  wf.run("build", { command: "true" });
+  wf.step("ship", { skill: "s" });
+  wf.entry("draft");
+  wf.edge("draft", "build");
+  wf.edge("build", "ship", when.field("exitCode").equals(0), {
+    otherwise: retry(2, "the build failed"),
+  });
+  wf.edge("ship", END);
+  return wf.compile();
+}
+
 const skills = () => [Skill.from({ name: "s", description: "Does a step.", body: "# s\n" })];
 
 describe("what a graph can decide", () => {
@@ -142,6 +164,30 @@ describe("running a plan against the emitted dispatcher", () => {
       });
     }
     expect(result.passed).toBe(true);
+  });
+
+  it("answers each visit in turn when one fire visits a node twice", () => {
+    const graph = retriedCommand();
+    const plan = generateSuite(graph);
+
+    // The case that matters fails the build once and passes it on the retry, so
+    // the two visits need different answers. Both happen inside one dispatcher
+    // process, and the harness is blocked while that runs, so it cannot rewrite
+    // the stub file between them. Answering per node rather than per visit made
+    // the second visit silently overwrite the first, and the run advanced on the
+    // first attempt instead of retrying.
+    const failsThenPasses = plan.cases.find(
+      (entry) => entry.walk.filter((node) => node === "build").length === 2,
+    );
+    expect(failsThenPasses?.walk).toEqual(["draft", "build", "build", "ship"]);
+
+    const result = runSuite(graph, plan, { skills: skills() });
+    for (const testCase of result.cases) {
+      expect({ id: testCase.id, problems: testCase.problems }).toEqual({
+        id: testCase.id,
+        problems: [],
+      });
+    }
   });
 
   it("catches a graph whose emitted plugin does not do what the graph says", () => {
