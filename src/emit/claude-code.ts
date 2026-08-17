@@ -2101,7 +2101,11 @@ const ASK_MARKER = "MINFLOW-ASK";
 // How a run is told to answer its own questions. An argument rather than an
 // environment variable, so a run that was unattended is visible in its own
 // transcript, which is exactly where you look when you doubt an answer.
-const AUTO_FLAG = /(^|\s)--auto(\s|$)/;
+// A word boundary rather than whitespace after the flag: a user writing
+// "--auto." or "--auto, please" means it, and a flag that silently fails to
+// register is the worst way for this to be wrong, since the run then waits for
+// answers nobody is coming to give.
+const AUTO_FLAG = /(^|\s)--auto\b/;
 
 // A test seam, and the only one in this file.
 //
