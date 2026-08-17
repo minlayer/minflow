@@ -100,14 +100,18 @@ export interface StepNode extends NodeBase {
   /**
    * Per-node model override. Defaults to inheriting the session's.
    *
-   * **A known defect, deliberately unpaid: this holds a provider's own model
-   * name.** `"haiku"` in an IR whose whole claim is to outlive any one platform
-   * is a Claude Code dependency written into the layer that exists not to have
-   * one, and nothing validates it, so a misspelling compiles clean and names a
-   * model the platform does not have. It should be an agnostic tier, `small`,
-   * `medium` or `large`, translated by each backend, with exact pinning moved to
-   * the emit call where every other platform-specific fact already lives.
-   * Changing it is breaking, so it waits. See D28 and L23.
+   * **Prefer a portable tier: `"small"`, `"medium"` or `"large"`.** Each backend
+   * translates one into a real model, so a graph using tiers names no provider's
+   * product and stays readable by a backend serving a different one. A tier is
+   * relative to whichever ladder the deployment resolves rather than an absolute
+   * capability claim, because a client is not a provider: several clients expose
+   * more than one provider's ladder at once.
+   *
+   * **A provider's own name is still accepted, and that is a known defect.** The
+   * type is a free string, so `"haiku"` remains legal in an IR whose whole claim
+   * is to outlive any one platform. Closing it means an enum, which is breaking,
+   * so it waits. What is done: the backend refuses a name it does not recognise,
+   * rather than emitting it verbatim. See D28 and L23.
    */
   model?: string;
   /** Per-step turn ceiling. Provider-agnostic: a turn is a turn. */

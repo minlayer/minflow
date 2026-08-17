@@ -224,7 +224,7 @@ registrations are scoped so that nothing fires during unrelated work.
 Working: the builder, the IR, the graph lint, the transition evaluator, run
 context interpolation, command nodes, interactive asks, auto mode, resuming an
 interrupted run, skills shipped inside the plugin, skill validation, Mermaid
-output, generated tests, and the Claude Code backend. 646 tests, none of which
+output, generated tests, and the Claude Code backend. 651 tests, none of which
 need a model.
 
 A compiled workflow runs: the transition cycle, a judge verdict, a gate parked in

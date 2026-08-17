@@ -282,12 +282,42 @@ model?: "small" | "medium" | "large"
 ```
 
 with the Claude Code backend mapping `small` to `haiku`, `medium` to `sonnet`,
-`large` to `opus`, and absent meaning inherit. Size words rather than
-`fast`/`balanced`/`deep` because the axis authors actually reason about is how
-much capability to spend, and because a tier is a relative claim within one
-provider's line rather than an absolute one. Three tiers rather than five because
-every current provider ships about three, and a tier nothing maps to is worse
-than a tier that is missing.
+`large` to `opus`, and absent meaning inherit. **Shipped as an accepted spelling
+in 0.2.1**, alongside the provider names, which still pass through.
+
+**A tier is relative to whichever ladder a deployment resolves, not an absolute
+capability claim, and this is the part it is easy to get wrong.** A client is not
+a provider. Cursor and Copilot each expose several providers' ladders at once,
+and a Codex-style client treats reasoning effort as a separate axis from model
+choice. So "medium" on one ladder may well beat "large" on another, and the tier
+cannot mean a capability floor. It means: of the models this deployment has put in
+play, spend low, middle or top. A step that genuinely requires a capability floor
+is asking for something else, and that something else is not specified here.
+
+Size words rather than `fast`/`balanced`/`deep` because the axis authors reason
+about is how much capability to spend. Three tiers because every current ladder
+has about three, and a tier nothing maps to is worse than a tier that is missing.
+
+**Where the rest of it goes.** The ladder itself is a property of the deployment,
+not of the workflow, so it belongs in `EmitOptions` next to every other
+platform-specific fact:
+
+```
+claudeCode.emit(ir, { models: { small: "haiku", large: "claude-opus-5" } })
+```
+
+That shape works unchanged for a multi-provider client, because whoever writes
+the emit call chooses the ladder and may mix providers freely within it. Pinning
+one exact model for one node belongs in the same place and keyed by node id, so
+an unknown id is a compile error like every other unknown id. The two have
+different lifetimes: how much capability a step deserves is a property of the
+workflow, and which model that means today changes every few months.
+
+**Effort is a second axis and is currently unexpressible.** Claude Code's agent
+frontmatter accepts `effort` (L16) and minflow emits nothing for it, while some
+clients fold effort into the model choice instead of separating it. If it is
+added it should be its own ordinal field rather than more tiers, and a backend
+that cannot separate it has to say so rather than silently dropping it.
 
 An enum also buys the validation the string cannot have: a bad tier becomes a
 compile error, at the authoring line, like every other authoring mistake.
@@ -299,12 +329,16 @@ per-backend override map. The graph says how much capability a step deserves; th
 emit call says which model that means today. Those are different lifetimes: the
 first is a property of the workflow, the second changes every few months.
 
-**Why it is left for now.** The rename is breaking, it touches the IR, the
-builder, the emitter, the SPEC's node table and every graph in the wild, and it
-arrived in the middle of a cost fix that needed to land. Live with it knowingly.
-The mitigation is indirection at the call site: nimble-researcher declares three
-named tiers in one place, so the eventual migration is three lines rather than
-thirteen. Recorded as L23.
+**What shipped, and what did not.** 0.2.1 contains the leak without fixing it:
+tiers are accepted and translated, and a value the backend does not recognise is
+now a compile error naming the node, where before a misspelling reached the
+frontmatter verbatim and produced an agent naming a model that never existed.
+Validation lives in the backend, because which names are real is a platform fact
+and the builder is not allowed to know one.
+
+Still outstanding: the IR's type is a free `string` rather than the enum, so the
+provider names remain legal and nothing stops a new graph using them. Closing
+that is breaking and waits. Recorded as L23.
 
 ### D22. Track the emerging portable orchestration API
 
