@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-19
+
+### Added
+
+- **A finished or stopped run leaves a record, and `--from <node>` re-enters
+  from it.** A record holds every payload every step produced, keyed by the step
+  that produced it, and the entry command can start a fresh run at any step you
+  name with that record carried into it. Nothing before the named step runs
+  again.
+
+  This is the loop a workflow is actually edited in: run it, read what came out,
+  change one prompt near the end, run it again. Paying for the eleven steps in
+  front of the twelfth, every time, is what made that loop expensive. The record
+  is not consumed, so one run seeds as many attempts as the tuning takes.
+
+  A graph whose hash moved is accepted here, unlike a resume, because changing
+  the graph is usually the reason to re-enter. What replaces the hash check is
+  stricter than the hash was: every value the chosen step reads is checked
+  against the record before the run starts, and a step that reads something
+  nothing carries is refused rather than started. A value only a later step reads
+  is named as a warning instead, because that step may sit on a branch this run
+  never takes.
+
+  A record is not state and is not a run. It sits in its own directory, nothing
+  resumes one, and no scan of live runs can see one. Records are capped at the
+  most recent 20, and abandoning a run at a gate keeps none: that command means
+  throw this away, and a record would make it reversible by accident.
+
+  An interrupted run seeds a re-entry too, so there is no need to finish or
+  abandon one first.
+
+### Fixed
+
+- **An argument the entry command does not recognise is now reported.** It named
+  a run to resume, and when it named nothing the caller could not tell that from
+  there being nothing to resume, so a typo, or a subject somebody reasonably
+  expected to reach the workflow, silently started a fresh run over the top of a
+  stalled one. That is the single outcome resume exists to prevent, and it was
+  reachable by misspelling a word.
+
+
 ## [0.2.1] - 2026-08-17
 
 ### Added

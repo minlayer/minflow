@@ -1037,20 +1037,26 @@ function askProtocolSection(pluginName: string): string {
 }
 
 function runCommandFile(ir: Graph, pluginName: string): string {
-  // `--new` is always offered, unlike `--auto`: every workflow can be
-  // interrupted, so every workflow can be resumed, and the flag is how you say
-  // you meant to start over rather than continue.
+  // `--new` and `--from` are always offered, unlike `--auto`: every workflow can be
+  // interrupted, so every workflow can be resumed, and every workflow gets edited, so
+  // every workflow gets re-entered. The flags are how you say you meant to start over
+  // rather than continue, and where you meant to start.
+  const resumeHints =
+    "[--new to start over instead of resuming] [--from <step> to start at one step with " +
+    "an earlier run's results]";
   const hints = graphAsks(ir)
-    ? "[--auto to answer the run's own questions instead of asking you] [--new to start over " +
-      "instead of resuming]"
-    : "[--new to start over instead of resuming]";
+    ? `[--auto to answer the run's own questions instead of asking you] ${resumeHints}`
+    : resumeHints;
   return commandFor(
     `Start or resume the "${ir.name}" workflow.`,
     spawnRunnerBody(
       pluginName,
       `Start the **${oneLine(ir.name)}** workflow, which begins at \`${ir.entry}\`.\n\n` +
         "If a previous run stopped part way through, this picks it up where it left off " +
-        "instead of starting again, and says so. Everything already finished is kept.",
+        "instead of starting again, and says so. Everything already finished is kept.\n\n" +
+        "`--from <step>` starts a fresh run at one step, carrying what an earlier run " +
+        "produced, so nothing before that step runs again. It is how a workflow is tuned " +
+        "without paying for every step in front of the one being changed.",
       graphAsks(ir),
     ),
     hints,
@@ -2165,6 +2171,15 @@ const AUTO_FLAG = /(^|\s)--auto\b/;
 // resume, because the expensive mistake is redoing work, not continuing it.
 const NEW_FLAG = /(^|\s)--new\b/;
 
+// Starts a fresh run at a named step, seeded with what an earlier run recorded.
+//
+// Held as two patterns because they answer two questions. The first is whether
+// re-entry was asked for at all, so that "--from" with nothing after it is a mistake
+// to report rather than a flag to quietly ignore. The second lifts the step id out,
+// in either spelling a person might type.
+const FROM_FLAG = /(^|\s)--from\b/;
+const FROM_NODE = /(^|\s)--from(?:\s+|=)([^\s]+)/;
+
 // A test seam, and the only one in this file.
 //
 // Set to a path, it answers observations from that file instead of resolving
@@ -2308,6 +2323,96 @@ function deleteState(runId) {
   }
 }
 
+// A cap, rather than a sweep on age. A record holds every payload a run produced,
+// and the loop it serves reaches back a few runs rather than a few months. Nothing
+// else ever deletes one, so without a cap this directory only grows.
+const RECORD_LIMIT = 20;
+
+// What a finished or stopped run leaves behind, and the reason it is not state.
+//
+// State is still ephemeral and still keyed by run id (D11). A record is a different
+// thing that happens to hold the same outputs: nothing resumes one, session garbage
+// collection never sees one, and it sits in its own directory so that no scan of live
+// runs can find it by accident.
+//
+// It exists because of how a workflow is actually edited. You run it, you read what
+// came out, you change one prompt, and you run it again. Re-running twenty steps to
+// reach the twenty-first is the whole cost of that loop. A record lets the next run
+// start at the twenty-first with what the first twenty produced.
+function recordPath(runId) {
+  return path.join(DATA, "records", runId + ".json");
+}
+
+// Enough to seed a run, plus enough to tell two of them apart when a person is
+// choosing. The outputs are the point. Everything else is the label.
+function keepRecord(state, outcome, detail) {
+  const record = {
+    runId: state.runId,
+    graphHash: state.graphHash,
+    workflow: PLUGIN.workflow,
+    outcome: outcome,
+    node: state.node,
+    steps: state.steps,
+    at: new Date().toISOString(),
+    outputs: state.outputs !== null && typeof state.outputs === "object" ? state.outputs : {},
+  };
+  if (typeof detail === "string" && detail !== "") record.detail = detail;
+  try {
+    writeJson(recordPath(state.runId), record);
+    pruneRecords();
+  } catch (error) {
+    // A record that cannot be written is not a reason to fail a run that has already
+    // ended. It costs the next re-entry, and saying so is better than passing silently.
+    process.stderr.write(
+      "minflow: could not keep a record of run " + state.runId + ": " + error.message + "\n",
+    );
+  }
+}
+
+// Newest first. A run id begins with the timestamp it was minted from, so the string
+// order is the time order and no second index has to be kept consistent with it.
+function byNewestRunId(a, b) {
+  if (a.runId < b.runId) return 1;
+  if (a.runId > b.runId) return -1;
+  return 0;
+}
+
+function allRecords() {
+  let entries = [];
+  try {
+    entries = fs.readdirSync(path.join(DATA, "records"));
+  } catch (error) {
+    return [];
+  }
+  const found = [];
+  for (const entry of entries) {
+    if (entry.slice(-5) !== ".json") continue;
+    const record = readJson(path.join(DATA, "records", entry));
+    if (record === null || typeof record.runId !== "string") continue;
+    found.push(record);
+  }
+  found.sort(byNewestRunId);
+  return found;
+}
+
+function pruneRecords() {
+  const kept = allRecords();
+  for (let index = RECORD_LIMIT; index < kept.length; index += 1) {
+    try {
+      fs.unlinkSync(recordPath(kept[index].runId));
+    } catch (error) {
+      // Already gone is the desired end state.
+    }
+  }
+}
+
+// The end of a run, whichever way it ended. Every terminal path goes through here, so
+// there is one answer to what is left on disk afterwards rather than eight.
+function concludeRun(state, outcome, detail) {
+  keepRecord(state, outcome, detail);
+  deleteState(state.runId);
+}
+
 function runIdForSession(sessionId) {
   const pointer = readJson(sessionPath(sessionId));
   return pointer && typeof pointer.runId === "string" ? pointer.runId : null;
@@ -2373,15 +2478,25 @@ function askingRuns() {
  * resuming the wrong run is worse than asking which.
  */
 function resumableRunFor(event, sessionId) {
-  const named = commandArgument(event).replace(AUTO_FLAG, "").replace(NEW_FLAG, "").trim();
+  const named = leftoverArgument(event);
   const candidates = resumableRuns();
-  if (candidates.length === 0) return { none: true };
+  // Checked before the empty case, and reported rather than discarded. A leftover that
+  // names no run used to mean the same thing as no leftover at all, so a typo, or a
+  // subject somebody reasonably expected to reach the workflow, started a fresh run
+  // instead: the one outcome this whole path exists to prevent, reachable by
+  // misspelling a word.
   if (named !== "") {
     for (const state of candidates) {
       if (state.runId === named) return { state: state };
     }
-    return { none: true };
+    return {
+      error:
+        'nothing stopped part way through is named "' + named +
+        '". Text after the command names a run to resume, and there is no channel that ' +
+        "would carry it to the workflow. Drop it, or pass --new to start a fresh run.",
+    };
   }
+  if (candidates.length === 0) return { none: true };
   const linked = runIdForSession(sessionId);
   for (const state of candidates) {
     if (state.runId === linked) return { state: state };
@@ -2644,9 +2759,11 @@ function taskFor(graph, state) {
     return {
       error:
         'step "' + state.node + '" cannot be started: ' + failure +
-        ". A graph compiled by minflow's builder cannot reach this, because the builder refuses " +
-        "a ctx reference unless the step it names runs on every path to this one; an IR from " +
-        "another front-end can. Fix the template, or the step it reads from.",
+        ". Two things reach this. A run re-entered with --from, whose record does not carry " +
+        "that value, which is checked before such a run starts and can still be reached by " +
+        "editing a step to read something new. And an IR from another front-end, since " +
+        "minflow's own builder refuses a ctx reference unless the step it names runs on every " +
+        "path to this one. Fix the template, the step it reads from, or re-enter earlier.",
     };
   }
   return { text: text };
@@ -3262,6 +3379,257 @@ function commandArgument(event) {
   return "";
 }
 
+/**
+ * Whatever the argument holds once the flags are taken out of it.
+ *
+ * That leftover names a run. It is not passed to the workflow, and there is no
+ * channel that would carry it there, so text nobody recognises is a mistake rather
+ * than a subject.
+ */
+function leftoverArgument(event) {
+  return commandArgument(event)
+    .replace(FROM_NODE, " ")
+    .replace(AUTO_FLAG, " ")
+    .replace(NEW_FLAG, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** The step id after --from, or "" when the flag carries none. */
+function reentryNode(event) {
+  const found = FROM_NODE.exec(commandArgument(event));
+  return found === null ? "" : found[2];
+}
+
+/** Every step id in the graph, for an error that has to say what was available. */
+function nodeIdList(graph) {
+  const ids = [];
+  for (let index = 0; index < graph.nodes.length; index += 1) {
+    const node = graph.nodes[index];
+    if (node !== null && typeof node === "object" && typeof node.id === "string") ids.push(node.id);
+  }
+  return ids;
+}
+
+/**
+ * Every node a run entering at the named step can still reach.
+ *
+ * Used to tell two kinds of missing value apart. A reference to a node that runs
+ * later is fine, because that node will run. A reference to a node that neither ran
+ * before the record was kept nor runs after this entry point is a hole, and the run
+ * will stop on it however many expensive steps later.
+ */
+function reachableFrom(graph, start) {
+  const seen = {};
+  const queue = [start];
+  seen[start] = true;
+  while (queue.length > 0) {
+    const at = queue.shift();
+    for (let index = 0; index < graph.edges.length; index += 1) {
+      const edge = graph.edges[index];
+      if (edge === null || typeof edge !== "object" || edge.from !== at) continue;
+      const targets = [edge.goto];
+      if (edge.otherwise !== null && typeof edge.otherwise === "object") {
+        if (edge.otherwise.kind === "goto") targets.push(edge.otherwise.node);
+      }
+      for (let which = 0; which < targets.length; which += 1) {
+        const target = targets[which];
+        if (typeof target !== "string" || seen[target] === true) continue;
+        seen[target] = true;
+        queue.push(target);
+      }
+    }
+  }
+  return seen;
+}
+
+/**
+ * The ctx references a run entering at the named step cannot satisfy.
+ *
+ * Each entry names the node that reads and the reference it reads, so the report can
+ * separate the fatal case from the merely likely one: a hole in the entry node itself
+ * stops the run before it costs anything, and a hole further on may sit on a branch
+ * this run never takes.
+ */
+function unsatisfiedReferences(graph, start, outputs) {
+  const reachable = reachableFrom(graph, start);
+  const holes = [];
+  for (let index = 0; index < graph.nodes.length; index += 1) {
+    const node = graph.nodes[index];
+    if (node === null || typeof node !== "object") continue;
+    if (reachable[node.id] !== true) continue;
+    const template = node.kind === "command" ? node.command : node.prompt;
+    if (typeof template !== "string") continue;
+    const pattern = /\{\{\s*ctx\.([^{}\s]+?)\s*\}\}/g;
+    let found = pattern.exec(template);
+    while (found !== null) {
+      const reference = found[1];
+      const producer = reference.split(".")[0];
+      // A step that runs between here and there will supply it, whatever it holds.
+      if (producer === node.id || reachable[producer] === true) {
+        found = pattern.exec(template);
+        continue;
+      }
+      // Otherwise the record has to answer, and it has to answer the whole reference.
+      // Checking only the first segment passes a record that holds the right step and
+      // the wrong field, which then fails at step one with an error that blames the
+      // graph. Resolved through the same reader the interpolation uses, so the check
+      // and the run cannot disagree about what counts as present.
+      if (readOutputPath(outputs, reference).error) {
+        holes.push({ node: node.id, reference: reference });
+      }
+      found = pattern.exec(template);
+    }
+  }
+  return holes;
+}
+
+/**
+ * The record, or the stopped run, a re-entry is seeded from.
+ *
+ * A named one wins. Otherwise the newest, because re-entry is a loop you run several
+ * times in an hour and the one you mean is the one you just watched. Stopped runs are
+ * candidates too: a run interrupted mid-flight holds the same outputs a record does,
+ * and refusing to seed from one would send a person to start it over first.
+ */
+function seedFor(named) {
+  const candidates = allRecords().concat(resumableRuns().slice().sort(byNewestRunId));
+  if (named !== "") {
+    for (let index = 0; index < candidates.length; index += 1) {
+      if (candidates[index].runId === named) return { seed: candidates[index] };
+    }
+    return {
+      error:
+        'no finished, stopped or interrupted run is named "' + named +
+        '". Text after the command names a run to seed from, and is not passed to the ' +
+        "workflow. Drop it to use the most recent run.",
+    };
+  }
+  if (candidates.length === 0) {
+    return {
+      error:
+        "nothing has run yet, so there is nothing to re-enter. A run leaves a record when " +
+        "it finishes and when it stops, and --from starts a fresh run from one of those.",
+    };
+  }
+  candidates.sort(byNewestRunId);
+  return { seed: candidates[0] };
+}
+
+/**
+ * Start a fresh run at a chosen step, carrying what an earlier run produced.
+ *
+ * A new run rather than a revived one, deliberately. The record stays where it is and
+ * can seed the next attempt too, which is the point: you re-enter the same run at
+ * three different steps while you tune three different prompts.
+ *
+ * A graph whose hash has moved is accepted here, unlike a resume. Resume is the
+ * default and happens to a run you did not deliberately touch, so it stays
+ * conservative. Re-entry is a thing you typed, at a step you named, and the reason to
+ * type it is almost always that you just changed the graph. Refusing it would refuse
+ * the whole use case. What replaces the hash check is the reference check below,
+ * which is stricter about the thing the hash was standing in for.
+ */
+function reenterRun(event, sessionId, graph) {
+  const node = reentryNode(event);
+  if (node === "") {
+    report(
+      "--from needs the id of the step to start at, as in --from " + PLUGIN.entry +
+        ". This graph has: " + nodeIdList(graph).join(", ") + ".",
+    );
+    return;
+  }
+  if (nodeIdList(graph).indexOf(node) === -1) {
+    report(
+      'this graph has no step called "' + node + '". It has: ' + nodeIdList(graph).join(", ") + ".",
+    );
+    return;
+  }
+  const found = seedFor(leftoverArgument(event));
+  if (found.error) {
+    report(found.error);
+    return;
+  }
+  const seed = found.seed;
+  const outputs =
+    seed.outputs !== null && typeof seed.outputs === "object" ? seed.outputs : {};
+
+  const holes = unsatisfiedReferences(graph, node, outputs);
+  const here = [];
+  const later = [];
+  for (let index = 0; index < holes.length; index += 1) {
+    const hole = holes[index];
+    const line = hole.node + " reads {{ctx." + hole.reference + "}}";
+    if (hole.node === node) here.push(line);
+    else later.push(line);
+  }
+  if (here.length > 0) {
+    report(
+      'cannot start at "' + node + '" from run ' + seed.runId + ": " + here.join(", ") +
+        ", and that value is neither in the record nor produced by anything this run would " +
+        "reach. Re-enter earlier, at a step that produces it.",
+    );
+    return;
+  }
+  if (needsAgent(node) && typeof PLUGIN.agents[node] !== "string") {
+    report('no agent is registered for node "' + node + '". Regenerate the plugin.');
+    return;
+  }
+
+  const runId = mintRunId();
+  // Read fresh from the argument, unlike a resume, which carries the flag the run
+  // began with. This is a new run and a person is typing the command now, so the
+  // answer to whether anybody is behind it is the one they just gave.
+  const state = {
+    runId: runId,
+    graphHash: PLUGIN.graphHash,
+    node: node,
+    status: "running",
+    attempts: {},
+    steps: 0,
+    auto: AUTO_FLAG.test(commandArgument(event)),
+    outputs: Object.assign({}, outputs),
+    seededFrom: seed.runId,
+  };
+  saveState(withScratch(state, startingScratch(state)));
+  linkSession(sessionId, runId);
+  appendTrace(runId, {
+    at: new Date().toISOString(),
+    decision: "reenter",
+    session: sessionId,
+    run: runId,
+    from: seed.runId,
+    node: node,
+    carried: Object.keys(outputs).length,
+  });
+
+  // The seed is described, not merely named. Records and interrupted runs are both
+  // candidates and the newest wins, so which one that was is not obvious from a run id.
+  const seedWas =
+    typeof seed.outcome === "string"
+      ? "which " + seed.outcome + ' at step "' + seed.node + '"'
+      : 'which is interrupted at step "' + seed.node + '"';
+  const lines = [
+    "run " + runId + ' starts at step "' + node + '", carrying ' + Object.keys(outputs).length +
+      " step outputs from run " + seed.runId + ", " + seedWas +
+      ". Nothing before that step runs again.",
+  ];
+  if (seed.graphHash !== PLUGIN.graphHash) {
+    lines.push(
+      "That run used graph " + seed.graphHash + " and this one is " + PLUGIN.graphHash +
+        ". The graph moved, which is usually why you are here. Every value this run needs " +
+        "was checked against the record before it started.",
+    );
+  }
+  if (later.length > 0) {
+    lines.push(
+      "Watch for: " + later.join(", ") + ". Nothing carried supplies those, and no step " +
+        "downstream produces them, so the run will stop if it reaches one.",
+    );
+  }
+  report(lines.join(" "));
+}
+
 function startRun(event, sessionId) {
   const graph = requireGraph();
   if (graph === null) return;
@@ -3273,6 +3641,14 @@ function startRun(event, sessionId) {
     return;
   }
   const argument = commandArgument(event);
+
+  // Before anything else looks at the argument. Re-entry is explicit, it names its own
+  // step, and it starts a fresh run, so neither the resume path nor --new has anything
+  // to say about it.
+  if (FROM_FLAG.test(argument)) {
+    reenterRun(event, sessionId, graph);
+    return;
+  }
 
   // SPEC section 3.5: one static command serves both a fresh run and a run
   // resumed at any node, which is why the command body tells the runner to stand
@@ -3458,6 +3834,9 @@ function abandonGate(event, sessionId, gate) {
     return;
   }
   const parked = found.state;
+  // No record kept, unlike every other way a run ends. This is the one command whose
+  // whole meaning is throw this away, and a record is the thing a later run could be
+  // seeded from. Keeping one here would make abandoning a run reversible by accident.
   deleteState(parked.runId);
   appendTrace(parked.runId, {
     at: new Date().toISOString(),
@@ -3596,7 +3975,7 @@ function settle(graph, state) {
       return null;
     }
     if (transition.kind === "end") {
-      deleteState(current.runId);
+      concludeRun(transition.state, "finished", "");
       report("run " + current.runId + ' finished at command node "' + current.node + '".');
       return null;
     }
@@ -3618,7 +3997,7 @@ function concludeWithError(state, code, message) {
     message: message,
     state: state,
   });
-  deleteState(state.runId);
+  concludeRun(state, "stopped", "[" + code + "] " + message);
   report("run " + state.runId + " stopped: [" + code + "] " + message);
 }
 
@@ -3705,7 +4084,7 @@ function act(graph, state, transition) {
         "run " + state.runId + " could not write its questions: " + error.message +
           ". The run is stopped rather than continued without the answers.",
       );
-      deleteState(state.runId);
+      concludeRun(state, "stopped", "could not write its questions");
       return;
     }
     saveState(departed(transition.state));
@@ -3735,7 +4114,7 @@ function act(graph, state, transition) {
       node: state.node,
       gate: transition.gate,
     });
-    deleteState(state.runId);
+    concludeRun(transition.state, "stopped", 'stopped at the "' + transition.gate + '" gate');
     report(
       "run " + state.runId + ' reached the "' + transition.gate + '" gate and stopped, because ' +
         "it was started with --auto. A gate waits for a person to look at something, so an " +
@@ -3759,9 +4138,9 @@ function act(graph, state, transition) {
   }
 
   if (transition.kind === "end") {
-    // No decision, and the state is gone: the trace is what survives a finished
-    // run.
-    deleteState(state.runId);
+    // No decision, and the live state is gone. What survives a finished run is the
+    // trace, which says how it got here, and the record, which carries what it made.
+    concludeRun(transition.state, "finished", "");
     report("run " + state.runId + ' finished at step "' + state.node + '".');
     return;
   }
@@ -3785,7 +4164,7 @@ function act(graph, state, transition) {
     message: transition.message,
     state: transition.state,
   });
-  deleteState(state.runId);
+  concludeRun(transition.state, "stopped", "[" + transition.code + "] " + transition.message);
   report("run " + state.runId + " stopped: [" + transition.code + "] " + transition.message);
 }
 
@@ -3868,7 +4247,7 @@ function onAskStop(event, state) {
         "inconsistent and the run is stopped rather than resumed into a node it may not belong " +
         "at.",
     );
-    deleteState(state.runId);
+    concludeRun(state, "stopped", "marked as asking with no questions on record");
     return;
   }
 
@@ -3915,7 +4294,7 @@ function onAskStop(event, state) {
       return;
     }
     report("run " + state.runId + " cannot use its answers: " + answers.error);
-    deleteState(state.runId);
+    concludeRun(state, "stopped", "answers could not be used");
     clearAskFiles(state.runId);
     return;
   }

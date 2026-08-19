@@ -390,6 +390,25 @@ function withPromptAndParams(
   };
 }
 
+/**
+ * Three steps, where the last one reads the first one's payload.
+ *
+ * Re-entering at the middle step leaves a hole nothing fills: the first step does not
+ * run again, and nothing after the entry point produces what the last step reads. The
+ * run starts anyway, because the hole may sit on a branch this run never takes.
+ */
+function threeStepIr(): Graph {
+  const wf = workflow({ name: "three-step" });
+  wf.step("gather", { skill: "s", output: { notes: "string" } });
+  wf.step("draft", { skill: "s", prompt: "Draft it." });
+  wf.step("check", { skill: "s", prompt: "Check the draft against {{ctx.gather.notes}}." });
+  wf.entry("gather");
+  wf.edge("gather", "draft");
+  wf.edge("draft", "check");
+  wf.edge("check", END);
+  return wf.compile();
+}
+
 /** A step whose payload is read from a file rather than from its final message. */
 function fileLaneIr(): Graph {
   const wf = workflow({ name: "file-lane" });
@@ -1339,6 +1358,16 @@ interface Harness {
   fire(event: Record<string, JsonValue>): Fired;
   /** Every run state on disk, by run id. */
   runs(): RunState[];
+  /**
+   * Every record on disk, newest first.
+   *
+   * A record is what a run leaves behind once it has ended, and it is the thing a
+   * re-entry is seeded from. It lives in its own directory precisely so that no scan
+   * of live runs can see it, which is why it needs its own reader here.
+   */
+  records(): Record<string, JsonValue>[];
+  /** Writes a record directly, for the shapes no sequence of hook fires produces. */
+  writeRecord(record: Record<string, JsonValue>): void;
   /** The only run state on disk; fails if there is not exactly one. */
   onlyRun(): RunState;
   /** Writes a file into the project directory the guards resolve against. */
@@ -1491,6 +1520,30 @@ async function withPlugin(
         const runs = harness.runs();
         expect(runs).toHaveLength(1);
         return runs[0] as RunState;
+      },
+      records() {
+        const dir = path.join(dataDir, "records");
+        if (!sync.existsSync(dir)) return [];
+        return sync
+          .readdirSync(dir)
+          .sort()
+          .reverse()
+          .map(
+            (name) =>
+              JSON.parse(sync.readFileSync(path.join(dir, name), "utf8")) as Record<
+                string,
+                JsonValue
+              >,
+          );
+      },
+      writeRecord(record) {
+        const dir = path.join(dataDir, "records");
+        sync.mkdirSync(dir, { recursive: true });
+        sync.writeFileSync(
+          path.join(dir, `${String(record.runId)}.json`),
+          JSON.stringify(record, null, 2),
+          "utf8",
+        );
       },
       write(relative, contents) {
         const target = path.join(projectDir, ...relative.split("/"));
@@ -2174,6 +2227,337 @@ describe("a run whose session went away, resumed from the entry command", () => 
       // Not resumed, and not quietly replaced by a fresh run either.
       expect(plugin.runs()).toHaveLength(1);
       expect(plugin.onlyRun().node).toBe("build");
+    });
+  });
+});
+
+describe("what a run leaves behind, and re-entering from it", () => {
+  /** The record a finished run of interpolatingIr leaves. */
+  function finishInterpolating(plugin: Harness, notes = "widgets are slow"): void {
+    plugin.begin();
+    plugin.fire(stopped(reported({ notes })));
+    plugin.fire(stopped("Planned."));
+  }
+
+  it("keeps a record of a finished run, carrying every payload it produced", async () => {
+    await withPlugin(interpolatingIr(), (plugin) => {
+      finishInterpolating(plugin);
+
+      // The live state is gone, exactly as before: an ended run is not a live run.
+      expect(plugin.runs()).toEqual([]);
+
+      const kept = plugin.records();
+      expect(kept).toHaveLength(1);
+      expect(kept[0]).toMatchObject({
+        outcome: "finished",
+        workflow: "interpolating",
+        node: "plan",
+        outputs: { research: { notes: "widgets are slow" } },
+      });
+    });
+  });
+
+  it("keeps a record of a run that stopped, so the work before the failure survives", async () => {
+    await withPlugin(fileLaneIr(), (plugin) => {
+      plugin.begin();
+      // The step honours nothing: its payload was to be read from a file that is not
+      // there, which is a broken contract and stops the run.
+      const missing = plugin.fire(stopped("I scanned."));
+      expect(missing.stderr).toContain("observation-failed");
+      expect(plugin.runs()).toHaveLength(0);
+
+      const kept = plugin.records();
+      expect(kept).toHaveLength(1);
+      expect(kept[0]?.outcome).toBe("stopped");
+      expect(String(kept[0]?.detail)).toContain("observation-failed");
+    });
+  });
+
+  it("starts a fresh run at the named step, carrying what the record holds", async () => {
+    await withPlugin(interpolatingIr(), (plugin) => {
+      finishInterpolating(plugin);
+      const record = plugin.records()[0];
+
+      const started = plugin.fire(
+        typed("interpolating:run-interpolating", "session-2", "--from plan"),
+      );
+      expect(started.decision).toBeNull();
+      expect(started.stderr).toContain('starts at step "plan"');
+      expect(started.stderr).toContain(String(record?.runId));
+      // Which run it picked, described rather than only named: records and interrupted
+      // runs are both candidates, and a run id alone does not say which this was.
+      expect(started.stderr).toContain('which finished at step "plan"');
+
+      // A new run, not the old one revived, and it begins at the named step with the
+      // earlier run's outputs already on board.
+      const seeded = plugin.onlyRun();
+      expect(seeded.runId).not.toBe(record?.runId);
+      expect(seeded.node).toBe("plan");
+      expect(seeded.steps).toBe(0);
+      expect(seeded.outputs).toEqual({ research: { notes: "widgets are slow" } });
+
+      // And the step it spawns reads the carried value, which is the whole point:
+      // nothing re-runs to produce it.
+      const fired = plugin.fire(stopped("Standing by.", "session-2"));
+      expect(fired.reason).toContain("interpolating:step-plan");
+      expect(fired.reason).toContain("widgets are slow");
+    });
+  });
+
+  it("leaves the record in place, so one run can seed several attempts", async () => {
+    await withPlugin(interpolatingIr(), (plugin) => {
+      finishInterpolating(plugin);
+      const record = plugin.records()[0];
+
+      plugin.fire(typed("interpolating:run-interpolating", "session-2", "--from plan"));
+      const first = plugin.onlyRun().runId;
+      // The second attempt has to find the same record, or tuning one prompt twice
+      // means running the whole graph again between the two tries.
+      plugin.fire(typed("interpolating:run-interpolating", "session-3", "--from plan"));
+
+      expect(plugin.records()).toHaveLength(1);
+      expect(plugin.records()[0]?.runId).toBe(record?.runId);
+      expect(plugin.runs().map((run) => run.runId)).toContain(first);
+      expect(plugin.runs()).toHaveLength(2);
+    });
+  });
+
+  it("refuses a step whose own context the record cannot supply", async () => {
+    await withPlugin(interpolatingIr(), (plugin) => {
+      // A record that reached the end without ever recording research. Nothing a real
+      // run does produces this, which is why it is written directly.
+      plugin.writeRecord({
+        runId: "run-20260101000000-aaaaaa",
+        graphHash: "0000000000000000",
+        workflow: "interpolating",
+        outcome: "stopped",
+        node: "research",
+        steps: 0,
+        at: "2026-01-01T00:00:00.000Z",
+        outputs: {},
+      });
+
+      const refused = plugin.fire(
+        typed("interpolating:run-interpolating", "session-2", "--from plan"),
+      );
+      expect(refused.stderr).toContain('cannot start at "plan"');
+      expect(refused.stderr).toContain("{{ctx.research.notes}}");
+      expect(refused.stderr).toContain("Re-enter earlier");
+      // Refused means refused: no run was started to fail three steps later.
+      expect(plugin.runs()).toEqual([]);
+    });
+  });
+
+  it("refuses a record that holds the right step and the wrong field", async () => {
+    await withPlugin(interpolatingIr(), (plugin) => {
+      // "plan" reads {{ctx.research.notes}}. The record holds a research payload, so a
+      // check on the step name alone passes it, and the run then dies on its first step
+      // with an error that blames the graph. Found by re-entering a real workflow, where
+      // a step read a field of a payload the record did carry.
+      plugin.writeRecord({
+        runId: "run-20260101000000-aaaaaa",
+        graphHash: "0000000000000000",
+        workflow: "interpolating",
+        outcome: "finished",
+        node: "plan",
+        steps: 2,
+        at: "2026-01-01T00:00:00.000Z",
+        outputs: { research: { summary: "not the field the prompt reads" } },
+      });
+
+      const refused = plugin.fire(
+        typed("interpolating:run-interpolating", "session-2", "--from plan"),
+      );
+      expect(refused.stderr).toContain('cannot start at "plan"');
+      expect(refused.stderr).toContain("{{ctx.research.notes}}");
+      expect(plugin.runs()).toEqual([]);
+    });
+  });
+
+  it("accepts a graph that moved under the record, and says that it did", async () => {
+    await withPlugin(interpolatingIr(), (plugin) => {
+      finishInterpolating(plugin);
+      // Records keep the hash of the graph they ran against. A re-entry is almost
+      // always the second half of an edit, so a moved hash is the normal case here,
+      // unlike a resume, where it means the nodes may have moved under a live run.
+      const record = plugin.records()[0];
+      plugin.writeRecord({ ...record, graphHash: "0000000000000000" });
+
+      const started = plugin.fire(
+        typed("interpolating:run-interpolating", "session-2", "--from plan"),
+      );
+      expect(started.stderr).toContain("The graph moved");
+      expect(plugin.onlyRun().node).toBe("plan");
+    });
+  });
+
+  it("names the steps when --from carries no step, or one the graph does not have", async () => {
+    await withPlugin(interpolatingIr(), (plugin) => {
+      const bare = plugin.fire(typed("interpolating:run-interpolating", "session-2", "--from"));
+      expect(bare.stderr).toContain("--from needs the id of the step");
+      expect(bare.stderr).toContain("research, plan");
+
+      const wrong = plugin.fire(
+        typed("interpolating:run-interpolating", "session-2", "--from planning"),
+      );
+      expect(wrong.stderr).toContain('no step called "planning"');
+      expect(wrong.stderr).toContain("research, plan");
+      expect(plugin.runs()).toEqual([]);
+    });
+  });
+
+  it("says so when nothing has run yet, rather than starting from the top", async () => {
+    await withPlugin(interpolatingIr(), (plugin) => {
+      const nothing = plugin.fire(
+        typed("interpolating:run-interpolating", "session-2", "--from plan"),
+      );
+      expect(nothing.stderr).toContain("nothing has run yet");
+      expect(plugin.runs()).toEqual([]);
+    });
+  });
+
+  it("seeds from a run that was interrupted, not only from one that ended", async () => {
+    await withPlugin(interpolatingIr(), (plugin) => {
+      plugin.begin();
+      plugin.fire(stopped(reported({ notes: "half done" })));
+      // Still live, still at "plan", the way a closed laptop leaves a run. Its outputs
+      // are as good a seed as a record's, and refusing them would mean starting the
+      // run over before being allowed to re-enter it.
+      const stalled = plugin.onlyRun();
+      expect(stalled.status).toBe("running");
+
+      plugin.fire(typed("interpolating:run-interpolating", "session-2", "--from plan"));
+      const seeded = plugin.runs().filter((run) => run.runId !== stalled.runId);
+      expect(seeded).toHaveLength(1);
+      expect(seeded[0]?.outputs).toEqual({ research: { notes: "half done" } });
+    });
+  });
+
+  it("keeps the newest records and drops the rest, so the directory cannot grow forever", async () => {
+    await withPlugin(interpolatingIr(), (plugin) => {
+      // Twenty five records, oldest first by the timestamp inside the run id.
+      for (let index = 0; index < 25; index += 1) {
+        plugin.writeRecord({
+          runId: `run-2026010100${String(index).padStart(4, "0")}-aaaaaa`,
+          graphHash: "0000000000000000",
+          workflow: "interpolating",
+          outcome: "finished",
+          node: "plan",
+          steps: 2,
+          at: "2026-01-01T00:00:00.000Z",
+          outputs: {},
+        });
+      }
+      // One real run concludes, which is what triggers the prune.
+      finishInterpolating(plugin);
+
+      const kept = plugin.records();
+      expect(kept).toHaveLength(20);
+      // The newest survive, and the newest of all is the run that just finished.
+      expect(String(kept[0]?.runId)).toMatch(/^run-2026/);
+      expect(kept.map((record) => String(record.runId))).not.toContain(
+        "run-202601010000000-aaaaaa",
+      );
+    });
+  });
+
+  it("starts anyway when the hole is further on, and names what will run into it", async () => {
+    await withPlugin(threeStepIr(), (plugin) => {
+      plugin.writeRecord({
+        runId: "run-20260101000000-aaaaaa",
+        graphHash: "0000000000000000",
+        workflow: "three-step",
+        outcome: "stopped",
+        node: "gather",
+        steps: 0,
+        at: "2026-01-01T00:00:00.000Z",
+        outputs: {},
+      });
+
+      // "draft" itself reads nothing, so it can start. "check" reads the payload of a
+      // step this run will never reach, and warning about it here is worth two steps of
+      // model time, which is what it costs to find out the other way.
+      const started = plugin.fire(typed("three-step:run-three-step", "session-2", "--from draft"));
+      expect(started.stderr).toContain("Watch for");
+      expect(started.stderr).toContain("check reads {{ctx.gather.notes}}");
+      expect(plugin.onlyRun().node).toBe("draft");
+    });
+  });
+
+  it("reads the auto flag fresh, because a re-entry is a new run somebody just typed", async () => {
+    await withPlugin(interpolatingIr(), (plugin) => {
+      plugin.begin();
+      plugin.fire(stopped(reported({ notes: "widgets are slow" })));
+      plugin.fire(stopped("Planned."));
+      expect(plugin.records()[0]?.outcome).toBe("finished");
+
+      // A resume carries the flag the run began with, because it is the same run and
+      // the answers already recorded were given under whichever mode was in force. A
+      // re-entry mints a new run, so the person typing decides again.
+      plugin.fire(typed("interpolating:run-interpolating", "session-2", "--from plan --auto"));
+      expect(plugin.onlyRun().auto).toBe(true);
+    });
+  });
+
+  it("re-enters at a command node, which the dispatcher runs rather than spawns", async () => {
+    await withPlugin(commandIr(), (plugin) => {
+      plugin.begin();
+      // The file is not there, so the check fails and the run ends down the repair
+      // branch. Everything the run learned is in the record either way.
+      plugin.fire(stopped(reported({ path: "out.txt" })));
+      plugin.fire(stopped("Fixed it."));
+      expect(plugin.records()[0]?.outcome).toBe("finished");
+
+      // The thing that was wrong is now right, which is the ordinary reason to want
+      // one step run again and nothing else.
+      plugin.write("out.txt", "built");
+      plugin.fire(typed("checked:run-checked", "session-2", "--from verify"));
+
+      // A command node needs no agent and is not spawned. It runs inside the
+      // dispatcher on the next stop, with its command interpolated from the record.
+      const drained = plugin.fire(stopped("Standing by.", "session-2"));
+      expect(drained.reason).toContain("checked:step-publish");
+    });
+  });
+
+  it("keeps no record when a person abandons a run at a gate", async () => {
+    await withPlugin(gatedIr(["approve-plan"]), (plugin) => {
+      plugin.begin();
+      plugin.fire(stopped("Planned."));
+      expect(plugin.onlyRun().status).toBe("awaiting");
+
+      plugin.fire(typed("gated:reject-plan", "session-1"));
+      expect(plugin.runs()).toEqual([]);
+      // The one command whose whole meaning is throw this away. A record would make
+      // abandoning a run reversible by accident.
+      expect(plugin.records()).toEqual([]);
+    });
+  });
+});
+
+describe("an argument the entry command does not recognise", () => {
+  it("is reported rather than discarded into a fresh run", async () => {
+    await withPlugin(drivableIr(), (plugin) => {
+      plugin.begin();
+      plugin.fire(stopped(reported({ done: true })));
+      const stalled = plugin.onlyRun();
+
+      // Typed by somebody who expected the text to reach the workflow as its subject.
+      // It named no run, and used to mean the same thing as naming nothing at all, so
+      // the stalled run was silently abandoned and a second one started.
+      const typo = plugin.fire(typed("drivable:run-drivable", "session-2", "fix the parser"));
+      expect(typo.stderr).toContain('nothing stopped part way through is named "fix the parser"');
+      expect(typo.stderr).toContain("no channel");
+      expect(plugin.runs()).toHaveLength(1);
+      expect(plugin.onlyRun().runId).toBe(stalled.runId);
+    });
+  });
+
+  it("is reported even when there is nothing stopped to resume", async () => {
+    await withPlugin(drivableIr(), (plugin) => {
+      const typo = plugin.fire(typed("drivable:run-drivable", "session-1", "fix the parser"));
+      expect(typo.stderr).toContain("named");
+      expect(plugin.runs()).toEqual([]);
     });
   });
 });
@@ -3137,12 +3521,14 @@ describe("a small compiled workflow", () => {
       ",
         "commands/run-tiny-flow.md": "---
       description: "Start or resume the \\"tiny-flow\\" workflow."
-      argument-hint: "[--new to start over instead of resuming]"
+      argument-hint: "[--new to start over instead of resuming] [--from <step> to start at one step with an earlier run's results]"
       ---
 
       Start the **tiny-flow** workflow, which begins at \`draft\`.
 
       If a previous run stopped part way through, this picks it up where it left off instead of starting again, and says so. Everything already finished is kept.
+
+      \`--from <step>\` starts a fresh run at one step, carrying what an earlier run produced, so nothing before that step runs again. It is how a workflow is tuned without paying for every step in front of the one being changed.
 
       Spawn the subagent \`tiny-flow:runner\` with the Agent tool, and give
       it exactly this instruction, verbatim:
