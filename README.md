@@ -98,6 +98,29 @@ graph has changed underneath it is refused rather than resumed against nodes tha
 may have moved, and when several runs are stopped it names them instead of
 guessing.
 
+### Re-entry, for the loop you edit a workflow in
+
+A run leaves a record behind when it ends: every payload every step produced,
+keyed by the step that produced it. `--from` starts a fresh run at any step you
+name, carrying that record with it.
+
+```
+$ /research-ship --from draft-findings
+run run-20260819T0912-4c1e starts at step "draft-findings", carrying 11 step
+outputs from run run-20260817045146-b71a96. Nothing before that step runs again.
+```
+
+This is how a workflow gets tuned. You change one prompt near the end, and you
+want to see what it does now, not pay for the eleven steps in front of it again.
+The record stays where it is, so the same run seeds the next attempt too.
+
+A graph that changed under the record is accepted here, unlike a resume, because
+changing the graph is usually why you are re-entering. What replaces the hash
+check is stricter: every value the chosen step reads is checked against the record
+before the run starts, and a step that reads something nothing carries is refused
+rather than started. Values that only a later step reads are named as a warning,
+because that step may sit on a branch this run never takes.
+
 ### Sign-off that actually blocks
 
 `wf.gate()` parks the run and waits for a human to release it, across sessions if
