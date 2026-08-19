@@ -2284,6 +2284,9 @@ describe("what a run leaves behind, and re-entering from it", () => {
       expect(started.decision).toBeNull();
       expect(started.stderr).toContain('starts at step "plan"');
       expect(started.stderr).toContain(String(record?.runId));
+      // Which run it picked, described rather than only named: records and interrupted
+      // runs are both candidates, and a run id alone does not say which this was.
+      expect(started.stderr).toContain('which finished at step "plan"');
 
       // A new run, not the old one revived, and it begins at the named step with the
       // earlier run's outputs already on board.
@@ -2341,6 +2344,32 @@ describe("what a run leaves behind, and re-entering from it", () => {
       expect(refused.stderr).toContain("{{ctx.research.notes}}");
       expect(refused.stderr).toContain("Re-enter earlier");
       // Refused means refused: no run was started to fail three steps later.
+      expect(plugin.runs()).toEqual([]);
+    });
+  });
+
+  it("refuses a record that holds the right step and the wrong field", async () => {
+    await withPlugin(interpolatingIr(), (plugin) => {
+      // "plan" reads {{ctx.research.notes}}. The record holds a research payload, so a
+      // check on the step name alone passes it, and the run then dies on its first step
+      // with an error that blames the graph. Found by re-entering a real workflow, where
+      // a step read a field of a payload the record did carry.
+      plugin.writeRecord({
+        runId: "run-20260101000000-aaaaaa",
+        graphHash: "0000000000000000",
+        workflow: "interpolating",
+        outcome: "finished",
+        node: "plan",
+        steps: 2,
+        at: "2026-01-01T00:00:00.000Z",
+        outputs: { research: { summary: "not the field the prompt reads" } },
+      });
+
+      const refused = plugin.fire(
+        typed("interpolating:run-interpolating", "session-2", "--from plan"),
+      );
+      expect(refused.stderr).toContain('cannot start at "plan"');
+      expect(refused.stderr).toContain("{{ctx.research.notes}}");
       expect(plugin.runs()).toEqual([]);
     });
   });

@@ -2759,9 +2759,11 @@ function taskFor(graph, state) {
     return {
       error:
         'step "' + state.node + '" cannot be started: ' + failure +
-        ". A graph compiled by minflow's builder cannot reach this, because the builder refuses " +
-        "a ctx reference unless the step it names runs on every path to this one; an IR from " +
-        "another front-end can. Fix the template, or the step it reads from.",
+        ". Two things reach this. A run re-entered with --from, whose record does not carry " +
+        "that value, which is checked before such a run starts and can still be reached by " +
+        "editing a step to read something new. And an IR from another front-end, since " +
+        "minflow's own builder refuses a ctx reference unless the step it names runs on every " +
+        "path to this one. Fix the template, the step it reads from, or re-enter earlier.",
     };
   }
   return { text: text };
@@ -3463,8 +3465,17 @@ function unsatisfiedReferences(graph, start, outputs) {
     while (found !== null) {
       const reference = found[1];
       const producer = reference.split(".")[0];
-      const carried = Object.hasOwn(outputs, producer);
-      if (!carried && producer !== node.id && reachable[producer] !== true) {
+      // A step that runs between here and there will supply it, whatever it holds.
+      if (producer === node.id || reachable[producer] === true) {
+        found = pattern.exec(template);
+        continue;
+      }
+      // Otherwise the record has to answer, and it has to answer the whole reference.
+      // Checking only the first segment passes a record that holds the right step and
+      // the wrong field, which then fails at step one with an error that blames the
+      // graph. Resolved through the same reader the interpolation uses, so the check
+      // and the run cannot disagree about what counts as present.
+      if (readOutputPath(outputs, reference).error) {
         holes.push({ node: node.id, reference: reference });
       }
       found = pattern.exec(template);
@@ -3592,9 +3603,16 @@ function reenterRun(event, sessionId, graph) {
     carried: Object.keys(outputs).length,
   });
 
+  // The seed is described, not merely named. Records and interrupted runs are both
+  // candidates and the newest wins, so which one that was is not obvious from a run id.
+  const seedWas =
+    typeof seed.outcome === "string"
+      ? "which " + seed.outcome + ' at step "' + seed.node + '"'
+      : 'which is interrupted at step "' + seed.node + '"';
   const lines = [
     "run " + runId + ' starts at step "' + node + '", carrying ' + Object.keys(outputs).length +
-      " step outputs from run " + seed.runId + ". Nothing before that step runs again.",
+      " step outputs from run " + seed.runId + ", " + seedWas +
+      ". Nothing before that step runs again.",
   ];
   if (seed.graphHash !== PLUGIN.graphHash) {
     lines.push(
