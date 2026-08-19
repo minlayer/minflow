@@ -183,15 +183,29 @@ Only ergonomics need a human session.
 
 ### D19. Late discovery: native and third-party implementations exist
 
-**Found, by searching for *implementations* rather than for *writing about* the pattern, which is all D1 looked for:** Claude Code's native Workflow runtime, plus several third-party projects covering substantially this idea.
+**Found, by searching for *implementations* rather than for *writing about* the pattern, which is all D1 looked for:** Claude Code's native Workflow runtime, plus three third-party projects covering adjacent ground.
 
-- **xirothedev/claude-workflow-plugin**: workflows as TypeScript modules, with a runtime building an orchestration plan of agents, schemas, and execution stages. The same authoring model, already built.
-- **mbruhler/claude-orchestration**: state persisted so a run dying at step 14 of 15 resumes by loading state, skipping 1–13, and injecting variables; plus routing on natural-language conditions. The same state design and the same NL escape hatch, both validated.
-- **barkain/claude-code-workflow-orchestration**: hook-based delegation enforcement with escalating nudges.
+The descriptions below come from reading each repository's file tree, not its README. Two of the three were described wrongly here first, from READMEs alone, which is the same methodological error D1 made one level down.
+
+| | Ships as | Hook files | Node type | Also needs |
+|---|---|---|---|---|
+| minflow's output | plugin | 2, both matcher-scoped | skills | nothing |
+| xirothedev/claude-workflow-plugin | plugin | **0 of 68 files** | `*.workflow.ts` modules | Bun |
+| mbruhler/claude-orchestration | plugin | **0 of 158 files** | `.flow` files, markdown agents | generates Python and Node scripts |
+| barkain/claude-code-workflow-orchestration | plugin | 14 scripts on 6 events | markdown agents | Python |
+| native Workflow runtime | not a plugin | 0, by design | subagents | built into Claude Code |
+
+- **xirothedev/claude-workflow-plugin**: workflows as TypeScript modules, a Bun runtime that builds an orchestration plan of agents, schemas and execution stages, inspectable before execution. The same *authoring* model. Not the same enforcement: it registers no hooks, so the plan is a declaration the model follows.
+- **mbruhler/claude-orchestration**: state in `.orchestration/state.json`, resume by loading it and skipping finished steps, and semantic routing where an LLM evaluates captured variables in place of "rigid text-matching conditions". The same state design, validated. The opposite guard policy, and no hooks: resume is an instruction given to the agent rather than a command the plugin owns, and a checkpoint offers `fallback=skip` in headless mode.
+- **barkain/claude-code-workflow-orchestration**: hooks on six events across fourteen scripts, enforcing delegation by escalating nudges: about two tokens on the first violation, a strong reminder by the fifth, counter reset each turn. Hooks used to persuade. It declares no graph.
 
 **Decision:** no change to the v1 architecture. The hooks design retains cross-session durability, free mechanical guards, and a documented API. The native runtime is recorded as a secondary output mode ([`DYNAMIC-WORKFLOWS.md`](./DYNAMIC-WORKFLOWS.md)).
 
+**What actually separates this, stated narrowly.** Nobody else uses a hook to *decide* the next step. Two of the three declare a workflow and hand it to the model to follow, which is the exhortation this compiler exists to remove, in a better file format. The third uses hooks and has no workflow to enforce. And nobody else makes skills the node type.
+
 **Lesson recorded:** everyone converged on subagents as the node type, not skills. minflow's skills-first premise runs against the grain and should be held as a deliberate bet, not an assumption.
+
+**Second lesson, and the more expensive one:** a README describes what a project is for. A file tree shows what it is. AGENTS.md already requires platform claims to be established by running rather than by reading; the same rule applies to claims about other people's work.
 
 ### D20. Multi-platform compiler, not a Claude Code tool
 

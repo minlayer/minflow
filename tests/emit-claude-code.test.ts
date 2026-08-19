@@ -2720,6 +2720,34 @@ describe("a prompt's run context, resolved by the emitted dispatcher", () => {
 // Agents
 // ---------------------------------------------------------------------------
 
+describe("a step's turn budget", () => {
+  it("tells the step the ceiling the host will enforce on it", () => {
+    // A ceiling a step cannot see gets spent, and the step is then cut off before it
+    // writes the final message the run reads. That surfaces as a broken output contract,
+    // and the cause is a frontmatter field the step was never told about. Two runs of a
+    // real workflow died that way, on two different steps.
+    const wf = workflow({ name: "budgeted" });
+    wf.step("draft", { skill: "s", maxTurns: 25 });
+    wf.step("check", { skill: "s" });
+    wf.entry("draft");
+    wf.edge("draft", "check");
+    wf.edge("check", END);
+    const files = emit(wf.compile());
+
+    const drafted = fileOf(files, "agents/step-draft.md");
+    expect(frontmatterOf(drafted).maxTurns).toBe("25");
+    // The same number, from the same field, so the two cannot disagree.
+    expect(drafted).toContain("You have **25 tool-call turns**");
+    expect(drafted).toContain("Keep one in reserve");
+
+    // A step with no ceiling is told about none, rather than being told a default it
+    // does not have.
+    const checked = fileOf(files, "agents/step-check.md");
+    expect(frontmatterOf(checked).maxTurns).toBeUndefined();
+    expect(checked).not.toContain("tool-call turns");
+  });
+});
+
 describe("a step's model", () => {
   /** One step carrying whatever model spelling is under test. */
   function withModel(model: string): Graph {

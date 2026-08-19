@@ -1157,6 +1157,31 @@ function stepBody(
     ].join("\n"),
   );
 
+  // The ceiling, stated in the body as well as in the frontmatter.
+  //
+  // A step given a ceiling it cannot see spends it and gets cut off mid-thought. What
+  // the run then sees is a final message with no payload in it, which is reported as a
+  // broken output contract, because that is what it is. The cause is a number in a
+  // frontmatter field the step was never told about, and the report names the payload
+  // instead. Two runs of a real workflow died that way.
+  //
+  // Read from the same `node.maxTurns` the frontmatter uses, so the number a step is
+  // told cannot drift from the number the host enforces.
+  if (node.maxTurns !== undefined) {
+    sections.push(
+      [
+        "## Your budget",
+        "",
+        `You have **${node.maxTurns} tool-call turns**. The host stops you at that number,`,
+        "whatever you are in the middle of.",
+        "",
+        "Keep one in reserve. The run reads your final message and nothing else, so a step cut",
+        "off before it writes that message has produced nothing at all, however much work it",
+        "did. If the budget is running short, stop working and report what you have.",
+      ].join("\n"),
+    );
+  }
+
   const prompt = promptWithParams(node);
   if (prompt !== undefined) {
     sections.push(

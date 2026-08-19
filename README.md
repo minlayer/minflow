@@ -204,6 +204,48 @@ An installed workflow runs nothing when no workflow is running. Both hook
 registrations are matcher-scoped, so nothing fires during unrelated work. This is
 a hard requirement of the design rather than an optimisation.
 
+## Why a plugin made of standard parts
+
+There is a trade people usually accept between two things they want. Either you get
+an explicit workflow, written down, checkable, with types and tests, and it runs in a
+service somewhere away from the session you actually work in. Or you get something
+that runs where you are, and the workflow is a document you hope gets followed.
+
+A compiler gets both, and the reason is what it emits.
+
+**Only the platform's own parts.** The nodes are skills you already wrote. The entry
+is a command. The control is hooks. The artifact is a plugin directory. There is no
+runtime to install, no daemon, no second language at run time, and nothing to keep
+running between runs. Uninstall the plugin and nothing is left behind. A workflow that
+needs a package manager, a separate interpreter, or a service alongside it has moved
+your process somewhere you do not work.
+
+**Declaring a workflow is not enforcing one.** A file listing twenty steps, handed to
+a model, is a request. Nothing makes step 12 depend on step 11 having produced
+anything, so the order holds while the model cooperates and quietly stops holding when
+it does not. Here the hook decides the next step and blocks the agent into it. The
+order is a property of the artifact, not of anyone's good behaviour.
+
+**Checks that cannot flatter themselves.** A guard is a shell predicate or a test on a
+field of a payload. It costs no tokens, it cannot be talked round, and it cannot grade
+its own work. Judgement is available where judgement is genuinely needed, through one
+conspicuous function, so a graph that spends money on a decision says so on the line
+where it does it. That is a default, not a restriction.
+
+**Determinism where it pays.** The same graph and the same inputs take the same route,
+the route is recorded as the edges it traversed, and a finished run is therefore a walk
+over a table you can check afterwards. The graph hashes identically in another process
+on another day, so a graph edited under a live run is detected rather than resumed
+against nodes that moved.
+
+**Your files stay yours.** Skills are read, never written. No workflow machinery leaks
+into a file you maintain by hand, and no step needs to know it is part of a graph.
+
+So you write the workflow explicitly, in TypeScript, with the graph linted and the
+transition table tested before anything runs. And what you install is a plugin, made of
+the same components you would have used by hand, running in the session you are already
+in, on one command.
+
 ## Why a compiler
 
 The asset is the intermediate representation that `compile()` produces: a

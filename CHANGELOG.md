@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A step is told the turn ceiling the host will enforce on it.** When a node
+  declares `maxTurns`, the emitted wrapper now states the number in its body and
+  tells the step to keep one turn back for its final message.
+
+  A ceiling a step cannot see gets spent. The step is then cut off before it writes
+  the message the run reads, so it has produced nothing at all however much work it
+  did. That surfaces as a broken output contract, because that is what it is, and the
+  cause is a number in a frontmatter field the step was never told about. Two runs of
+  a real workflow died that way, on two different steps, and both reports named the
+  payload rather than the ceiling.
+
+  The number comes from the same `maxTurns` the frontmatter carries, so what a step is
+  told cannot drift from what the host enforces. A node with no ceiling is told about
+  none, rather than being told a default it does not have.
+
+
 ## [0.3.0] - 2026-08-19
 
 ### Added
