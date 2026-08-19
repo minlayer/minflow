@@ -164,4 +164,4 @@ export type {
 export { isCommandNode } from "./ir.js";
 
 /** The current package version. */
-export const VERSION = "0.3.0";
+export const VERSION = "0.4.0";
