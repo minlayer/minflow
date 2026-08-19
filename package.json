@@ -1,6 +1,6 @@
 {
   "name": "minflow",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "A workflow compiler for coding agents. Describe a graph of steps in TypeScript; get a plugin the agent installs and runs.",
   "keywords": [
     "minflow",

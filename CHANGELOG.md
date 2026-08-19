@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-19
+
 ### Added
 
 - **A finished or stopped run leaves a record, and `--from <node>` re-enters
