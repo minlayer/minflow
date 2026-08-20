@@ -35,7 +35,8 @@
   "files": [
     "dist",
     "src",
-    "CHANGELOG.md"
+    "CHANGELOG.md",
+    "TRADEMARK.md"
   ],
   "sideEffects": false,
   "engines": {
