@@ -12,6 +12,12 @@ jobs:
   publish:
     runs-on: ubuntu-latest
 
+    # Records each release as a deployment, so the published versions are
+    # listed under Deployments and not only in the workflow history.
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/minflow/v/${{ steps.version.outputs.version }}
+
     steps:
       - uses: actions/checkout@v4
 
@@ -21,6 +27,13 @@ jobs:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
           cache: npm
+
+      # The deployment URL must point at the version that this run publishes.
+      # The manifest is the one source that the release tag cannot disagree
+      # with, because a test compares it against VERSION in src/index.ts.
+      - name: Read the version
+        id: version
+        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
 
       # Trusted publishing requires npm >= 11.5.1, newer than the npm bundled
       # with any current Node release.
