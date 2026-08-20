@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **An entry command can greet the user before the run starts.** `emit` takes a new
+  `welcome` option. When it is set, the entry command opens with that text, quoted
+  inside a fence longer than any fence inside it, and spawns the runner after it.
+
+  A compiled workflow opened with a spawn instruction and nothing else, so the first
+  thing a user saw was a run already under way. Nothing said what the workflow does,
+  what it needs from them, or how often it stops to ask. That is knowledge the author
+  has and the user does not, and a command body is the one place a plugin can put text
+  into the main conversation.
+
+  The fence grows one backtick past the longest run inside the text, because a greeting
+  almost always carries a fenced banner. A three backtick wrapper would close at the
+  banner's own fence, and the rest of the greeting would reach the model as instructions
+  rather than as text to print.
+
+  It is an emit option rather than a graph field, so a reworded greeting leaves the graph
+  hash alone. A parked run resumes only against its own hash, so the alternative would
+  strand every run in flight.
+
+  Only the entry command carries it, because a gate command releases a run that greeted
+  the user already. A workflow that does not set the option emits a byte identical command
+  body.
+
 ## [0.4.0] - 2026-08-19
 
 ### Added
