@@ -170,6 +170,29 @@ export interface EmitOptions {
   author?: string | PluginAuthor;
   /** The command that starts a run. Defaults to `run-<plugin name>`. */
   command?: string;
+  /**
+   * Text the entry command prints to the user before it starts the run.
+   *
+   * A compiled workflow opens with a spawn instruction and nothing else, so the
+   * first thing a user sees is a run already under way. This puts a greeting in
+   * front of it: what the workflow does, what it needs, and a banner when the
+   * author wants one. The emitted command quotes the text inside a fence longer
+   * than any fence inside it, and tells the model to reproduce it character for
+   * character, because aligned monospace art does not survive a paraphrase.
+   *
+   * **This is an emit option and not a graph field on purpose.** A greeting does
+   * not change what the workflow does, so it must not change the graph hash. A
+   * parked run resumes only against its own hash, so a reworded greeting in the
+   * IR would strand every run in flight.
+   *
+   * Only the entry command carries it. A gate command does not, because it
+   * resumes a run that greeted the user already.
+   *
+   * It prints on a resume as well as on a fresh start, because the command cannot
+   * tell those apart: the dispatcher decides that after the command has run. So
+   * keep it short enough to read twice.
+   */
+  welcome?: string;
   /** Optional manifest `homepage`. */
   homepage?: string;
   /** Optional manifest `license`. */
@@ -984,10 +1007,66 @@ function commandFor(description: string, body: string, argumentHint?: string): s
  */
 const STAND_BY = "Stand by. You will be told which step to spawn. Spawn nothing until then.";
 
-function spawnRunnerBody(pluginName: string, headline: string, hasAsks: boolean): string {
-  const lines = [
-    headline,
+/** The longest run of backticks in `text`, so a fence can be built to outlast it. */
+function longestBacktickRun(text: string): number {
+  let longest = 0;
+  for (const match of text.matchAll(/`+/g)) longest = Math.max(longest, match[0].length);
+  return longest;
+}
+
+/**
+ * The greeting section of the entry command.
+ *
+ * The fence has to outrun every fence inside the text. A greeting almost always
+ * carries a fenced banner, so a three backtick wrapper would close at the
+ * banner's own fence and spill the rest of the greeting into the prompt as
+ * instructions.
+ */
+function welcomeSection(welcome: string): string {
+  const fence = "`".repeat(Math.max(4, longestBacktickRun(welcome) + 1));
+  return [
+    "## First, greet the user",
     "",
+    "Print the block below as your first output, verbatim. Reproduce it character for",
+    "character, blank lines included: it is aligned monospace text, so a reflowed or",
+    "summarised copy is a broken copy. Add nothing before it and nothing after it.",
+    "",
+    fence,
+    welcome,
+    fence,
+    "",
+    "Then do what the next section says. Do not wait for a reply unless the block itself",
+    "asks for one.",
+  ].join("\n");
+}
+
+/**
+ * The greeting, checked.
+ *
+ * Blank text is refused rather than dropped. An empty greeting still spends an
+ * instruction on the model, and silence would report that the text arrived when
+ * nothing did.
+ */
+function welcomeFor(opts: EmitOptions): string | undefined {
+  const welcome = opts.welcome;
+  if (welcome === undefined) return undefined;
+  if (welcome.trim() === "") {
+    throw new Error(
+      "minflow: welcome is blank. Omit the option rather than pass empty text: an empty " +
+        "greeting still tells the model to print something, and it reads as a greeting " +
+        "that arrived when none did.",
+    );
+  }
+  return welcome;
+}
+
+function spawnRunnerBody(
+  pluginName: string,
+  headline: string,
+  hasAsks: boolean,
+  welcome?: string,
+): string {
+  const spawn = [
     `Spawn the subagent \`${qualified(pluginName, RUNNER_AGENT)}\` with the Agent tool, and give`,
     "it exactly this instruction, verbatim:",
     "",
@@ -996,6 +1075,12 @@ function spawnRunnerBody(pluginName: string, headline: string, hasAsks: boolean)
     "Do not do any of the workflow's own work yourself, and spawn nothing else. Report",
     "back whatever the runner returns.",
   ];
+  // Without a greeting the body stays byte identical to every earlier version, so the
+  // option churns nothing for a workflow that does not set it.
+  const lines =
+    welcome === undefined
+      ? [headline, "", ...spawn]
+      : [headline, "", welcomeSection(welcome), "", "## Then, start the run", "", ...spawn];
   if (hasAsks) lines.push("", askProtocolSection(pluginName));
   return lines.join("\n");
 }
@@ -1036,7 +1121,7 @@ function askProtocolSection(pluginName: string): string {
   ].join("\n");
 }
 
-function runCommandFile(ir: Graph, pluginName: string): string {
+function runCommandFile(ir: Graph, pluginName: string, welcome?: string): string {
   // `--new` and `--from` are always offered, unlike `--auto`: every workflow can be
   // interrupted, so every workflow can be resumed, and every workflow gets edited, so
   // every workflow gets re-entered. The flags are how you say you meant to start over
@@ -1058,6 +1143,7 @@ function runCommandFile(ir: Graph, pluginName: string): string {
         "produced, so nothing before that step runs again. It is how a workflow is tuned " +
         "without paying for every step in front of the one being changed.",
       graphAsks(ir),
+      welcome,
     ),
     hints,
   );
@@ -4695,7 +4781,7 @@ export function emit(ir: Graph, opts: EmitOptions = {}): PluginFiles {
   files[RUNNER_PATH] = runnerFor(ir, pluginName, runCommand);
   // Every alternative in the UserPromptExpansion matcher needs a command that
   // actually exists, or the hook is unreachable and the plugin is inert.
-  files[`${COMMANDS_DIR}/${runCommand}.md`] = runCommandFile(ir, pluginName);
+  files[`${COMMANDS_DIR}/${runCommand}.md`] = runCommandFile(ir, pluginName, welcomeFor(opts));
   Object.assign(files, gateCommandFiles(ir, pluginName, gates));
   const byGate = gateIndex(gates);
   for (const node of ir.nodes) {

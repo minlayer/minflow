@@ -1082,6 +1082,77 @@ describe("the commands", () => {
   });
 });
 
+describe("the entry command's greeting", () => {
+  /** Shaped like a real one: a fenced banner inside markdown. */
+  const banner = ["## Field Note", "", "```", "NIMBLE", "```", "", "Two files."].join("\n");
+
+  function runBody(welcome?: string): string {
+    const files = welcome === undefined ? emit(tinyIr()) : emit(tinyIr(), { welcome });
+    return fileOf(files, `${COMMANDS_DIR}/run-tiny-flow.md`);
+  }
+
+  it("adds nothing when the option is absent", () => {
+    // The body has to stay byte identical without the option, or adding it rewrites
+    // every plugin that never asked for a greeting.
+    expect(runBody()).not.toContain("greet the user");
+    expect(runBody()).not.toContain("start the run");
+  });
+
+  it("carries the text byte for byte", () => {
+    // Aligned art is the point, so a trimmed or reflowed copy is a broken copy.
+    const welcome = "## Hi\n\n   indented\ttab kept   \n\nlast";
+    expect(runBody(welcome)).toContain(welcome);
+  });
+
+  it("fences the greeting one backtick above the longest run inside it", () => {
+    // Three backticks would close at the banner's own fence, and the rest of the
+    // greeting would reach the model as instructions rather than as text to print.
+    const fence = "````";
+    expect(runBody(banner)).toContain([fence, banner, fence].join("\n"));
+  });
+
+  it("grows the fence again when the greeting already holds four", () => {
+    const welcome = ["````", "nested", "````"].join("\n");
+    const fence = "`````";
+    expect(runBody(welcome)).toContain([fence, welcome, fence].join("\n"));
+  });
+
+  it("greets before it spawns the runner", () => {
+    // A greeting below the spawn instruction arrives once the run is already under
+    // way, which is the one thing it exists to prevent.
+    const body = runBody(banner);
+    expect(body.indexOf("## First, greet the user")).toBeLessThan(
+      body.indexOf("Spawn the subagent"),
+    );
+  });
+
+  it("keeps the ask protocol below the spawn instruction", () => {
+    // The protocol answers a marker the runner reports later, so it must not land
+    // between the greeting and the spawn.
+    const body = fileOf(emit(askIr(), { welcome: banner }), `${COMMANDS_DIR}/run-asker.md`);
+    const greet = body.indexOf("## First, greet the user");
+    const start = body.indexOf("## Then, start the run");
+    const protocol = body.indexOf("If the runner reports");
+    expect(greet).toBeGreaterThan(-1);
+    expect(greet).toBeLessThan(start);
+    expect(start).toBeLessThan(protocol);
+  });
+
+  it("leaves a gate's commands ungreeted", () => {
+    // A gate releases a run that greeted the user already, so a second greeting
+    // there would read as a second run.
+    const files = emit(gatedIr(["approve-plan"]), { welcome: banner });
+    expect(fileOf(files, `${COMMANDS_DIR}/run-gated.md`)).toContain("greet the user");
+    expect(fileOf(files, `${COMMANDS_DIR}/approve-plan.md`)).not.toContain("greet the user");
+    expect(fileOf(files, `${COMMANDS_DIR}/reject-plan.md`)).not.toContain("greet the user");
+  });
+
+  it("refuses blank text rather than dropping it", () => {
+    // Silence would report that the greeting arrived when nothing did.
+    expect(() => emit(tinyIr(), { welcome: " \n\t " })).toThrow(/welcome is blank/);
+  });
+});
+
 describe("a gate's two commands", () => {
   it("derives reject-<gate> when nothing survives the approve prefix", () => {
     const files = emit(gatedIr(["approve"]));
