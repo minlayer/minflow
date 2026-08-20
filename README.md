@@ -354,6 +354,9 @@ npm run build
 
 See [CONTRIBUTING.md](./CONTRIBUTING.md).
 
-## License
+## License and marks
 
-[MIT](./LICENSE) © Ariel Arevalo
+Code: [MIT](./LICENSE) © Ariel Arevalo
+
+MIT covers the code. It does not cover the name or the logo. Read
+[TRADEMARK.md](./TRADEMARK.md) before you use either one.
